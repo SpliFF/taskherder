@@ -1,0 +1,35 @@
+{
+  "name": "@spliff/taskherder",
+  "version": "0.0.0",
+  "description": "Herd scheduled task lanes across projects, containers, and hosts — run OS commands and AI agents (Claude/Codex/Copilot) on a schedule, with manual gates, git-branch isolation, per-account auth, and an optional web console.",
+  "type": "module",
+  "bin": {
+    "taskherd": "bin/cli.mjs",
+    "taskherder": "bin/cli.mjs",
+    "taskherd-mcp": "bin/mcp.mjs"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "license": "MIT",
+  "author": "SpliFF",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/SpliFF/taskherder.git"
+  },
+  "homepage": "https://github.com/SpliFF/taskherder#readme",
+  "bugs": {
+    "url": "https://github.com/SpliFF/taskherder/issues"
+  },
+  "keywords": [
+    "cron", "scheduler", "tasks", "task-runner", "ai", "agents",
+    "claude", "codex", "copilot", "automation", "cli", "worktree", "mcp"
+  ],
+  "files": [
+    "bin/", "src/", "skill/", "web/dist/", "README.md", "DESIGN.md", "LICENSE", "NOTICE"
+  ],
+  "scripts": {
+    "test": "node --test"
+  },
+  "dependencies": {}
+}

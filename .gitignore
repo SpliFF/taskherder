@@ -1,0 +1,10 @@
+node_modules/
+dist/
+web/dist/
+*.log
+.DS_Store
+.env
+.env.*
+coverage/
+# taskherder's own runtime state, if it ever herds itself:
+.tasks/

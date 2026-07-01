@@ -1,0 +1,14 @@
+taskherder
+Copyright (c) 2026 SpliFF — MIT License
+
+This project re-implements, as lean original code, several design *patterns*
+studied from the following MIT-licensed project (no source copied verbatim):
+
+  @yemi33/minions — https://github.com/yemi33/minions (MIT)
+    - git worktree isolation + pool + garbage collection
+    - per-provider permission/flag table (Claude / Copilot / Codex)
+    - headless handling of the MCP "trust this server?" prompt
+    - cron-style scheduler with schedule-time template variables
+    - preflight / timeout / watchdog / cooldown safety patterns
+
+See DESIGN.md §20 for details.
