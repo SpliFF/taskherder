@@ -20,6 +20,8 @@ import { tick } from '../src/scheduler.mjs';
 import { renderStatus, readHistory } from '../src/history.mjs';
 import { loadProviders } from '../src/providers.mjs';
 import { listProfiles, loadProfile, isolationWarnings } from '../src/profiles.mjs';
+import { isGitRepo, gcWorktrees } from '../src/git.mjs';
+import { loadProjectConfig } from '../src/config.mjs';
 
 const REPO_OPTION = { repo: { type: 'string', short: 'C' } };
 
@@ -111,7 +113,6 @@ function buildStepFromOpts(values, task) {
     if (values.provider) step.provider = values.provider;
     if (values.model) step.model = values.model;
     if (values.profile) step.profile = values.profile;
-    if (values.isolation) step.isolation = values.isolation;
     if (values.runner) step.runner = values.runner;
     if (values.session) step.session = { mode: values.session };
     const args = {};
@@ -148,6 +149,8 @@ const ADD_OPTIONS = {
   'budget-usd': { type: 'string' },
   'budget-per-day': { type: 'string' },
   'budget-per-run': { type: 'boolean', default: false },
+  land: { type: 'string' },
+  base: { type: 'string' },
   default: { type: 'boolean', default: false },
 };
 
@@ -157,7 +160,8 @@ async function cmdAdd(argv) {
   requireTasksDir(repo);
   const [laneName, ...taskParts] = rest;
   if (!laneName) {
-    console.error('taskherd: usage: taskherd add [-C repo] <lane> [--type command|ai|manual] [opts] "<task>"');
+    console.error('taskherd: usage: taskherd add [-C repo] <lane> [--type command|ai|manual] '
+      + '[--isolation worktree|inplace|none] [--land manual-gate|pr|leave] [--base <branch>] [opts] "<task>"');
     process.exit(1);
   }
   const task = taskParts.join(' ');
@@ -165,6 +169,12 @@ async function cmdAdd(argv) {
   const lane = (await laneExists(repo, laneName)) ? await loadLane(repo, laneName) : newLane(laneName);
   const step = buildStepFromOpts(values, task);
   validateStep(step);
+
+  // Isolation, land policy, and base are lane-level (DESIGN §7: "Isolation is
+  // per-lane") — the branch and land decision belong to the lane, not one step.
+  if (values.isolation) lane.isolation = values.isolation;
+  if (values.land) lane.land = values.land;
+  if (values.base) lane.base = values.base;
 
   if (values.default) {
     // Define the lane's recurring default step (DESIGN §6): each fire runs it
@@ -203,11 +213,33 @@ async function cmdAck(argv) {
     console.error('taskherd: usage: taskherd ack [-C repo] <lane>');
     process.exit(1);
   }
-  const { kind, lane } = await ackLane(repo, laneName);
-  if (kind === 'gate') console.log(`taskherd: acked manual gate on '${laneName}', cursor -> ${lane.cursor}`);
+  const { kind, lane, merged } = await ackLane(repo, laneName);
+  if (kind === 'land') console.log(`taskherd: landed '${laneName}' — merged ${merged.branch} into ${merged.base} (${merged.commit}); \`taskherd gc\` reclaims the worktree`);
+  else if (kind === 'gate') console.log(`taskherd: acked manual gate on '${laneName}', cursor -> ${lane.cursor}`);
   else if (kind === 'failure') console.log(`taskherd: cleared parked failure on '${laneName}', will retry`);
   else if (kind === 'budget') console.log(`taskherd: cleared budget block on '${laneName}' (raise the cap or it will re-block)`);
   else console.log(`taskherd: '${laneName}' has no open gate`);
+}
+
+// taskherd gc — remove finished worktrees + prune (DESIGN §7). "Finished" =
+// clean and merged (or the lane file is gone); everything kept says why.
+async function cmdGc(argv) {
+  const { values, positionals } = parseRepoOnly(argv);
+  const { repo } = resolveRepo(values.repo, positionals, { laneless: true });
+  requireTasksDir(repo);
+  if (!(await isGitRepo(repo))) {
+    console.log('taskherd: not a git repository — no worktrees to gc');
+    return;
+  }
+  const projectConfig = await loadProjectConfig(repo);
+  const report = await gcWorktrees(repo, projectConfig.base || null);
+  if (report.length === 0) {
+    console.log('taskherd: no worktrees');
+    return;
+  }
+  for (const r of report) {
+    console.log(`  ${r.action === 'removed' ? '✓' : '·'} ${r.lane}: ${r.action} — ${r.reason}`);
+  }
 }
 
 async function cmdAttach(argv) {
@@ -398,7 +430,8 @@ async function cmdHistory(argv) {
   for (const rec of recent) {
     const cost = typeof rec.cost === 'number' ? `  $${rec.cost.toFixed(4)}` : '';
     const dur = rec.durationMs != null ? `  ${Math.round(rec.durationMs)}ms` : '';
-    console.log(`${rec.ts}  ${rec.lane}#${rec.step} (${rec.type || rec.kind})  ${rec.result}${dur}${cost}`);
+    const commit = rec.commit ? `  @${rec.commit}` : '';
+    console.log(`${rec.ts}  ${rec.lane}#${rec.step} (${rec.type || rec.kind})  ${rec.result}${dur}${commit}${cost}`);
   }
 }
 
@@ -453,6 +486,11 @@ async function cmdDoctor() {
   }
 
   console.log('runtime:');
+  {
+    const ok = commandOnPath('git');
+    if (!ok) problems += 1;
+    console.log(`  ${ok ? '✓' : '✗'} git${ok ? '' : ' not on PATH — worktree/inplace isolation and land need it'}`);
+  }
   try {
     const { createRequire } = await import('node:module');
     const require = createRequire(import.meta.url);
@@ -477,6 +515,7 @@ const COMMANDS = {
   attach: cmdAttach,
   pause: cmdPause,
   resume: cmdResume,
+  gc: cmdGc,
   auth: cmdAuth,
   history: cmdHistory,
   cost: cmdCost,

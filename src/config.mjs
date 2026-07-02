@@ -4,7 +4,7 @@ import { readFile } from 'node:fs/promises';
 import { userConfigFile, projectConfigFile } from './paths.mjs';
 
 const INHERITED_KEYS = [
-  'provider', 'profile', 'runner', 'isolation', 'land',
+  'provider', 'profile', 'runner', 'isolation', 'land', 'base',
   'model', 'budget', 'timeout', 'maxTurns',
 ];
 

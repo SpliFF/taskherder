@@ -87,6 +87,28 @@ export function runSocketLink(repo, laneName) {
   return path.join(runDir(repo), `${laneName}.sock`);
 }
 
+// Worktrees live under user-level state, NOT inside the repo tree (DESIGN §4:
+// a nested checkout inside the gitignored repo confuses git/watchers/IDEs).
+// The repo id keeps a human-readable basename plus a hash so two checkouts
+// with the same basename never collide.
+export function wtBaseDir() {
+  return path.join(taskherdHome(), 'wt');
+}
+
+export function repoId(repo) {
+  const resolved = path.resolve(repo);
+  const hash = createHash('sha1').update(resolved).digest('hex').slice(0, 8);
+  return `${path.basename(resolved)}-${hash}`;
+}
+
+export function wtRepoDir(repo) {
+  return path.join(wtBaseDir(), repoId(repo));
+}
+
+export function worktreeDir(repo, laneName) {
+  return path.join(wtRepoDir(repo), laneName);
+}
+
 export function lockDir(repo) {
   return path.join(repoTasksDir(repo), '.lock');
 }

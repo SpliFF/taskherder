@@ -4,7 +4,16 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import { chmodSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import { initTasksDir } from '../src/tasks.mjs';
+
+const execFileAsync = promisify(execFile);
+
+export async function gitIn(repo, ...args) {
+  const { stdout } = await execFileAsync('git', ['-C', repo, ...args]);
+  return stdout.trim();
+}
 
 // Installs a fake `claude` provider in the test's TASKHERD_HOME: a shell script
 // standing in for the real CLI, plus a providers.json pointing the claude
@@ -40,6 +49,30 @@ export async function makeRepo() {
   const repo = await mkdtemp(path.join(os.tmpdir(), 'taskherd-repo-'));
   const home = await mkdtemp(path.join(os.tmpdir(), 'taskherd-home-'));
   process.env.TASKHERD_HOME = home;
+  await initTasksDir(repo, { globalGitignore: false });
+  return {
+    repo,
+    home,
+    async cleanup() {
+      await rm(repo, { recursive: true, force: true });
+      await rm(home, { recursive: true, force: true });
+    },
+  };
+}
+
+// A real git repo (seed commit on `main`, repo-local identity so nothing
+// depends on the machine's global config) with .tasks/ initialized AFTER
+// `git init`, so the scaffolded config gets the git-repo isolation default.
+export async function makeGitRepo() {
+  const repo = await mkdtemp(path.join(os.tmpdir(), 'taskherd-git-'));
+  const home = await mkdtemp(path.join(os.tmpdir(), 'taskherd-home-'));
+  process.env.TASKHERD_HOME = home;
+  await gitIn(repo, 'init', '-b', 'main');
+  await gitIn(repo, 'config', 'user.email', 'taskherd@test');
+  await gitIn(repo, 'config', 'user.name', 'taskherd test');
+  await writeFile(path.join(repo, 'README.md'), 'seed\n');
+  await gitIn(repo, 'add', 'README.md');
+  await gitIn(repo, 'commit', '-m', 'seed');
   await initTasksDir(repo, { globalGitignore: false });
   return {
     repo,

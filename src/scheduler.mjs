@@ -9,7 +9,9 @@ import {
 } from './paths.mjs';
 import {
   loadLane, loadAllLanesResilient, saveLane, nextAction, resolveStepConfig,
+  defaultFallback, maybeLand, newLane, validateStep,
 } from './tasks.mjs';
+import { loadProjectConfig, loadUserConfig } from './config.mjs';
 import { runStep, formatDuration } from './executor.mjs';
 import { appendEvent } from './events.mjs';
 import { appendHistory, readHistory } from './history.mjs';
@@ -138,6 +140,12 @@ async function gateBudgets(repo, runnable, history, nowIso) {
     }
     const cumulative = checkCumulativeBudget(cfg.budget, history, lane.name);
     if (cumulative) {
+      if (entry.synthetic) {
+        // The zero-config default has no lane file to persist a gate on; a
+        // loud per-tick skip still enforces the cap (history-based).
+        console.error(`taskherd: default step skipped — ${cumulative}`);
+        continue;
+      }
       const fresh = await loadLane(repo, lane.name);
       if (action.kind === 'step' && fresh.steps[action.index]) {
         fresh.steps[action.index].status = 'failed';
@@ -159,10 +167,10 @@ async function gateBudgets(repo, runnable, history, nowIso) {
 // Scans all lanes, transitioning any lane whose next action is a freshly
 // reached manual gate from pending -> blocked (DESIGN §6 step 2). Returns the
 // set of lanes still eligible to run this tick.
-async function scanAndGate(repo, lanes) {
+async function scanAndGate(repo, lanes, fallback) {
   const runnable = [];
   for (const lane of lanes) {
-    const action = nextAction(lane);
+    const action = nextAction(lane, fallback);
     if (action.kind === 'idle') continue;
     if (action.kind === 'step' && action.step.status === 'blocked') continue; // already gated
     if (action.kind === 'step' && action.step.status === 'failed') continue; // parked failure
@@ -206,19 +214,39 @@ export async function tick(repo) {
       // Loud + greppable; a single bad lane file must not brick every tick (DESIGN §1).
       console.error(`taskherd: lane ${bad.name} unloadable: ${bad.error}`);
     }
-    const gated = await scanAndGate(repo, lanes);
+    const [projectConfig, userConfig] = await Promise.all([loadProjectConfig(repo), loadUserConfig()]);
+    const fallback = defaultFallback(projectConfig, userConfig);
+    const gated = await scanAndGate(repo, lanes, fallback);
     const nowIso = new Date().toISOString();
     const history = await readHistory(repo);
-    const runnable = await gateBudgets(repo, gated, history, nowIso);
+    let runnable = await gateBudgets(repo, gated, history, nowIso);
     // gateBudgets may have re-blocked lanes on disk; re-read for an accurate list.
     const attention = await loadAllLanesResilient(repo);
     await writeNeedsAttention(repo, attention.lanes, attention.unloadable);
+
+    // DESIGN §6 fallback (deferred from M2): a repo with no lane files at all
+    // still runs the configured default once per fire — zero-config scheduled
+    // use. Synthetic: nothing is persisted to a lane file.
+    if (runnable.length === 0 && lanes.length === 0 && unloadable.length === 0 && fallback.default) {
+      try {
+        const { onEmpty: _configMarker, ...defStep } = fallback.default;
+        const step = validateStep({ ...defStep, status: 'pending' });
+        const candidate = {
+          lane: newLane('default'),
+          action: { kind: 'default', step, index: 0 },
+          synthetic: true,
+        };
+        runnable = await gateBudgets(repo, [candidate], history, nowIso);
+      } catch (err) {
+        console.error(`taskherd: configured default step is invalid, not running it: ${err.message}`);
+      }
+    }
 
     if (runnable.length === 0) {
       return { outcome: 'idle', lanes: lanes.length, unloadable: unloadable.length };
     }
 
-    const { lane, action } = fairPick(runnable);
+    const { lane, action, synthetic } = fairPick(runnable);
     const state = await readState(repo);
     state.tick = (state.tick || 0) + 1;
 
@@ -249,51 +277,63 @@ export async function tick(repo) {
     // run changed (by index). The snapshot in `lane` predates a possibly-long
     // run; any concurrent `taskherd add`/`ack`/`block` wrote to disk meanwhile
     // and must not be clobbered by re-saving the stale whole-lane snapshot (bug #2).
-    const fresh = await loadLane(repo, lane.name);
-    if (action.kind === 'step') {
-      const freshStep = fresh.steps[action.index];
-      if (result.status === 'done') {
-        if (freshStep) freshStep.status = 'done';
-        fresh.cursor = action.index + 1;
-      } else if (freshStep) {
-        freshStep.attempts = (freshStep.attempts || 0) + 1;
-        // A setup error is a config problem — retrying it is pointless, so park
-        // on the first failure instead of burning a second tick.
-        if (freshStep.attempts < 2 && !result.setupError) {
-          freshStep.status = 'pending'; // one retry, on a future fire
-        } else {
-          freshStep.status = 'failed';
-          freshStep.parkedReason = describeFailure(result);
+    // A synthetic zero-config default has no lane file — nothing to persist.
+    if (!synthetic) {
+      const fresh = await loadLane(repo, lane.name);
+      if (action.kind === 'step') {
+        const freshStep = fresh.steps[action.index];
+        if (result.status === 'done') {
+          if (freshStep) freshStep.status = 'done';
+          fresh.cursor = action.index + 1;
+        } else if (freshStep) {
+          freshStep.attempts = (freshStep.attempts || 0) + 1;
+          // A setup error is a config problem — retrying it is pointless, so park
+          // on the first failure instead of burning a second tick.
+          if (freshStep.attempts < 2 && !result.setupError) {
+            freshStep.status = 'pending'; // one retry, on a future fire
+          } else {
+            freshStep.status = 'failed';
+            freshStep.parkedReason = describeFailure(result);
+            fresh.status = 'blocked';
+            await appendEvent(repo, {
+              event: 'gate.blocked', lane: fresh.name, step: action.index, reason: freshStep.parkedReason,
+            });
+          }
+        }
+      }
+      // Carry an ai session across fires (DESIGN §8) and surface the last cost.
+      if (result.sessionId) fresh.session = { id: result.sessionId };
+      if (result.cost != null) fresh.lastCost = result.cost;
+
+      // Per-run budget (DESIGN §10): a run that overspent its per-run cap can't be
+      // predicted, so it blocks the lane after the fact — even on a successful run.
+      if (result.status === 'done' && result.cost != null) {
+        const perRun = checkPerRunBudget(resolvedConfig.budget, result.cost);
+        if (perRun) {
           fresh.status = 'blocked';
+          fresh.budgetBlock = perRun;
+          if (action.kind === 'step' && fresh.steps[action.index]) {
+            fresh.steps[action.index].parkedReason = perRun;
+          }
           await appendEvent(repo, {
-            event: 'gate.blocked', lane: fresh.name, step: action.index, reason: freshStep.parkedReason,
+            event: 'gate.blocked', lane: fresh.name, step: action.index, reason: perRun,
           });
         }
       }
-    }
-    // Carry an ai session across fires (DESIGN §8) and surface the last cost.
-    if (result.sessionId) fresh.session = { id: result.sessionId };
-    if (result.cost != null) fresh.lastCost = result.cost;
 
-    // Per-run budget (DESIGN §10): a run that overspent its per-run cap can't be
-    // predicted, so it blocks the lane after the fact — even on a successful run.
-    if (result.status === 'done' && result.cost != null) {
-      const perRun = checkPerRunBudget(resolvedConfig.budget, result.cost);
-      if (perRun) {
-        fresh.status = 'blocked';
-        fresh.budgetBlock = perRun;
-        if (action.kind === 'step' && fresh.steps[action.index]) {
-          fresh.steps[action.index].parkedReason = perRun;
-        }
-        await appendEvent(repo, {
-          event: 'gate.blocked', lane: fresh.name, step: action.index, reason: perRun,
-        });
+      // Land (DESIGN §7): a lane that just completed its queue with commits on
+      // its taskherd/<lane> branch lands per policy (gate/pr/leave). Recurring
+      // onEmpty-default lanes never complete, so they never land here.
+      if (action.kind === 'step' && result.status === 'done'
+          && fresh.status !== 'blocked' && fresh.cursor >= fresh.steps.length) {
+        await maybeLand(repo, fresh);
       }
+
+      // action.kind === 'default': synthetic step, not persisted — but the lane's
+      // lastRun below still must advance so fair-pick keeps rotating.
+      fresh.lastRun = state.tick;
+      await saveLane(repo, fresh);
     }
-    // action.kind === 'default': synthetic step, not persisted — but the lane's
-    // lastRun below still must advance so fair-pick keeps rotating.
-    fresh.lastRun = state.tick;
-    await saveLane(repo, fresh);
     await writeState(repo, state);
 
     const after = await loadAllLanesResilient(repo);
@@ -313,6 +353,7 @@ export async function tick(repo) {
       ...(result.tokens && (result.tokens.input != null || result.tokens.output != null)
         ? { tokens: result.tokens } : {}),
       ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+      ...(result.commit ? { commit: result.commit } : {}),
     });
 
     return {

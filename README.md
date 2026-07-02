@@ -5,8 +5,10 @@
 > with manual gates, git-branch isolation, per-account auth, and an optional web
 > console. CLI-first; the GUI is a view over the same files.
 
-**Status:** design complete, implementation starting. The full architecture is in
-**[DESIGN.md](DESIGN.md)** — read it first.
+**Status:** core built through M3 — scheduler + pty/control seam, AI providers +
+auth profiles + budgets, and git isolation (worktrees, `taskherd/<lane>` branches,
+land gates, `gc`). Next: MCP server + `/task` skill (M4). The full architecture is
+in **[DESIGN.md](DESIGN.md)** — read it first.
 
 ## The idea in one picture
 

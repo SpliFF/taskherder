@@ -13,6 +13,11 @@ import {
   taskherdHome,
 } from './paths.mjs';
 import { loadProjectConfig, loadUserConfig, resolveConfig } from './config.mjs';
+import {
+  isGitRepo, laneBranch, branchExists, branchBase, defaultBase, aheadCount,
+  landMerge, pushAndOpenPr,
+} from './git.mjs';
+import { appendEvent } from './events.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -43,16 +48,20 @@ export function validateStep(step) {
   return step;
 }
 
+// Axis fields default to null = inherit (step → lane → project → user config,
+// DESIGN §5). M1 hardcoded 'none'/'manual-gate'/'local' here, which silently
+// pinned every lane and defeated project-level defaults — now only an explicit
+// value overrides.
 export function newLane(name, overrides = {}) {
   return {
     name,
     parent: null,
-    onEmpty: 'idle',
+    onEmpty: null,
     default: null,
-    isolation: 'none',
-    land: 'manual-gate',
+    isolation: null,
+    land: null,
     profile: null,
-    runner: 'local',
+    runner: null,
     provider: null,
     cursor: 0,
     lastRun: 0,
@@ -126,14 +135,31 @@ export async function saveLane(repo, lane) {
   return lane;
 }
 
+// Project/user-level `default`/`onEmpty` (DESIGN §6, deferred from M2): a lane
+// that doesn't set its own falls back to the project's, then the user's. The
+// §5 config example nests `onEmpty` inside the default step object, so both
+// spellings count.
+export function defaultFallback(projectConfig = {}, userConfig = {}) {
+  return {
+    onEmpty: projectConfig.onEmpty ?? projectConfig.default?.onEmpty
+      ?? userConfig.onEmpty ?? userConfig.default?.onEmpty ?? null,
+    default: projectConfig.default ?? userConfig.default ?? null,
+  };
+}
+
 // Determines what the scheduler should do next with this lane, without
-// mutating it. See DESIGN §6 step 5.
-export function nextAction(lane) {
+// mutating it. See DESIGN §6 step 5. `fallback` carries the project/user-level
+// default + onEmpty (defaultFallback above) for lanes that don't set their own.
+export function nextAction(lane, fallback = {}) {
   if (lane.cursor < lane.steps.length) {
     return { kind: 'step', step: lane.steps[lane.cursor], index: lane.cursor };
   }
-  if (lane.onEmpty === 'default' && lane.default) {
-    return { kind: 'default', step: { ...lane.default, status: 'pending' }, index: lane.cursor };
+  const onEmpty = lane.onEmpty ?? fallback.onEmpty ?? 'idle';
+  const def = lane.default ?? fallback.default ?? null;
+  if (onEmpty === 'default' && def) {
+    // Strip the config-side `onEmpty` marker so it doesn't ride into the step.
+    const { onEmpty: _configMarker, ...step } = def;
+    return { kind: 'default', step: { ...step, status: 'pending' }, index: lane.cursor };
   }
   return { kind: 'idle' };
 }
@@ -143,9 +169,77 @@ export async function resolveStepConfig(repo, lane, step) {
   return resolveConfig(step, lane, projectConfig, userConfig);
 }
 
-// Clears whatever gate currently sits at the lane's cursor: a manual gate
-// advances past (cursor++), a parked failure resets for retry in place.
-// Shared by the CLI's `ack` and (later) the MCP `tasks_ack` tool.
+// Land check (DESIGN §7): when a lane has finished its queue and its
+// taskherd/<lane> branch carries commits beyond base, the land policy decides
+// what happens — `manual-gate` (default) appends a blocking gate whose ack
+// merges; `pr` pushes the branch + opens a PR; `leave` does nothing. Mutates
+// `lane` in memory (caller saves). Lanes that recur via an onEmpty default
+// never "complete", so they never land here (§6 steady state); a land-check
+// failure logs loudly and degrades to `leave` — the branch keeps the work.
+export async function maybeLand(repo, lane) {
+  const branch = laneBranch(lane.name);
+  try {
+    const [projectConfig, userConfig] = await Promise.all([loadProjectConfig(repo), loadUserConfig()]);
+    const fallback = defaultFallback(projectConfig, userConfig);
+    const onEmpty = lane.onEmpty ?? fallback.onEmpty ?? 'idle';
+    if (onEmpty === 'default' && (lane.default ?? fallback.default)) return null;
+    if (!(await isGitRepo(repo)) || !(await branchExists(repo, branch))) return null;
+    const cfg = resolveConfig(null, lane, projectConfig, userConfig);
+    const land = cfg.land || 'manual-gate';
+    if (land === 'leave') return null;
+    const base = cfg.base || (await branchBase(repo, branch)) || (await defaultBase(repo));
+    const ahead = await aheadCount(repo, branch, base);
+    if (ahead === 0) return null;
+
+    if (land === 'pr') {
+      try {
+        const url = await pushAndOpenPr(repo, branch, base, lane.name);
+        await appendEvent(repo, {
+          event: 'land.pr', lane: lane.name, branch, base, url,
+        });
+        return { landed: 'pr', url };
+      } catch (err) {
+        const gate = {
+          type: 'manual',
+          message: `land: could not push/PR ${branch}: ${err.message} — land it manually, then ack`,
+          status: 'blocked',
+        };
+        lane.steps.push(gate);
+        lane.status = 'blocked';
+        await appendEvent(repo, {
+          event: 'gate.blocked', lane: lane.name, step: lane.steps.length - 1, reason: gate.message,
+        });
+        return { landed: 'gate', reason: gate.message };
+      }
+    }
+
+    // manual-gate (default): the gate carries the branch/base so ack knows to merge.
+    const gate = {
+      type: 'manual',
+      message: `land: ${branch} is ${ahead} commit(s) ahead of ${base} — review `
+        + `(git diff ${base}...${branch}) and ack to merge`,
+      land: { branch, base },
+      status: 'blocked',
+    };
+    lane.steps.push(gate);
+    lane.status = 'blocked';
+    await appendEvent(repo, {
+      event: 'land.gate', lane: lane.name, branch, base, ahead,
+    });
+    await appendEvent(repo, {
+      event: 'gate.blocked', lane: lane.name, step: lane.steps.length - 1, reason: gate.message,
+    });
+    return { landed: 'gate', reason: gate.message };
+  } catch (err) {
+    console.error(`taskherd: lane ${lane.name} land check failed (branch ${branch} left in place): ${err.message}`);
+    return null;
+  }
+}
+
+// Clears whatever gate currently sits at the lane's cursor: a land gate merges
+// its branch into base first (a failed merge throws and the gate stays), a
+// manual gate advances past (cursor++), a parked failure resets for retry in
+// place. Shared by the CLI's `ack` and (later) the MCP `tasks_ack` tool.
 export async function ackLane(repo, name) {
   const lane = await loadLane(repo, name);
   const step = lane.steps[lane.cursor];
@@ -155,6 +249,9 @@ export async function ackLane(repo, name) {
     if (lane.status === 'blocked' && lane.budgetBlock) {
       lane.status = 'idle';
       delete lane.budgetBlock;
+      // A budget block on the lane's final run suppressed the land check —
+      // clearing it re-runs the check so completed work still lands.
+      if (lane.cursor >= lane.steps.length) await maybeLand(repo, lane);
       await saveLane(repo, lane);
       return { kind: 'budget', lane };
     }
@@ -162,11 +259,23 @@ export async function ackLane(repo, name) {
   }
   delete lane.budgetBlock; // clearing a step-gate also clears any budget marker
   if (step.status === 'blocked') {
+    const land = step.land?.branch ? step.land : null;
+    let merged = null;
+    if (land) {
+      merged = await landMerge(repo, land.branch, land.base); // throws on conflict; gate stays
+      await appendEvent(repo, {
+        event: 'land.merged', lane: name, branch: land.branch, base: land.base, commit: merged,
+      });
+    }
     step.status = 'done';
     lane.cursor += 1;
     lane.status = 'idle';
+    // Acking the final gate can complete the queue — the same land trigger as
+    // a run finishing in the scheduler (a lane ending in a sign-off gate must
+    // still land). An acked land gate's branch is no longer ahead, so no re-gate.
+    if (lane.cursor >= lane.steps.length) await maybeLand(repo, lane);
     await saveLane(repo, lane);
-    return { kind: 'gate', lane };
+    return land ? { kind: 'land', lane, merged: { ...land, commit: merged } } : { kind: 'gate', lane };
   }
   step.status = 'pending';
   step.attempts = 0;
@@ -216,7 +325,10 @@ export async function initTasksDir(repo, { globalGitignore = true } = {}) {
       default: null,
       profile: null,
       runner: 'local',
-      isolation: 'none',
+      // Safety-first (DESIGN §7, §12): a git repo gets worktree isolation by
+      // default — autonomous edits land on taskherd/<lane>, never the user's
+      // checkout. Where there's no repo to isolate, 'none'.
+      isolation: (await isGitRepo(repo)) ? 'worktree' : 'none',
       land: 'manual-gate',
       budget: null,
       timeout: '45m',

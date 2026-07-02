@@ -17,6 +17,9 @@ import {
 import { appendEvent } from './events.mjs';
 import { resolveProvider, renderInvocation, parseCost } from './providers.mjs';
 import { loadProfile, profileEnv, isolationWarnings } from './profiles.mjs';
+import {
+  isGitRepo, ensureWorktree, ensureInplaceBranch, defaultBase, headCommit,
+} from './git.mjs';
 
 // Cap on how much trailing output we keep to scan for a provider's cost JSON.
 // The result object is small and printed last, so the tail is enough.
@@ -138,12 +141,40 @@ function resolveSession(step, lane) {
   return { mode };
 }
 
+// Git isolation (DESIGN §7): where the step's working tree lives. An explicit
+// isolation value wins; unset means worktree when the repo is git-managed
+// ("default for code lanes") and none otherwise. Git isolation configured on a
+// non-repo throws — the lane parks loudly rather than silently running
+// unisolated (§12: a misconfigured guardrail must not degrade quietly).
+async function resolveWorkdir(repo, lane, resolvedConfig) {
+  const gitRepo = await isGitRepo(repo);
+  const isolation = resolvedConfig.isolation ?? (gitRepo ? 'worktree' : 'none');
+  if (isolation === 'none') return { isolation, workdir: repo };
+  if (!gitRepo) {
+    throw new Error(
+      `taskherd: lane ${lane?.name} wants isolation '${isolation}' but ${repo} is not a git repository — set isolation 'none' or git init`,
+    );
+  }
+  const base = resolvedConfig.base || await defaultBase(repo);
+  if (isolation === 'worktree') {
+    return { isolation, workdir: await ensureWorktree(repo, lane.name, base) };
+  }
+  if (isolation === 'inplace') {
+    await ensureInplaceBranch(repo, lane.name, base);
+    return { isolation, workdir: repo };
+  }
+  throw new Error(`taskherd: unknown isolation ${JSON.stringify(isolation)} (worktree | inplace | none)`);
+}
+
 // Builds the concrete spawn spec for a step. `command` → the shell/argv, the
 // ambient env, no cost capture. `ai` → the provider-rendered argv, the profile's
 // isolated env, and cost capture on (DESIGN §8, §9, §13). Throws on setup errors
 // (unknown provider, missing profile/prompt); the scheduler catches those per
-// lane so one misconfigured lane can't brick the tick.
-async function buildInvocation(repo, lane, step, resolvedConfig = {}) {
+// lane so one misconfigured lane can't brick the tick. `workdir` is the
+// isolation-resolved tree the step edits (the {repo} template var — .mcp.json
+// is read from there); file-as-prompt still resolves against the MAIN repo's
+// .tasks/, which never exists inside a worktree (it's gitignored).
+async function buildInvocation(repo, lane, step, resolvedConfig = {}, workdir = repo) {
   if (step.type !== 'ai') {
     const { file, args } = shellArgv(step);
     return {
@@ -162,7 +193,7 @@ async function buildInvocation(repo, lane, step, resolvedConfig = {}) {
   const session = resolveSession(step, lane);
 
   const inv = renderInvocation(provider, {
-    task, model: resolvedConfig.model, permissionMode, maxTurns, session, repo,
+    task, model: resolvedConfig.model, permissionMode, maxTurns, session, repo: workdir,
   });
 
   let env = process.env;
@@ -206,7 +237,9 @@ function killTree(child, signal) {
 // on setup errors (bad argv, unparseable timeout, unknown provider, io).
 export async function runStep(repo, lane, step, index, resolvedConfig) {
   const timeoutMs = parseTimeout(resolvedConfig?.timeout); // throws before any I/O
-  const invocation = await buildInvocation(repo, lane, step, resolvedConfig || {}); // throws before any I/O
+  // Both throw on setup errors, before the socket/log exist — the lane parks.
+  const { isolation, workdir } = await resolveWorkdir(repo, lane, resolvedConfig || {});
+  const invocation = await buildInvocation(repo, lane, step, resolvedConfig || {}, workdir);
 
   const id = randomUUID();
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -286,7 +319,7 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     name: 'xterm-color',
     cols: 80,
     rows: 30,
-    cwd: repo,
+    cwd: workdir,
     env: spawnEnv,
   });
   for (const msg of preSpawn.splice(0)) applyControl(msg);
@@ -353,6 +386,10 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     }
   }
 
+  // §6 audit: the commit the step's tree ended on — meaningful only when git
+  // isolation put the step on a taskherd/<lane> branch.
+  const commit = isolation === 'none' ? null : await headCommit(workdir);
+
   return {
     status,
     exitCode: timedOut ? null : exitCode,
@@ -363,5 +400,6 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     cost,
     tokens,
     sessionId,
+    commit,
   };
 }
