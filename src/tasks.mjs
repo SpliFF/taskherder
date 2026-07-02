@@ -1,6 +1,8 @@
 // Lane store (DESIGN.md §5): load/save lane files, the five-axis step model
 // (command + manual only this milestone — ai lands in M2), config inheritance.
-import { mkdir, readFile, writeFile, readdir, appendFile } from 'node:fs/promises';
+import {
+  mkdir, readFile, writeFile, readdir, appendFile, rename,
+} from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import os from 'node:os';
@@ -88,9 +90,34 @@ export async function loadAllLanes(repo) {
   return lanes;
 }
 
+// Like loadAllLanes but a single broken lane file (bad JSON, an unsupported
+// step type from a hand-edit or a pre-M2 `ai` step) does NOT take down every
+// other lane. Returns the loadable lanes plus a list of the ones that failed so
+// callers can surface them loudly (DESIGN §1: no-silent-failure ≠ fail-everything).
+export async function loadAllLanesResilient(repo) {
+  const names = await listLaneNames(repo);
+  const lanes = [];
+  const unloadable = [];
+  for (const name of names) {
+    try {
+      lanes.push(await loadLane(repo, name));
+    } catch (err) {
+      unloadable.push({ name, error: err.message });
+    }
+  }
+  return { lanes, unloadable };
+}
+
+// Atomic write: lane files are the source of truth, so a crash mid-write must
+// not leave a truncated/corrupt file. Write a sibling temp then rename (atomic
+// on the same filesystem). The temp name avoids `.json` so listLaneNames never
+// picks it up as a lane mid-write.
 export async function saveLane(repo, lane) {
   for (const step of lane.steps || []) validateStep(step);
-  await writeFile(laneFile(repo, lane.name), `${JSON.stringify(lane, null, 2)}\n`);
+  const file = laneFile(repo, lane.name);
+  const tmp = `${file}.${process.pid}.tmp`;
+  await writeFile(tmp, `${JSON.stringify(lane, null, 2)}\n`);
+  await rename(tmp, file);
   return lane;
 }
 

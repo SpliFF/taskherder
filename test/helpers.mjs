@@ -5,6 +5,16 @@ import os from 'node:os';
 import path from 'node:path';
 import { initTasksDir } from '../src/tasks.mjs';
 
+// Poll until `cond()` is truthy (or throw after `timeout`). Used to wait for a
+// run's control socket to appear before attaching in a test.
+export async function waitFor(cond, { timeout = 3000, interval = 10 } = {}) {
+  const start = Date.now();
+  while (!cond()) {
+    if (Date.now() - start > timeout) throw new Error('waitFor: condition never became true');
+    await new Promise((r) => { setTimeout(r, interval); });
+  }
+}
+
 export async function makeRepo() {
   const repo = await mkdtemp(path.join(os.tmpdir(), 'taskherd-repo-'));
   const home = await mkdtemp(path.join(os.tmpdir(), 'taskherd-home-'));
