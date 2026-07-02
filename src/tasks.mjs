@@ -16,7 +16,7 @@ import { loadProjectConfig, loadUserConfig, resolveConfig } from './config.mjs';
 
 const execFileAsync = promisify(execFile);
 
-const STEP_TYPES = ['command', 'manual'];
+const STEP_TYPES = ['command', 'ai', 'manual'];
 
 export class LaneValidationError extends Error {}
 
@@ -26,11 +26,16 @@ export function validateStep(step) {
   }
   if (!STEP_TYPES.includes(step.type)) {
     throw new LaneValidationError(
-      `taskherd: unsupported step type ${JSON.stringify(step.type)} (this milestone supports: ${STEP_TYPES.join(', ')})`,
+      `taskherd: unsupported step type ${JSON.stringify(step.type)} (supported: ${STEP_TYPES.join(', ')})`,
     );
   }
   if (step.type === 'command' && !step.run && !step.argv) {
     throw new LaneValidationError('taskherd: command step needs `run` (shell string) or `argv` (array)');
+  }
+  // `provider` is resolved by inheritance (step → lane → config) at run time, so
+  // it is NOT required here — only a prompt source is (DESIGN §5, §8).
+  if (step.type === 'ai' && !step.task && !step.file) {
+    throw new LaneValidationError('taskherd: ai step needs a `task` (prompt string) or `file` (file-as-prompt path)');
   }
   if (step.type === 'manual' && !step.message) {
     throw new LaneValidationError('taskherd: manual step needs `message`');
@@ -145,8 +150,17 @@ export async function ackLane(repo, name) {
   const lane = await loadLane(repo, name);
   const step = lane.steps[lane.cursor];
   if (!step || (step.status !== 'blocked' && step.status !== 'failed')) {
+    // No step-gate at the cursor: a budget-blocked lane whose gate sits on a
+    // synthetic default step (cursor past end) is cleared here (DESIGN §10).
+    if (lane.status === 'blocked' && lane.budgetBlock) {
+      lane.status = 'idle';
+      delete lane.budgetBlock;
+      await saveLane(repo, lane);
+      return { kind: 'budget', lane };
+    }
     return { kind: 'none', lane };
   }
+  delete lane.budgetBlock; // clearing a step-gate also clears any budget marker
   if (step.status === 'blocked') {
     step.status = 'done';
     lane.cursor += 1;

@@ -12,7 +12,8 @@ import {
 } from './tasks.mjs';
 import { runStep, formatDuration } from './executor.mjs';
 import { appendEvent } from './events.mjs';
-import { appendHistory } from './history.mjs';
+import { appendHistory, readHistory } from './history.mjs';
+import { checkDailyBudget, checkCumulativeBudget, checkPerRunBudget } from './budget.mjs';
 
 const STALE_LOCK_MIN = 15;
 const HEARTBEAT_MS = 60_000; // touch the lock mtime this often while a step runs
@@ -98,7 +99,11 @@ async function writeNeedsAttention(repo, lanes, unloadable = []) {
   const lines = ['# Needs attention', ''];
   for (const lane of blocked) {
     const step = lane.steps[lane.cursor];
-    const reason = step ? (step.type === 'manual' ? step.message : (step.parkedReason || 'failed, parked for review')) : 'blocked';
+    // A budget-blocked lane whose gate is on a synthetic default step has no
+    // step at cursor — fall back to lane.budgetBlock so the reason still shows.
+    const reason = step
+      ? (step.type === 'manual' ? step.message : (step.parkedReason || 'failed, parked for review'))
+      : (lane.budgetBlock || 'blocked');
     lines.push(`- **${lane.name}** (step ${lane.cursor}): ${reason}`);
   }
   for (const bad of unloadable) {
@@ -108,10 +113,47 @@ async function writeNeedsAttention(repo, lanes, unloadable = []) {
 }
 
 function describeFailure(result) {
+  if (result.setupError) return `step could not start: ${result.setupError}`;
   const cause = result.timedOut
     ? `timed out after ${formatDuration(result.timeoutMs)}`
     : `exit ${result.exitCode}`;
-  return `command failed twice (${cause}); see ${result.logPath}`;
+  return `step failed twice (${cause}); see ${result.logPath}`;
+}
+
+// Budget gate (DESIGN §10). For the runnable ai steps, block those already over
+// budget so fair-pick never even runs them: a daily cap SOFT-skips (returns for
+// re-eval next tick, not persisted); a cumulative/per-run cap is a persistent
+// lane gate. Returns the still-runnable subset.
+async function gateBudgets(repo, runnable, history, nowIso) {
+  const stillRunnable = [];
+  for (const entry of runnable) {
+    const { lane, action } = entry;
+    if (action.step.type !== 'ai') { stillRunnable.push(entry); continue; }
+    const cfg = await resolveStepConfig(repo, lane, action.step);
+
+    const daily = checkDailyBudget(cfg.budget, history, lane.name, nowIso);
+    if (daily) {
+      console.error(`taskherd: lane ${lane.name} skipped — ${daily}`);
+      continue; // soft: not persisted, runnable again once the day rolls
+    }
+    const cumulative = checkCumulativeBudget(cfg.budget, history, lane.name);
+    if (cumulative) {
+      const fresh = await loadLane(repo, lane.name);
+      if (action.kind === 'step' && fresh.steps[action.index]) {
+        fresh.steps[action.index].status = 'failed';
+        fresh.steps[action.index].parkedReason = cumulative;
+      }
+      fresh.status = 'blocked';
+      fresh.budgetBlock = cumulative;
+      await saveLane(repo, fresh);
+      await appendEvent(repo, {
+        event: 'gate.blocked', lane: lane.name, step: action.index, reason: cumulative,
+      });
+      continue;
+    }
+    stillRunnable.push(entry);
+  }
+  return stillRunnable;
 }
 
 // Scans all lanes, transitioning any lane whose next action is a freshly
@@ -164,8 +206,13 @@ export async function tick(repo) {
       // Loud + greppable; a single bad lane file must not brick every tick (DESIGN §1).
       console.error(`taskherd: lane ${bad.name} unloadable: ${bad.error}`);
     }
-    const runnable = await scanAndGate(repo, lanes);
-    await writeNeedsAttention(repo, lanes, unloadable); // reflects gated + unloadable lanes
+    const gated = await scanAndGate(repo, lanes);
+    const nowIso = new Date().toISOString();
+    const history = await readHistory(repo);
+    const runnable = await gateBudgets(repo, gated, history, nowIso);
+    // gateBudgets may have re-blocked lanes on disk; re-read for an accurate list.
+    const attention = await loadAllLanesResilient(repo);
+    await writeNeedsAttention(repo, attention.lanes, attention.unloadable);
 
     if (runnable.length === 0) {
       return { outcome: 'idle', lanes: lanes.length, unloadable: unloadable.length };
@@ -177,7 +224,26 @@ export async function tick(repo) {
 
     const step = action.step;
     const resolvedConfig = await resolveStepConfig(repo, lane, step);
-    const result = await runStep(repo, lane, step, action.index, resolvedConfig);
+    let result;
+    try {
+      result = await runStep(repo, lane, step, action.index, resolvedConfig);
+    } catch (err) {
+      // Setup failure (unknown provider, missing profile/prompt, unparseable
+      // timeout). Loud + greppable; a misconfigured lane parks itself as a gate
+      // rather than crashing the tick (bug #5 philosophy, extended to run time).
+      console.error(`taskherd: lane ${lane.name} step ${action.index} could not start: ${err.message}`);
+      result = {
+        status: 'failed',
+        exitCode: null,
+        timedOut: false,
+        durationMs: 0,
+        logPath: null,
+        cost: null,
+        tokens: null,
+        sessionId: null,
+        setupError: err.message,
+      };
+    }
 
     // Re-load the lane from disk before writing back, then patch ONLY what this
     // run changed (by index). The snapshot in `lane` predates a possibly-long
@@ -191,7 +257,9 @@ export async function tick(repo) {
         fresh.cursor = action.index + 1;
       } else if (freshStep) {
         freshStep.attempts = (freshStep.attempts || 0) + 1;
-        if (freshStep.attempts < 2) {
+        // A setup error is a config problem — retrying it is pointless, so park
+        // on the first failure instead of burning a second tick.
+        if (freshStep.attempts < 2 && !result.setupError) {
           freshStep.status = 'pending'; // one retry, on a future fire
         } else {
           freshStep.status = 'failed';
@@ -201,6 +269,25 @@ export async function tick(repo) {
             event: 'gate.blocked', lane: fresh.name, step: action.index, reason: freshStep.parkedReason,
           });
         }
+      }
+    }
+    // Carry an ai session across fires (DESIGN §8) and surface the last cost.
+    if (result.sessionId) fresh.session = { id: result.sessionId };
+    if (result.cost != null) fresh.lastCost = result.cost;
+
+    // Per-run budget (DESIGN §10): a run that overspent its per-run cap can't be
+    // predicted, so it blocks the lane after the fact — even on a successful run.
+    if (result.status === 'done' && result.cost != null) {
+      const perRun = checkPerRunBudget(resolvedConfig.budget, result.cost);
+      if (perRun) {
+        fresh.status = 'blocked';
+        fresh.budgetBlock = perRun;
+        if (action.kind === 'step' && fresh.steps[action.index]) {
+          fresh.steps[action.index].parkedReason = perRun;
+        }
+        await appendEvent(repo, {
+          event: 'gate.blocked', lane: fresh.name, step: action.index, reason: perRun,
+        });
       }
     }
     // action.kind === 'default': synthetic step, not persisted — but the lane's
@@ -216,14 +303,21 @@ export async function tick(repo) {
       lane: lane.name,
       step: action.index,
       kind: action.kind,
+      type: step.type,
       result: result.status,
       exitCode: result.exitCode,
       timedOut: result.timedOut,
       durationMs: result.durationMs,
       logPath: result.logPath,
+      ...(result.cost != null ? { cost: result.cost } : {}),
+      ...(result.tokens && (result.tokens.input != null || result.tokens.output != null)
+        ? { tokens: result.tokens } : {}),
+      ...(result.sessionId ? { sessionId: result.sessionId } : {}),
     });
 
-    return { outcome: 'ran', lane: lane.name, step: action.index, result: result.status };
+    return {
+      outcome: 'ran', lane: lane.name, step: action.index, result: result.status, cost: result.cost ?? null,
+    };
   } finally {
     clearInterval(heartbeat);
     await releaseLock(repo);

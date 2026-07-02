@@ -25,6 +25,24 @@ export function userConfigFile() {
   return path.join(taskherdHome(), 'config.json');
 }
 
+// Provider templates (DESIGN §8) merged over the built-in defaults.
+export function providersFile() {
+  return path.join(taskherdHome(), 'providers.json');
+}
+
+// Per-account auth contexts (DESIGN §9): ~/.taskherd/profiles/<name>/profile.json.
+export function profilesDir() {
+  return path.join(taskherdHome(), 'profiles');
+}
+
+export function profileDir(name) {
+  return path.join(profilesDir(), name);
+}
+
+export function profileFile(name) {
+  return path.join(profileDir(name), 'profile.json');
+}
+
 export function logsDir(repo) {
   return path.join(repoTasksDir(repo), 'logs');
 }

@@ -21,11 +21,24 @@ function lastResultLabel(last) {
   return `${last.result}${last.exitCode != null ? ` (exit ${last.exitCode})` : ''}`;
 }
 
+function fmtUsd(n) {
+  return `$${Number(n).toFixed(4)}`;
+}
+
 export async function renderStatus(repo) {
   const { lanes, unloadable } = await loadAllLanesResilient(repo);
   const history = await readHistory(repo);
   if (lanes.length === 0 && unloadable.length === 0) {
     return 'no lanes yet — `taskherd add <lane> "<task>"` to create one';
+  }
+
+  // Running cost totals (DESIGN §10).
+  const spentByLane = {};
+  let grandTotal = 0;
+  for (const rec of history) {
+    if (typeof rec.cost !== 'number') continue;
+    spentByLane[rec.lane] = (spentByLane[rec.lane] || 0) + rec.cost;
+    grandTotal += rec.cost;
   }
 
   const lines = [];
@@ -36,15 +49,19 @@ export async function renderStatus(repo) {
     // that this lane's step is executing right now (DESIGN §13).
     const running = existsSync(runSocketLink(repo, lane.name));
     const state = running ? 'running' : lane.status;
-    lines.push(`${lane.name}  [${lane.cursor}/${total}]  ${state}  last: ${lastResultLabel(last)}`);
-    if (lane.status === 'blocked' && lane.steps[lane.cursor]) {
+    const spent = spentByLane[lane.name] ? `  spent: ${fmtUsd(spentByLane[lane.name])}` : '';
+    lines.push(`${lane.name}  [${lane.cursor}/${total}]  ${state}  last: ${lastResultLabel(last)}${spent}`);
+    if (lane.status === 'blocked') {
       const step = lane.steps[lane.cursor];
-      const reason = step.type === 'manual' ? step.message : (step.parkedReason || 'failed, parked for review');
+      const reason = step
+        ? (step.type === 'manual' ? step.message : (step.parkedReason || 'failed, parked for review'))
+        : (lane.budgetBlock || 'blocked');
       lines.push(`  gate: ${reason}`);
     }
   }
   for (const bad of unloadable) {
     lines.push(`${bad.name}  [unloadable]  ${bad.error}`);
   }
+  if (grandTotal > 0) lines.push(`total spent: ${fmtUsd(grandTotal)}`);
   return lines.join('\n');
 }

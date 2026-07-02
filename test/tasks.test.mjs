@@ -24,11 +24,15 @@ test('lane save/load round-trip preserves steps', async (t) => {
 });
 
 test('validateStep rejects unknown types and missing required fields', () => {
-  assert.throws(() => validateStep({ type: 'ai', task: '/work' }), LaneValidationError);
+  assert.throws(() => validateStep({ type: 'frobnicate' }), LaneValidationError);
   assert.throws(() => validateStep({ type: 'command' }), LaneValidationError);
   assert.throws(() => validateStep({ type: 'manual' }), LaneValidationError);
+  // ai needs a prompt source (task or file); provider is resolved by inheritance.
+  assert.throws(() => validateStep({ type: 'ai', provider: 'claude' }), LaneValidationError);
   assert.doesNotThrow(() => validateStep({ type: 'command', run: 'echo hi' }));
   assert.doesNotThrow(() => validateStep({ type: 'manual', message: 'ok' }));
+  assert.doesNotThrow(() => validateStep({ type: 'ai', task: '/work' }));
+  assert.doesNotThrow(() => validateStep({ type: 'ai', file: 'desc/x.md' }));
 });
 
 test('nextAction: pending step at cursor is the next action', () => {

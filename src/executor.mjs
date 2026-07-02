@@ -5,16 +5,22 @@
 import {
   createWriteStream, existsSync, chmodSync, statSync, readdirSync, mkdirSync,
 } from 'node:fs';
-import { rm, symlink } from 'node:fs/promises';
+import { rm, symlink, readFile } from 'node:fs/promises';
 import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import pty from 'node-pty';
 import {
-  logsDir, runtimeDir, runSocketPath, runSocketLink,
+  logsDir, runtimeDir, runSocketPath, runSocketLink, repoTasksDir,
 } from './paths.mjs';
 import { appendEvent } from './events.mjs';
+import { resolveProvider, renderInvocation, parseCost } from './providers.mjs';
+import { loadProfile, profileEnv, isolationWarnings } from './profiles.mjs';
+
+// Cap on how much trailing output we keep to scan for a provider's cost JSON.
+// The result object is small and printed last, so the tail is enough.
+const COST_CAPTURE_MAX = 256 * 1024;
 
 const DEFAULT_TIMEOUT_MS = 45 * 60 * 1000; // 45m, matches config.json's default
 const RING_MAX_BYTES = 64 * 1024; // late-attach replay buffer (DESIGN §13)
@@ -104,6 +110,81 @@ function shellArgv(step) {
   return { file: shell, args: [flag, step.run] };
 }
 
+// file-as-prompt (DESIGN §5): a `file` path resolves relative to the repo's
+// .tasks/ dir (so `desc/x.md` → .tasks/desc/x.md), unless absolute. `task` is a
+// literal prompt string.
+async function resolvePrompt(repo, step) {
+  if (step.file) {
+    const p = path.isAbsolute(step.file) ? step.file : path.join(repoTasksDir(repo), step.file);
+    return readFile(p, 'utf8');
+  }
+  return step.task;
+}
+
+// Session mode for an ai step (DESIGN §8). `resume` threads an id from the step
+// or, for a lane carrying a session across fires, from lane.session.id. Without
+// an id there is nothing to resume, so it degrades to fresh — loudly.
+function resolveSession(step, lane) {
+  const s = step.session || {};
+  const mode = s.mode || 'fresh';
+  if (mode === 'resume') {
+    const id = s.id || lane?.session?.id || null;
+    if (!id) {
+      console.error(`taskherd: WARNING lane ${lane?.name} requested session resume but no session id is known yet — starting fresh`);
+      return { mode: 'fresh' };
+    }
+    return { mode: 'resume', id };
+  }
+  return { mode };
+}
+
+// Builds the concrete spawn spec for a step. `command` → the shell/argv, the
+// ambient env, no cost capture. `ai` → the provider-rendered argv, the profile's
+// isolated env, and cost capture on (DESIGN §8, §9, §13). Throws on setup errors
+// (unknown provider, missing profile/prompt); the scheduler catches those per
+// lane so one misconfigured lane can't brick the tick.
+async function buildInvocation(repo, lane, step, resolvedConfig = {}) {
+  if (step.type !== 'ai') {
+    const { file, args } = shellArgv(step);
+    return {
+      file, args, env: process.env, captureCost: false,
+    };
+  }
+
+  const providerName = resolvedConfig.provider || step.provider;
+  if (!providerName) {
+    throw new Error(`taskherd: ai step in lane ${lane?.name} has no provider — set it on the step, lane, or config.json (DESIGN §8)`);
+  }
+  const provider = await resolveProvider(providerName);
+  const task = await resolvePrompt(repo, step);
+  const maxTurns = step.args?.maxTurns ?? resolvedConfig.maxTurns ?? null;
+  const permissionMode = step.args?.permissionMode ?? null;
+  const session = resolveSession(step, lane);
+
+  const inv = renderInvocation(provider, {
+    task, model: resolvedConfig.model, permissionMode, maxTurns, session, repo,
+  });
+
+  let env = process.env;
+  const profileName = resolvedConfig.profile || step.profile;
+  if (profileName) {
+    const profile = await loadProfile(profileName);
+    for (const w of isolationWarnings(profile)) {
+      console.error(`taskherd: profile '${profileName}' ${w}`);
+    }
+    env = { ...process.env, ...profileEnv(profile) };
+  }
+
+  // Loud whenever an autonomous, un-gated permission model is in force (DESIGN §12).
+  if (inv.permissionMode === 'bypassPermissions') {
+    console.error(`taskherd: WARNING lane ${lane?.name} runs ${provider.command} with --permission-mode bypassPermissions (autonomous, no approval gate) — DESIGN §12`);
+  }
+
+  return {
+    file: inv.command, args: inv.args, env, captureCost: inv.captureCost,
+  };
+}
+
 // node-pty puts the child in its own session (pgid == pid), so signalling the
 // process *group* reaches children the shell spawned (a timed-out `npm test`'s
 // workers), which a bare child.kill() would orphan holding the pty open.
@@ -119,12 +200,13 @@ function killTree(child, signal) {
   }
 }
 
-// Runs one `command` step to completion. Resolves
-// { status: 'done'|'failed', exitCode, timedOut, timeoutMs, durationMs, logPath }.
-// Never rejects on the child's own failure — only on setup errors (bad argv,
-// unparseable timeout, io).
+// Runs one step (`command` or `ai`) to completion. Resolves
+// { status: 'done'|'failed', exitCode, timedOut, timeoutMs, durationMs, logPath,
+//   cost, tokens, sessionId }. Never rejects on the child's own failure — only
+// on setup errors (bad argv, unparseable timeout, unknown provider, io).
 export async function runStep(repo, lane, step, index, resolvedConfig) {
   const timeoutMs = parseTimeout(resolvedConfig?.timeout); // throws before any I/O
+  const invocation = await buildInvocation(repo, lane, step, resolvedConfig || {}); // throws before any I/O
 
   const id = randomUUID();
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -135,9 +217,12 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   await rm(sockPath, { force: true });
   await rm(sockLink, { force: true });
 
-  const { file, args } = shellArgv(step);
+  const { file, args, env: spawnEnv } = invocation;
   const logStream = createWriteStream(logPath);
   const clients = new Set();
+
+  // Trailing output kept for cost-JSON parsing (ai steps only, DESIGN §10).
+  let costCapture = invocation.captureCost ? '' : null;
 
   // Ring buffer of recent output lines for late attach (DESIGN §13).
   const ring = [];
@@ -202,7 +287,7 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     cols: 80,
     rows: 30,
     cwd: repo,
-    env: process.env,
+    env: spawnEnv,
   });
   for (const msg of preSpawn.splice(0)) applyControl(msg);
 
@@ -210,6 +295,10 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
 
   child.onData((data) => {
     logStream.write(data);
+    if (costCapture !== null) {
+      costCapture += data;
+      if (costCapture.length > COST_CAPTURE_MAX) costCapture = costCapture.slice(-COST_CAPTURE_MAX);
+    }
     const line = `${JSON.stringify({ ts: new Date().toISOString(), event: 'output', lane: lane.name, step: index, id, data: Buffer.from(data, 'utf8').toString('base64') })}\n`;
     pushRing(line);
     for (const socket of clients) socket.write(line);
@@ -246,12 +335,33 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   await rm(sockPath, { force: true });
   await rm(sockLink, { force: true });
 
+  const status = exitCode === 0 && !timedOut ? 'done' : 'failed';
+
+  // Cost logging (DESIGN §10). A provider we asked for cost JSON that produced
+  // none on a clean exit is a loud, greppable stand-in — never a silent $0.
+  let cost = null;
+  let tokens = null;
+  let sessionId = null;
+  if (costCapture !== null) {
+    const parsed = parseCost(costCapture);
+    if (parsed) {
+      cost = parsed.usd;
+      tokens = { input: parsed.inputTokens, output: parsed.outputTokens };
+      sessionId = parsed.sessionId;
+    } else if (status === 'done') {
+      console.error(`FIDELITY-STANDIN: could not parse ${file} cost JSON for lane ${lane.name} step ${index} — cost not logged (DESIGN §10)`);
+    }
+  }
+
   return {
-    status: exitCode === 0 && !timedOut ? 'done' : 'failed',
+    status,
     exitCode: timedOut ? null : exitCode,
     timedOut,
     timeoutMs,
     durationMs,
     logPath,
+    cost,
+    tokens,
+    sessionId,
   };
 }

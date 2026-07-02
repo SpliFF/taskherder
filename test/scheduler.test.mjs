@@ -10,7 +10,11 @@ import {
   needsAttentionFile, pausedFile, lockDir, lockPidFile, laneFile,
 } from '../src/paths.mjs';
 import { readHistory } from '../src/history.mjs';
-import { makeRepo } from './helpers.mjs';
+import { makeRepo, installFakeClaude } from './helpers.mjs';
+
+const FAKE_CLAUDE = `#!/bin/sh
+echo '{"total_cost_usd":0.01,"session_id":"s1","usage":{"input_tokens":5,"output_tokens":5}}'
+`;
 
 const AGED = () => new Date(Date.now() - 60 * 60_000); // an hour ago, well past STALE_LOCK_MIN
 
@@ -204,8 +208,8 @@ test('resilient: one unloadable lane file does not brick a healthy lane (bug #5)
   const healthy = newLane('healthy');
   healthy.steps.push({ type: 'command', run: 'echo ok', status: 'pending' });
   await saveLane(repo, healthy);
-  // A hand-authored `ai` step is unsupported this milestone -> loadLane throws.
-  await writeFile(laneFile(repo, 'broken'), JSON.stringify({ name: 'broken', cursor: 0, steps: [{ type: 'ai', task: '/work' }] }));
+  // A hand-authored step of an unknown type is unsupported -> loadLane throws.
+  await writeFile(laneFile(repo, 'broken'), JSON.stringify({ name: 'broken', cursor: 0, steps: [{ type: 'frobnicate', run: 'x' }] }));
 
   const result = await tick(repo);
   assert.equal(result.outcome, 'ran');
@@ -241,6 +245,78 @@ test('timeout park reason reads "timed out after ..." not "exit null" (bug #4)',
 
   const history = await readHistory(repo);
   assert.equal(history.at(-1).timedOut, true, 'history records the timeout');
+});
+
+test('ai step runs via the scheduler and its cost lands in history (M2 exit)', async (t) => {
+  const { repo, home, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await installFakeClaude(home, FAKE_CLAUDE);
+
+  const lane = newLane('work');
+  lane.steps.push({ type: 'ai', task: '/work', provider: 'claude', status: 'pending' });
+  await saveLane(repo, lane);
+
+  const result = await tick(repo);
+  assert.equal(result.result, 'done');
+  assert.equal(result.cost, 0.01, 'the run reports its parsed cost');
+
+  const history = await readHistory(repo);
+  assert.equal(history.at(-1).cost, 0.01, 'cost is recorded in history.jsonl (DESIGN §10)');
+  assert.equal(history.at(-1).type, 'ai');
+
+  const reloaded = await loadLane(repo, 'work');
+  assert.equal(reloaded.session.id, 's1', 'the session id is carried on the lane for the next fire');
+});
+
+test('spend cap: a cumulative budget blocks the lane once exhausted (M2 exit)', async (t) => {
+  const { repo, home, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await installFakeClaude(home, FAKE_CLAUDE); // each run costs $0.01
+
+  // A recurring /work lane (onEmpty=default) with a $0.005 lifetime cap.
+  const lane = newLane('work', {
+    onEmpty: 'default',
+    default: { type: 'ai', task: '/work', provider: 'claude', budget: { usd: 0.005 } },
+  });
+  await saveLane(repo, lane);
+
+  const first = await tick(repo);
+  assert.equal(first.outcome, 'ran', 'first fire runs (nothing spent yet)');
+  assert.equal(first.cost, 0.01);
+
+  const second = await tick(repo);
+  assert.equal(second.outcome, 'idle', 'the lane is now over budget, nothing runnable');
+
+  const reloaded = await loadLane(repo, 'work');
+  assert.equal(reloaded.status, 'blocked');
+  assert.match(reloaded.budgetBlock, /budget exhausted/);
+
+  const attention = await readFile(needsAttentionFile(repo), 'utf8');
+  assert.match(attention, /budget exhausted/);
+
+  // Acking clears the (soft) budget block.
+  const acked = await ackLane(repo, 'work');
+  assert.equal(acked.kind, 'budget');
+  const cleared = await loadLane(repo, 'work');
+  assert.equal(cleared.status, 'idle');
+  assert.equal(cleared.budgetBlock, undefined);
+});
+
+test('a misconfigured ai step parks immediately (setup error, not a crash)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+
+  const lane = newLane('work');
+  lane.steps.push({ type: 'ai', task: '/work', provider: 'nonesuch', status: 'pending' });
+  await saveLane(repo, lane);
+
+  const result = await tick(repo);
+  assert.equal(result.result, 'failed');
+
+  const reloaded = await loadLane(repo, 'work');
+  assert.equal(reloaded.steps[0].status, 'failed', 'parked on the FIRST failure (retrying a config error is pointless)');
+  assert.equal(reloaded.status, 'blocked');
+  assert.match(reloaded.steps[0].parkedReason, /could not start.*unknown provider/s);
 });
 
 test('ack of a parked failure resets attempts and the step re-runs', async (t) => {
