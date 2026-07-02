@@ -22,14 +22,34 @@
     "url": "https://github.com/SpliFF/taskherder/issues"
   },
   "keywords": [
-    "cron", "scheduler", "tasks", "task-runner", "ai", "agents",
-    "claude", "codex", "copilot", "automation", "cli", "worktree", "mcp"
+    "cron",
+    "scheduler",
+    "tasks",
+    "task-runner",
+    "ai",
+    "agents",
+    "claude",
+    "codex",
+    "copilot",
+    "automation",
+    "cli",
+    "worktree",
+    "mcp"
   ],
   "files": [
-    "bin/", "src/", "skill/", "web/dist/", "README.md", "DESIGN.md", "LICENSE", "NOTICE"
+    "bin/",
+    "src/",
+    "skill/",
+    "web/dist/",
+    "README.md",
+    "DESIGN.md",
+    "LICENSE",
+    "NOTICE"
   ],
   "scripts": {
     "test": "node --test"
   },
-  "dependencies": {}
+  "dependencies": {
+    "node-pty": "^1.1.0"
+  }
 }
