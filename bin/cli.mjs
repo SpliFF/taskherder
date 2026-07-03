@@ -21,6 +21,7 @@ import {
 import { tick } from '../src/scheduler.mjs';
 import { renderStatus, readHistory } from '../src/history.mjs';
 import { loadProviders } from '../src/providers.mjs';
+import { loadRunners } from '../src/runners.mjs';
 import { listProfiles, loadProfile, isolationWarnings } from '../src/profiles.mjs';
 import { isGitRepo, gcWorktrees } from '../src/git.mjs';
 import { loadProjectConfig } from '../src/config.mjs';
@@ -594,6 +595,36 @@ async function cmdDoctor() {
     const ok = commandOnPath(def.command);
     if (!ok) problems += 1;
     console.log(`  ${ok ? '✓' : '✗'} ${name} -> ${def.command}${ok ? '' : ' (not on PATH)'}`);
+  }
+
+  console.log('runners:');
+  {
+    // local is always available; docker/ssh need their client on PATH. A named
+    // runner in runners.json is checked against the CLI its kind requires.
+    console.log('  ✓ local (host)');
+    let runners = {};
+    try {
+      runners = await loadRunners();
+    } catch (err) {
+      problems += 1;
+      console.log(`  ✗ runners.json: ${err.message}`);
+    }
+    const names = Object.keys(runners);
+    if (names.length === 0) {
+      console.log('  · no named runners (~/.taskherd/runners.json) — inline docker:<ctr> / ssh:<host> still work');
+    }
+    for (const [name, def] of names.map((n) => [n, runners[n]])) {
+      const cli = def.kind === 'ssh' ? 'ssh' : 'docker';
+      const ok = def.kind === 'docker' || def.kind === 'ssh' ? commandOnPath(cli) : false;
+      if (!ok) problems += 1;
+      const target = def.container || def.image || def.host || '?';
+      console.log(`  ${ok ? '✓' : '✗'} ${name} (${def.kind || 'no kind'} → ${target})${ok ? '' : ` — ${def.kind ? `${cli} not on PATH` : 'needs "kind": docker|ssh'}`}`);
+    }
+    // Flag the inline-runner CLIs so `docker:`/`ssh:` axis values fail loud, not late.
+    for (const cli of ['docker', 'ssh']) {
+      const ok = commandOnPath(cli);
+      console.log(`  ${ok ? '✓' : '·'} ${cli} ${ok ? 'on PATH' : `not on PATH — ${cli}:<…> runners will park a lane`}`);
+    }
   }
 
   console.log('profiles:');

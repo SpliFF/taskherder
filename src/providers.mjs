@@ -8,8 +8,25 @@ import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { providersFile } from './paths.mjs';
 
-// DESIGN §8 flag table, verbatim intent. Codex/Copilot land in M6; an unknown
-// provider errors loudly rather than silently doing nothing (DESIGN §1).
+// DESIGN §8 flag table. Claude is the reference (M2, fully live-verified);
+// codex + copilot land in M6. An unknown provider errors loudly rather than
+// silently doing nothing (DESIGN §1). `leadArgs` (codex) render a subcommand
+// immediately after the command, before any flags — for CLIs shaped
+// `cmd <subcommand> [flags] <prompt>` rather than claude's `cmd [flags] -p`.
+//
+// NOT-LIVE-VERIFIED (codex, copilot): neither CLI is installed on the dev
+// machine, so these templates are best-effort from DESIGN §8 + each tool's
+// public non-interactive interface, exercised only at the argv-rendering level
+// (test/providers.test.mjs). Override any flag in ~/.taskherd/providers.json if
+// your installed version differs — that's the §8 escape hatch. Two honest gaps:
+//   • Cost logging (§10) is claude-shaped (`total_cost_usd` in one result
+//     object). codex/copilot emit different/ no cost JSON, so `costJson` is
+//     unset — cost stays null (honest, not a silent $0) until a provider-
+//     specific parser lands.
+//   • DESIGN §8's copilot example uses `--acp` (an Agent Client Protocol stdio
+//     SERVER — it needs a protocol client, not a prompt, so it does NOT fit the
+//     one-shot pty seam). We use copilot's non-interactive `-p` shape instead;
+//     wiring a real ACP client is a later milestone.
 export const BUILTIN_PROVIDERS = {
   claude: {
     command: 'claude',
@@ -26,6 +43,25 @@ export const BUILTIN_PROVIDERS = {
     mcpArgs: ['--mcp-config', '{mcpConfig}', '--strict-mcp-config'],
     maxTurnsArg: ['--max-turns', '{maxTurns}'],
     costJson: ['--output-format', 'json'], // parsed for §10 cost logging
+  },
+  codex: {
+    // `codex exec [flags] "<prompt>"` — the `exec` subcommand must lead, so it
+    // is a leadArg (not a promptArg, which renders last). Autonomy is granted by
+    // --sandbox, not a --permission-mode flag; --model is honored when set.
+    command: 'codex',
+    leadArgs: ['exec'],
+    modelArg: ['--model', '{model}'],
+    sessionArgs: { resume: ['resume', '{id}'] }, // `codex exec resume <id>` continues a session
+    defaultArgs: ['--sandbox', 'workspace-write'],
+    promptArgs: ['{task}'], // positional prompt, last
+  },
+  copilot: {
+    // GitHub Copilot CLI non-interactive: `copilot -p "<prompt>" --allow-all-tools`.
+    // (NOT DESIGN §8's `--acp` server form — see the header note.)
+    command: 'copilot',
+    promptArgs: ['-p', '{task}'],
+    modelArg: ['--model', '{model}'],
+    defaultArgs: ['--allow-all-tools'],
   },
 };
 
@@ -83,6 +119,11 @@ export function renderInvocation(provider, {
   task, model, permissionMode, maxTurns, session, repo, mcpConfig, mcp = true,
 } = {}) {
   const args = [];
+
+  // A leading subcommand (codex `exec`) renders first, before any flags/prompt —
+  // some CLIs are `cmd <subcommand> [flags] <prompt>` rather than claude's flag-
+  // first shape. Literal (no template vars), so it never drops.
+  if (provider.leadArgs) args.push(...provider.leadArgs);
 
   const mode = session?.mode || 'fresh';
   if (mode === 'resume' && session?.id && provider.sessionArgs?.resume) {

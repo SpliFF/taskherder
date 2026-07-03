@@ -73,6 +73,26 @@ test('renderInvocation: a template needing a task but given none throws loudly',
   assert.throws(() => renderInvocation(claude, { repo: '/nope' }), /no `task`\/`file`/);
 });
 
+test('renderInvocation: codex leads with the `exec` subcommand, prompt positional-last (M6)', () => {
+  const inv = renderInvocation(BUILTIN_PROVIDERS.codex, { task: 'do it', model: 'gpt-5', repo: '/nope' });
+  assert.equal(inv.command, 'codex');
+  assert.equal(inv.args[0], 'exec', 'the subcommand leads, before any flags');
+  assert.equal(inv.args[inv.args.length - 1], 'do it', 'the prompt is the trailing positional');
+  assert.ok(inv.args.includes('--model') && inv.args.includes('gpt-5'));
+  assert.ok(inv.args.includes('--sandbox') && inv.args.includes('workspace-write'));
+  assert.ok(!inv.args.includes('--permission-mode'), 'codex autonomy is --sandbox, not --permission-mode');
+  assert.equal(inv.captureCost, false, 'no codex-shaped cost JSON yet — cost stays null, not a silent $0');
+});
+
+test('renderInvocation: copilot uses the non-interactive -p prompt (not the §8 --acp server form) (M6)', () => {
+  const inv = renderInvocation(BUILTIN_PROVIDERS.copilot, { task: 'ship it', repo: '/nope' });
+  assert.equal(inv.command, 'copilot');
+  assert.deepEqual(inv.args.slice(-2), ['-p', 'ship it'], 'prompt via -p, last');
+  assert.ok(inv.args.includes('--allow-all-tools'));
+  assert.ok(!inv.args.includes('--acp'), '--acp is a protocol server, not a one-shot prompt runner');
+  assert.equal(inv.captureCost, false);
+});
+
 test('lastJsonObject: extracts the last top-level (nested) object after leading noise', () => {
   const text = 'starting run...\nfetched 3 items\n{"a":1,"b":{"c":2}}\n';
   assert.deepEqual(lastJsonObject(text), { a: 1, b: { c: 2 } });

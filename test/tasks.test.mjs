@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { writeFile, readdir } from 'node:fs/promises';
 import {
   newLane, saveLane, loadLane, nextAction, validateStep, LaneValidationError,
-  loadAllLanesResilient,
+  loadAllLanesResilient, buildStep,
 } from '../src/tasks.mjs';
 import { laneFile } from '../src/paths.mjs';
 import { makeRepo } from './helpers.mjs';
@@ -33,6 +33,17 @@ test('validateStep rejects unknown types and missing required fields', () => {
   assert.doesNotThrow(() => validateStep({ type: 'manual', message: 'ok' }));
   assert.doesNotThrow(() => validateStep({ type: 'ai', task: '/work' }));
   assert.doesNotThrow(() => validateStep({ type: 'ai', file: 'desc/x.md' }));
+});
+
+test('buildStep: a command step carries the runner axis (M6 — was silently dropped)', () => {
+  const cmd = buildStep({ type: 'command', run: 'make build', runner: 'docker:ci' });
+  assert.equal(cmd.type, 'command');
+  assert.equal(cmd.run, 'make build');
+  assert.equal(cmd.runner, 'docker:ci', 'a containerized/remote command must keep its runner (DESIGN §11)');
+  // still optional — a plain local command has no runner key
+  assert.equal(buildStep({ type: 'command', run: 'ls' }).runner, undefined);
+  // ai parity (unchanged)
+  assert.equal(buildStep({ type: 'ai', task: '/work', runner: 'ssh:box' }).runner, 'ssh:box');
 });
 
 test('nextAction: pending step at cursor is the next action', () => {

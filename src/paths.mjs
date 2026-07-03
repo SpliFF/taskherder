@@ -30,6 +30,12 @@ export function providersFile() {
   return path.join(taskherdHome(), 'providers.json');
 }
 
+// Runner definitions (DESIGN §11): ~/.taskherd/runners.json — docker/ssh runner
+// specs keyed by name (local is implicit and needs no entry).
+export function runnersFile() {
+  return path.join(taskherdHome(), 'runners.json');
+}
+
 // Per-account auth contexts (DESIGN §9): ~/.taskherd/profiles/<name>/profile.json.
 export function profilesDir() {
   return path.join(taskherdHome(), 'profiles');

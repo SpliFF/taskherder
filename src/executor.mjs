@@ -19,6 +19,7 @@ import {
 } from './paths.mjs';
 import { appendEvent } from './events.mjs';
 import { resolveProvider, renderInvocation, parseCost } from './providers.mjs';
+import { resolveRunner, wrapForRunner } from './runners.mjs';
 import { loadProfile, profileEnv, isolationWarnings } from './profiles.mjs';
 import {
   isGitRepo, ensureWorktree, ensureInplaceBranch, defaultBase, headCommit,
@@ -109,8 +110,12 @@ export function formatDuration(ms) {
   return `${ms}ms`;
 }
 
-function shellArgv(step) {
+function shellArgv(step, runnerKind = 'local') {
   if (step.argv) return { file: step.argv[0], args: step.argv.slice(1) };
+  // A `run` string on a docker/ssh runner is interpreted by a shell that exists
+  // in the RUNNER env (a Linux container / remote host), so use POSIX /bin/sh —
+  // the host's $SHELL (e.g. /bin/zsh) is absent there. Local keeps $SHELL.
+  if (runnerKind !== 'local') return { file: '/bin/sh', args: ['-c', step.run] };
   const shell = process.platform === 'win32' ? 'cmd.exe' : (process.env.SHELL || '/bin/sh');
   const flag = process.platform === 'win32' ? '/c' : '-c';
   return { file: shell, args: [flag, step.run] };
@@ -211,19 +216,22 @@ export async function writeMcpConfig(repo, lane, workdir) {
   return file;
 }
 
-// Builds the concrete spawn spec for a step. `command` → the shell/argv, the
-// ambient env, no cost capture. `ai` → the provider-rendered argv, the profile's
-// isolated env, and cost capture on (DESIGN §8, §9, §13). Throws on setup errors
-// (unknown provider, missing profile/prompt); the scheduler catches those per
-// lane so one misconfigured lane can't brick the tick. `workdir` is the
-// isolation-resolved tree the step edits (the {repo} template var — .mcp.json
-// is read from there); file-as-prompt still resolves against the MAIN repo's
-// .tasks/, which never exists inside a worktree (it's gitignored).
-async function buildInvocation(repo, lane, step, resolvedConfig = {}, workdir = repo) {
+// Builds the INNER invocation for a step (what runs, before the runner axis wraps
+// it — §11). `command` → the shell/argv, no auth env, no cost capture. `ai` → the
+// provider-rendered argv, the profile's isolated auth env delta (`extraEnv`), and
+// cost capture on (DESIGN §8, §9, §13). Throws on setup errors (unknown provider,
+// missing profile/prompt); the scheduler catches those per lane so one
+// misconfigured lane can't brick the tick. `workdir` is the isolation-resolved
+// tree the step edits (the {repo} template var — .mcp.json is read from there);
+// file-as-prompt still resolves against the MAIN repo's .tasks/, which never
+// exists inside a worktree (it's gitignored). `mcpEnabled` is false under a
+// non-local runner — the host taskherd-mcp can't run there (§11), so we don't
+// hand the provider a --mcp-config at a host path that won't exist in the runner.
+async function buildInvocation(repo, lane, step, resolvedConfig = {}, workdir = repo, { mcpEnabled = true, runnerKind = 'local' } = {}) {
   if (step.type !== 'ai') {
-    const { file, args } = shellArgv(step);
+    const { file, args } = shellArgv(step, runnerKind);
     return {
-      file, args, env: process.env, captureCost: false,
+      file, args, extraEnv: {}, captureCost: false,
     };
   }
 
@@ -237,19 +245,19 @@ async function buildInvocation(repo, lane, step, resolvedConfig = {}, workdir = 
   const permissionMode = step.args?.permissionMode ?? null;
   const session = resolveSession(step, lane);
 
-  const mcpConfig = await writeMcpConfig(repo, lane, workdir);
+  const mcpConfig = mcpEnabled ? await writeMcpConfig(repo, lane, workdir) : null;
   const inv = renderInvocation(provider, {
-    task, model: resolvedConfig.model, permissionMode, maxTurns, session, repo: workdir, mcpConfig,
+    task, model: resolvedConfig.model, permissionMode, maxTurns, session, repo: workdir, mcpConfig, mcp: mcpEnabled,
   });
 
-  let env = process.env;
+  let extraEnv = {};
   const profileName = resolvedConfig.profile || step.profile;
   if (profileName) {
     const profile = await loadProfile(profileName);
     for (const w of isolationWarnings(profile)) {
       console.error(`taskherd: profile '${profileName}' ${w}`);
     }
-    env = { ...process.env, ...profileEnv(profile) };
+    extraEnv = profileEnv(profile);
   }
 
   // Loud whenever an autonomous, un-gated permission model is in force (DESIGN §12).
@@ -258,7 +266,7 @@ async function buildInvocation(repo, lane, step, resolvedConfig = {}, workdir = 
   }
 
   return {
-    file: inv.command, args: inv.args, env, captureCost: inv.captureCost,
+    file: inv.command, args: inv.args, extraEnv, captureCost: inv.captureCost,
   };
 }
 
@@ -283,9 +291,15 @@ function killTree(child, signal) {
 // on setup errors (bad argv, unparseable timeout, unknown provider, io).
 export async function runStep(repo, lane, step, index, resolvedConfig) {
   const timeoutMs = parseTimeout(resolvedConfig?.timeout); // throws before any I/O
-  // Both throw on setup errors, before the socket/log exist — the lane parks.
+  // All three throw on setup errors, before the socket/log exist — the lane
+  // parks. resolveRunner precedes buildInvocation because a non-local runner
+  // suppresses the (host-only) taskherd-mcp wiring on the ai invocation (§11).
   const { isolation, workdir } = await resolveWorkdir(repo, lane, resolvedConfig || {});
-  const invocation = await buildInvocation(repo, lane, step, resolvedConfig || {}, workdir);
+  const runner = await resolveRunner(resolvedConfig?.runner);
+  const invocation = await buildInvocation(repo, lane, step, resolvedConfig || {}, workdir, {
+    mcpEnabled: runner.kind === 'local',
+    runnerKind: runner.kind,
+  });
 
   const id = randomUUID();
   const ts = new Date().toISOString().replace(/[:.]/g, '-');
@@ -296,7 +310,28 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   await rm(sockPath, { force: true });
   await rm(sockLink, { force: true });
 
-  const { file, args, env: spawnEnv } = invocation;
+  // The runner axis (§11) wraps the inner (provider/shell) invocation into the
+  // OUTER argv the local pty actually runs: local = the step itself; docker/ssh =
+  // a `docker exec|run` / `ssh` wrapper streaming a container/remote process
+  // through the same pty seam. Auth env crosses secret-safely (docker `-e KEY`
+  // by name; ssh not at all — the remote authenticates as itself). Warnings
+  // (mcp-in-runner, unsynced ssh cwd) are loud, per DESIGN §1/§11.
+  const { file: innerFile } = invocation; // the provider/shell command, for the cost message
+  const spawnSpec = wrapForRunner(runner, {
+    file: invocation.file,
+    args: invocation.args,
+    extraEnv: invocation.extraEnv,
+    cwd: workdir,
+    worktree: workdir,
+    repo: path.resolve(repo),
+    laneName: lane.name,
+    isAi: step.type === 'ai',
+    // Only the local runner forwards the taskherd escape-hatch vars — host paths
+    // are meaningless inside a container / on a remote host.
+    taskherdEnv: { TASKHERD_REPO: path.resolve(repo), TASKHERD_LANE: lane.name },
+  });
+  for (const w of spawnSpec.warnings) console.error(w);
+  const { file, args } = spawnSpec;
   const logStream = createWriteStream(logPath);
   const clients = new Set();
 
@@ -365,11 +400,11 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     name: 'xterm-color',
     cols: 80,
     rows: 30,
-    cwd: workdir,
-    // TASKHERD_REPO/LANE: the seam letting anything the step spawns (the /task
-    // skill, a script calling the CLI, taskherd-mcp) target the MAIN repo's
-    // .tasks/ and its own lane — the step's cwd is a worktree under isolation.
-    env: { ...spawnEnv, TASKHERD_REPO: path.resolve(repo), TASKHERD_LANE: lane.name },
+    // spawnSpec.cwd/env are the LOCAL pty child's — the step itself under
+    // `local` (workdir + TASKHERD_REPO/LANE, as before), or the docker/ssh
+    // client under a runner (auth values travel via `-e KEY` / not at all).
+    cwd: spawnSpec.cwd,
+    env: spawnSpec.env,
   });
   for (const msg of preSpawn.splice(0)) applyControl(msg);
 
@@ -436,7 +471,7 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
       tokens = { input: parsed.inputTokens, output: parsed.outputTokens };
       sessionId = parsed.sessionId;
     } else if (status === 'done') {
-      console.error(`FIDELITY-STANDIN: could not parse ${file} cost JSON for lane ${lane.name} step ${index} — cost not logged (DESIGN §10)`);
+      console.error(`FIDELITY-STANDIN: could not parse ${innerFile} cost JSON for lane ${lane.name} step ${index} — cost not logged (DESIGN §10)`);
     }
   }
 

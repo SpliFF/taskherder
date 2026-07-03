@@ -333,7 +333,13 @@ export function buildStep(opts = {}) {
     if (budget) step.budget = budget;
     return validateStep(step);
   }
-  return validateStep({ type: 'command', run: opts.run ?? opts.task, status: 'pending' });
+  // A command step honors the `runner` axis too (DESIGN §11: a read-only/remote
+  // command is a first-class runner target — e.g. a container build or a remote
+  // deploy). Mirrors the ai branch; without it `add --runner docker:… "cmd"`
+  // silently dropped the runner and ran on the host.
+  const step = { type: 'command', run: opts.run ?? opts.task, status: 'pending' };
+  if (opts.runner) step.runner = opts.runner;
+  return validateStep(step);
 }
 
 // Lane-level axis settings a client may set alongside a step (DESIGN §7:

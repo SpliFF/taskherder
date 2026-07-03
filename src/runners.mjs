@@ -1,0 +1,184 @@
+// Runners — the fourth axis (DESIGN.md §11): *where* a step's process executes.
+// A runner takes the inner invocation the provider rendered ({ file, args } + the
+// profile's auth env) and a working directory, and returns the OUTER argv the
+// executor actually spawns under its (always-local) pty. `local` is a
+// pass-through; `docker`/`ssh` wrap the argv so the same pty seam (§13) streams
+// a container/remote process transparently. The pty stays host-side — only what
+// it runs changes.
+//
+// Honest complexity (DESIGN §11, flagged loudly, never silently): for non-local
+// runners the worktree/repo must already exist *in the runner env* (a docker
+// bind-mount, or a pre-synced remote checkout — full remote-git is a later
+// refinement), and the taskherd-mcp servers can't run there (host node + host
+// bin/mcp.mjs paths are absent), so an ai step's tasks_* finalization tools are
+// unavailable inside the runner. Both are surfaced as warnings by wrapForRunner.
+import { readFile } from 'node:fs/promises';
+import { existsSync } from 'node:fs';
+import { runnersFile } from './paths.mjs';
+
+// Named runner defs from ~/.taskherd/runners.json (DESIGN §11). Empty when the
+// file is absent — inline `docker:`/`ssh:` shorthands need no file.
+export async function loadRunners() {
+  const file = runnersFile();
+  if (!existsSync(file)) return {};
+  try {
+    return JSON.parse(await readFile(file, 'utf8'));
+  } catch (err) {
+    throw new Error(`taskherd: malformed runners.json at ${file}: ${err.message}`);
+  }
+}
+
+// Resolve a runner axis value to a normalized def { kind, ... }. Accepts:
+//   null / 'local'        → { kind: 'local' }
+//   'docker:<container>'  → exec into a running container
+//   'ssh:<host>'          → run over ssh on a host
+//   '<name>'              → a def from runners.json (kind docker|ssh)
+// An unknown name / kind is a loud setup error (the lane parks), never a silent
+// fall-through to local — a step asking for isolation it didn't get is exactly
+// the silent-guardrail failure DESIGN §1/§12 forbid.
+export async function resolveRunner(value) {
+  if (!value || value === 'local') return { kind: 'local' };
+
+  const colon = value.indexOf(':');
+  if (colon !== -1) {
+    const kind = value.slice(0, colon);
+    const target = value.slice(colon + 1);
+    if (kind === 'docker') return { kind: 'docker', container: target, name: value };
+    if (kind === 'ssh') return { kind: 'ssh', host: target, name: value };
+    throw new Error(
+      `taskherd: unknown runner kind ${JSON.stringify(kind)} in ${JSON.stringify(value)} `
+      + '(inline forms: docker:<container> | ssh:<host>) (DESIGN §11)',
+    );
+  }
+
+  const runners = await loadRunners();
+  const def = runners[value];
+  if (!def) {
+    const known = Object.keys(runners).join(', ') || '(none)';
+    throw new Error(
+      `taskherd: unknown runner ${JSON.stringify(value)} — use 'local', 'docker:<container>', `
+      + `'ssh:<host>', or a name from ~/.taskherd/runners.json (known: ${known}) (DESIGN §11)`,
+    );
+  }
+  if (def.kind !== 'docker' && def.kind !== 'ssh') {
+    throw new Error(`taskherd: runner ${JSON.stringify(value)} needs "kind": "docker" | "ssh" in runners.json (got ${JSON.stringify(def.kind)})`);
+  }
+  return { name: value, ...def };
+}
+
+// POSIX single-quote escaping for a remote (ssh) command string. Wraps in single
+// quotes and escapes embedded single quotes the '\'' way, so an argv element
+// survives the remote shell's word-splitting verbatim.
+export function shquote(s) {
+  return `'${String(s).replace(/'/g, "'\\''")}'`;
+}
+
+// {worktree}/{repo}/{lane} template substitution for mounts and remote cwds.
+function renderTemplate(str, vars) {
+  return String(str).replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? String(vars[k]) : m));
+}
+
+// Wraps the inner invocation for the resolved runner. Returns the concrete spawn
+// spec the executor hands to node-pty:
+//   { file, args, env, cwd, warnings }
+// where `env`/`cwd` are for the LOCAL pty child (the docker/ssh client, or the
+// step itself under `local`). `extraEnv` is the profile's auth-env delta (§9):
+//   - local  → merged onto process.env for the child (current behavior);
+//   - docker → forwarded by NAME (`-e KEY`) so the *value* travels via the local
+//              docker client's env, never onto the argv (which lands in
+//              events.jsonl / the pty log — a secret there would leak);
+//   - ssh    → NOT forwarded (the remote host authenticates as itself, §11); a
+//              set profile env with an ssh runner warns rather than silently
+//              dropping auth the user expected to cross.
+// `baseEnv` (default process.env) are the ambient vars for TASKHERD_* injection
+// on local; callers thread the same TASKHERD_REPO/LANE in that they set today.
+export function wrapForRunner(runner, {
+  file, args, extraEnv = {}, cwd, worktree, repo, laneName, isAi = false, taskherdEnv = {},
+} = {}) {
+  const warnings = [];
+  const extraKeys = Object.keys(extraEnv);
+
+  // The §11 mcp-in-runner gap: a scheduled ai step under a non-local runner can't
+  // reach the host-registered taskherd-mcp (host node + bin/mcp.mjs aren't in the
+  // container/remote), so its tasks_* finalization tools (§16/§17) are absent.
+  if (isAi && runner.kind !== 'local') {
+    warnings.push(
+      `FIDELITY-STANDIN: ai step on runner '${runner.name || runner.kind}' cannot reach taskherd-mcp `
+      + '(host node/bin/mcp.mjs absent in the runner env) — the tasks_* finalization tools are '
+      + 'unavailable inside the runner; the agent runs but cannot enqueue its own next step (DESIGN §11).',
+    );
+  }
+
+  if (runner.kind === 'local') {
+    return {
+      file,
+      args,
+      cwd,
+      env: { ...process.env, ...extraEnv, ...taskherdEnv },
+      warnings,
+    };
+  }
+
+  if (runner.kind === 'docker') {
+    const dargs = [];
+    let ttyEnv = { ...process.env, ...extraEnv }; // -e KEY reads values from here
+    if (runner.container) {
+      // Exec into a running, user-managed container. The worktree mapping is the
+      // user's responsibility; use runner.workdir if given, else the container's.
+      dargs.push('exec', '-i', '-t');
+      if (runner.workdir) dargs.push('-w', runner.workdir);
+      for (const k of extraKeys) dargs.push('-e', k);
+      dargs.push(runner.container);
+    } else if (runner.image) {
+      // Ephemeral container with the worktree bind-mounted in. --rm so it doesn't
+      // pile up; each fire is a fresh, isolated home/keychain (§11's strongest
+      // multi-account isolation).
+      dargs.push('run', '--rm', '-i', '-t');
+      const mounts = runner.mounts && runner.mounts.length
+        ? runner.mounts
+        : (worktree ? [`{worktree}:${runner.workdir || '/work'}`] : []);
+      for (const m of mounts) dargs.push('-v', renderTemplate(m, { worktree, repo, lane: laneName }));
+      if (runner.workdir) dargs.push('-w', runner.workdir);
+      for (const k of extraKeys) dargs.push('-e', k);
+      if (runner.dockerArgs) dargs.push(...runner.dockerArgs);
+      dargs.push(runner.image);
+    } else {
+      throw new Error(`taskherd: docker runner ${JSON.stringify(runner.name || 'docker')} needs a "container" or an "image" (DESIGN §11)`);
+    }
+    dargs.push(file, ...args);
+    return {
+      file: 'docker', args: dargs, cwd: repo, env: ttyEnv, warnings,
+    };
+  }
+
+  if (runner.kind === 'ssh') {
+    if (!runner.host) throw new Error(`taskherd: ssh runner ${JSON.stringify(runner.name || 'ssh')} needs a "host" (DESIGN §11)`);
+    if (extraKeys.length) {
+      warnings.push(
+        `taskherd: profile env (${extraKeys.join(', ')}) is NOT forwarded over the ssh runner — `
+        + 'the remote host authenticates as itself (its own home/keychain, DESIGN §11).',
+      );
+    }
+    // Full remote-git is a later refinement (§11): the remote checkout must
+    // already exist. `cwd` (runners.json, {repo}/{lane} templated) picks the
+    // remote working dir; without one we cd nowhere and run in the login dir.
+    const remoteCwd = runner.cwd ? renderTemplate(runner.cwd, { repo, lane: laneName, worktree }) : null;
+    if (!remoteCwd) {
+      warnings.push(
+        `taskherd: ssh runner '${runner.name || runner.host}' has no "cwd" — running in the remote login `
+        + 'dir; the host worktree is NOT synced to the remote (full remote-git is a later refinement, DESIGN §11).',
+      );
+    }
+    const remoteParts = [];
+    if (remoteCwd) remoteParts.push(`cd ${shquote(remoteCwd)} &&`);
+    remoteParts.push('exec', shquote(file), ...args.map(shquote));
+    const sargs = [];
+    if (runner.sshArgs) sargs.push(...runner.sshArgs);
+    sargs.push('-tt', runner.host, remoteParts.join(' ')); // -tt forces a remote pty (curses/TUI, §13)
+    return {
+      file: 'ssh', args: sargs, cwd: repo, env: { ...process.env }, warnings,
+    };
+  }
+
+  throw new Error(`taskherd: unsupported runner kind ${JSON.stringify(runner.kind)} (local | docker | ssh) (DESIGN §11)`);
+}
