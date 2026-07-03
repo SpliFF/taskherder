@@ -45,10 +45,18 @@ export async function waitFor(cond, { timeout = 3000, interval = 10 } = {}) {
   }
 }
 
+// Tests block gates constantly; without this the M5 notify-once os channel
+// would fire a real desktop notification per gate. The notify test overrides
+// it at project level.
+async function quietNotifications(home) {
+  await writeFile(path.join(home, 'config.json'), '{ "notify": "none" }\n');
+}
+
 export async function makeRepo() {
   const repo = await mkdtemp(path.join(os.tmpdir(), 'taskherd-repo-'));
   const home = await mkdtemp(path.join(os.tmpdir(), 'taskherd-home-'));
   process.env.TASKHERD_HOME = home;
+  await quietNotifications(home);
   await initTasksDir(repo, { globalGitignore: false });
   return {
     repo,
@@ -73,6 +81,7 @@ export async function makeGitRepo() {
   await writeFile(path.join(repo, 'README.md'), 'seed\n');
   await gitIn(repo, 'add', 'README.md');
   await gitIn(repo, 'commit', '-m', 'seed');
+  await quietNotifications(home);
   await initTasksDir(repo, { globalGitignore: false });
   return {
     repo,

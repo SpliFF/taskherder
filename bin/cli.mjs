@@ -24,6 +24,7 @@ import { loadProviders } from '../src/providers.mjs';
 import { listProfiles, loadProfile, isolationWarnings } from '../src/profiles.mjs';
 import { isGitRepo, gcWorktrees } from '../src/git.mjs';
 import { loadProjectConfig } from '../src/config.mjs';
+import { registerProject } from '../src/registry.mjs';
 
 const REPO_OPTION = { repo: { type: 'string', short: 'C' } };
 
@@ -339,6 +340,49 @@ async function cmdResume(argv) {
   console.log('taskherd: resumed');
 }
 
+// taskherd serve — the optional web-console control plane (DESIGN §15).
+// Binds loopback by default; exposing it on a LAN (--host) is a deliberate
+// opt-in — remote/mobile access is expected to go through a tunnel/Tailscale,
+// and every state-touching request needs the printed token either way.
+async function cmdServe(argv) {
+  const { values, positionals } = parseRepoOnly(argv, {
+    port: { type: 'string', short: 'p' },
+    host: { type: 'string' },
+  });
+  const { repo } = resolveRepo(values.repo, positionals, { laneless: true });
+  if (existsSync(repoTasksDir(repo))) await registerProject(repo);
+
+  const { createConsoleServer } = await import('../src/serve.mjs');
+  const console_ = await createConsoleServer();
+  const host = values.host || '127.0.0.1';
+  const port = values.port ? Number(values.port) : 4373; // H-E-R-D on a phone keypad
+  const addr = await console_.listen(port, host);
+
+  const urls = [];
+  if (host === '0.0.0.0' || host === '::') {
+    for (const ifaces of Object.values(os.networkInterfaces())) {
+      for (const iface of ifaces || []) {
+        if (iface.family === 'IPv4' && !iface.internal) urls.push(`http://${iface.address}:${addr.port}`);
+      }
+    }
+    urls.unshift(`http://127.0.0.1:${addr.port}`);
+  } else {
+    urls.push(`http://${host}:${addr.port}`);
+  }
+  console.log('taskherd: console up — open (token included, keep it private):');
+  for (const u of urls) console.log(`  ${u}/?token=${console_.token}`);
+  if (host === '127.0.0.1') {
+    console.log('  (loopback only — use --host 0.0.0.0 or a tunnel for phone access)');
+  }
+
+  await new Promise((resolve) => {
+    process.on('SIGINT', resolve);
+    process.on('SIGTERM', resolve);
+  });
+  await console_.close();
+  console.log('taskherd: console stopped');
+}
+
 function commandOnPath(cmd) {
   const r = spawnSync(process.platform === 'win32' ? 'where' : 'command', process.platform === 'win32' ? [cmd] : ['-v', cmd], { encoding: 'utf8', shell: process.platform !== 'win32' });
   return r.status === 0;
@@ -593,14 +637,24 @@ async function cmdDoctor() {
     if (!ok) problems += 1;
     console.log(`  ${ok ? '✓' : '✗'} git${ok ? '' : ' not on PATH — worktree/inplace isolation and land need it'}`);
   }
-  try {
+  {
     const { createRequire } = await import('node:module');
     const require = createRequire(import.meta.url);
-    require.resolve('node-pty');
-    console.log('  ✓ node-pty resolvable (executor self-heals a non-executable spawn-helper)');
-  } catch {
-    problems += 1;
-    console.log('  ✗ node-pty not installed — run `npm install`');
+    try {
+      require.resolve('node-pty');
+      console.log('  ✓ node-pty resolvable (executor self-heals a non-executable spawn-helper)');
+    } catch {
+      problems += 1;
+      console.log('  ✗ node-pty not installed — run `npm install`');
+    }
+    try {
+      require.resolve('ws');
+      require.resolve('@xterm/xterm/package.json');
+      console.log('  ✓ web console deps resolvable (ws, @xterm/xterm)');
+    } catch {
+      problems += 1;
+      console.log('  ✗ web console deps missing (ws / @xterm/xterm) — run `npm install`; `taskherd serve` will not start');
+    }
   }
 
   console.log(problems === 0 ? 'all checks passed' : `${problems} problem(s) found`);
@@ -622,6 +676,7 @@ const COMMANDS = {
   auth: cmdAuth,
   history: cmdHistory,
   cost: cmdCost,
+  serve: cmdServe,
   install: cmdInstall,
   doctor: cmdDoctor,
 };

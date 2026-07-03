@@ -394,15 +394,17 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     killTimer = setTimeout(() => killTree(child, 'SIGKILL'), killGraceMs());
   }, timeoutMs);
 
-  const { exitCode } = await new Promise((resolve) => {
-    child.onExit(({ exitCode: code, signal }) => resolve({ exitCode: code, signal }));
+  const { exitCode, signal } = await new Promise((resolve) => {
+    child.onExit(({ exitCode: code, signal: sig }) => resolve({ exitCode: code, signal: sig }));
   });
   clearTimeout(timer);
   if (killTimer) clearTimeout(killTimer);
   const durationMs = Date.now() - startedAt;
 
   logStream.end();
-  await appendEvent(repo, { event: 'run.exit', lane: lane.name, step: index, id, code: exitCode, timedOut, durationMs });
+  await appendEvent(repo, {
+    event: 'run.exit', lane: lane.name, step: index, id, code: exitCode, ...(signal ? { signal } : {}), timedOut, durationMs,
+  });
   // Teardown must NOT depend on clients cooperating: server.close() waits for
   // every connection to fully close, and a client that never reads (a wedged
   // console tab, a SIGSTOPped attach) never processes our FIN — runStep would
@@ -417,7 +419,10 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   await rm(sockPath, { force: true });
   await rm(sockLink, { force: true });
 
-  const status = exitCode === 0 && !timedOut ? 'done' : 'failed';
+  // A signal-killed child reports {exitCode: 0, signal: N} from node-pty — a
+  // bare exit-code check would mark an interrupted step (the console's
+  // interrupt button, Ctrl-C over attach) as DONE and advance the cursor.
+  const status = exitCode === 0 && !timedOut && !signal ? 'done' : 'failed';
 
   // Cost logging (DESIGN §10). A provider we asked for cost JSON that produced
   // none on a clean exit is a loud, greppable stand-in — never a silent $0.
@@ -441,7 +446,8 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
 
   return {
     status,
-    exitCode: timedOut ? null : exitCode,
+    exitCode: timedOut || signal ? null : exitCode, // 0-from-a-signal is not a real exit code
+    signal: signal || null,
     timedOut,
     timeoutMs,
     durationMs,

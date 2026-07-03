@@ -118,7 +118,7 @@ function describeFailure(result) {
   if (result.setupError) return `step could not start: ${result.setupError}`;
   const cause = result.timedOut
     ? `timed out after ${formatDuration(result.timeoutMs)}`
-    : `exit ${result.exitCode}`;
+    : (result.signal ? `killed by signal ${result.signal}` : `exit ${result.exitCode}`);
   return `step failed twice (${cause}); see ${result.logPath}`;
 }
 
@@ -346,6 +346,7 @@ export async function tick(repo) {
       type: step.type,
       result: result.status,
       exitCode: result.exitCode,
+      ...(result.signal ? { signal: result.signal } : {}),
       timedOut: result.timedOut,
       durationMs: result.durationMs,
       logPath: result.logPath,

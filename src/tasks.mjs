@@ -10,9 +10,10 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   repoTasksDir, laneFile, projectConfigFile, logsDir, descDir, runDir,
-  taskherdHome,
+  taskherdHome, runSocketLink,
 } from './paths.mjs';
 import { loadProjectConfig, loadUserConfig, resolveConfig } from './config.mjs';
+import { registerProject } from './registry.mjs';
 import {
   isGitRepo, laneBranch, branchExists, branchBase, defaultBase, aheadCount,
   landMerge, pushAndOpenPr,
@@ -364,6 +365,69 @@ export async function addStep(repo, laneName, stepOpts, laneOpts = {}) {
   return { lane, step, index: lane.steps.length - 1 };
 }
 
+// Queue editing (DESIGN §15 "reorder, add, edit, remove steps"). Only the
+// still-pending future of the queue is editable: indices before the cursor are
+// history, and while a step is live (its control socket exists) the step at
+// the cursor is off-limits too — the executor patches its result back BY INDEX
+// after the run (the M1.1 lost-update fix), so shifting or mutating it would
+// corrupt that write-back. Blocked/failed steps go through `ack`, not editing.
+export function laneIsRunning(repo, laneName) {
+  return existsSync(runSocketLink(repo, laneName));
+}
+
+function assertEditableIndex(repo, lane, index, verb) {
+  const min = lane.cursor + (laneIsRunning(repo, lane.name) ? 1 : 0);
+  if (!Number.isInteger(index) || index < 0 || index >= lane.steps.length) {
+    throw new LaneValidationError(`taskherd: lane '${lane.name}' has no step ${index}`);
+  }
+  if (index < min) {
+    throw new LaneValidationError(
+      `taskherd: cannot ${verb} step ${index} of lane '${lane.name}' — `
+      + (index < lane.cursor ? 'it already ran' : 'it is running (or next); interrupt or ack instead'),
+    );
+  }
+  if (lane.steps[index].status !== 'pending') {
+    throw new LaneValidationError(
+      `taskherd: cannot ${verb} step ${index} of lane '${lane.name}' (status ${lane.steps[index].status}) — clear it with ack`,
+    );
+  }
+}
+
+export async function removeStep(repo, laneName, index) {
+  const lane = await loadLane(repo, laneName);
+  assertEditableIndex(repo, lane, index, 'remove');
+  const [removed] = lane.steps.splice(index, 1);
+  await saveLane(repo, lane);
+  return { lane, removed };
+}
+
+export async function moveStep(repo, laneName, from, to) {
+  const lane = await loadLane(repo, laneName);
+  assertEditableIndex(repo, lane, from, 'move');
+  assertEditableIndex(repo, lane, to, 'move to');
+  const [step] = lane.steps.splice(from, 1);
+  lane.steps.splice(to, 0, step);
+  await saveLane(repo, lane);
+  return { lane, step };
+}
+
+// Patches fields onto a pending step and re-validates. Run-state fields can
+// never ride in through a patch — status/attempts are the scheduler's.
+export async function editStep(repo, laneName, index, patch = {}) {
+  const lane = await loadLane(repo, laneName);
+  assertEditableIndex(repo, lane, index, 'edit');
+  const {
+    status: _s, attempts: _a, parkedReason: _p, ...fields
+  } = patch;
+  const step = { ...lane.steps[index], ...fields };
+  // A patch may null a field out (e.g. switch task -> file prompt).
+  for (const [k, v] of Object.entries(fields)) if (v === null) delete step[k];
+  validateStep(step);
+  lane.steps[index] = step;
+  await saveLane(repo, lane);
+  return { lane, step };
+}
+
 // Forks a sibling lane off a parent (DESIGN §18 `taskherd fork`, MCP
 // `tasks_fork`, §17 "independent workstreams"): a NEW lane with `parent` set,
 // running independently from creation. The parent must exist — forking off a
@@ -449,6 +513,11 @@ export async function initTasksDir(repo, { globalGitignore = true } = {}) {
   }
 
   if (globalGitignore) await ensureGlobalGitignore();
+
+  // The web console aggregates registered projects (DESIGN §4 projects.json);
+  // init is the natural registration point — `taskherd serve` also registers
+  // its own repo so pre-M5 projects appear on first serve.
+  await registerProject(repo);
 
   return dir;
 }
