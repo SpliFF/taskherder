@@ -23,7 +23,7 @@ import { renderStatus, readHistory } from '../src/history.mjs';
 import { loadProviders } from '../src/providers.mjs';
 import { loadRunners } from '../src/runners.mjs';
 import { listProfiles, loadProfile, isolationWarnings } from '../src/profiles.mjs';
-import { isGitRepo, gcWorktrees } from '../src/git.mjs';
+import { isGitRepo, gcWorktrees, laneDiff } from '../src/git.mjs';
 import { loadProjectConfig } from '../src/config.mjs';
 import { registerProject } from '../src/registry.mjs';
 
@@ -243,6 +243,39 @@ async function cmdGc(argv) {
   for (const r of report) {
     console.log(`  ${r.action === 'removed' ? '✓' : '·'} ${r.lane}: ${r.action} — ${r.reason}`);
   }
+}
+
+// taskherd diff <lane> — the lane's branch diff (DESIGN §15 Layer 2, CLI-side;
+// the console renders the same laneDiff data). Reviewing what an autonomous
+// agent committed to taskherd/<lane> before `taskherd ack` lands it. (§18 lists
+// no diff verb — recorded in PLAN as a CLI addition, like `install`.)
+async function cmdDiff(argv) {
+  const { values, positionals } = parseRepoOnly(argv, { base: { type: 'string' } });
+  const { repo, rest } = resolveRepo(values.repo, positionals);
+  requireTasksDir(repo);
+  const [laneName] = rest;
+  if (!laneName) {
+    console.error('taskherd: usage: taskherd diff [-C repo] <lane> [--base <branch>]');
+    process.exit(1);
+  }
+  if (!(await isGitRepo(repo))) {
+    console.log('taskherd: not a git repository — no lane branches to diff');
+    return;
+  }
+  const d = await laneDiff(repo, laneName, { base: values.base || null });
+  if (!d.exists) {
+    console.log(`taskherd: lane '${laneName}' has no branch ${d.branch} yet (never ran under git isolation)`);
+    return;
+  }
+  console.log(`taskherd: ${d.branch} vs ${d.base} — ${d.ahead} commit(s) ahead, ${d.files.length} file(s) changed${d.dirty ? '; worktree has uncommitted changes' : ''}`);
+  for (const f of d.files) {
+    console.log(`  ${f.binary ? 'bin' : `+${f.added} -${f.deleted}`}\t${f.path}`);
+  }
+  if (d.patch) {
+    console.log('');
+    process.stdout.write(d.patch.endsWith('\n') ? d.patch : `${d.patch}\n`);
+  }
+  if (d.truncated) console.log(`taskherd: diff truncated at ${d.bytes} bytes — inspect the full diff in the worktree`);
 }
 
 async function cmdAttach(argv) {
@@ -700,6 +733,7 @@ const COMMANDS = {
   block: cmdBlock,
   fork: cmdFork,
   ack: cmdAck,
+  diff: cmdDiff,
   attach: cmdAttach,
   pause: cmdPause,
   resume: cmdResume,

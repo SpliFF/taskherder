@@ -111,6 +111,7 @@ function laneHtml(p, lane) {
       ${running ? `
         <button class="btn" data-action="attach" data-project="${esc(p.id)}" data-lane="${esc(lane.name)}">ATTACH</button>
         <button class="btn warn" data-action="interrupt" data-lane="${esc(lane.name)}">INTERRUPT</button>` : ''}
+      <button class="btn ghost" data-action="diff" data-lane="${esc(lane.name)}">DIFF</button>
       <button class="btn ghost" data-action="fork" data-lane="${esc(lane.name)}">FORK</button>
     </div>
     <form class="add-row" data-action="add-step" data-lane="${esc(lane.name)}">
@@ -190,6 +191,8 @@ app.addEventListener('click', (e) => {
     if (name) act(id, 'fork', { name: name.trim(), from: lane }, `forked ${name.trim()}`);
   } else if (action === 'attach') {
     openTerminal(id, lane);
+  } else if (action === 'diff') {
+    openDiff(id, lane);
   }
 });
 
@@ -262,6 +265,7 @@ function closeTerminal() {
 
 function openTerminal(id, lane) {
   closeTerminal();
+  closeDiff();
   panel.hidden = false;
   termTitle.textContent = `${lane} — live`;
   term = new Terminal({ fontSize: 13, fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', theme: { background: '#0a0c0a' }, convertEol: false });
@@ -301,6 +305,69 @@ function openTerminal(id, lane) {
 document.getElementById('term-close').onclick = closeTerminal;
 document.getElementById('term-int').onclick = () => termWs?.send(JSON.stringify({ type: 'signal', signal: 'SIGINT' }));
 document.getElementById('term-term').onclick = () => termWs?.send(JSON.stringify({ type: 'signal', signal: 'SIGTERM' }));
+
+// ── worktree diff viewer (§15 Layer 2) ──────────────────────────────────
+// Review what an autonomous agent committed to taskherd/<lane> before acking
+// its land gate — the same laneDiff the CLI prints, over the read-only diff API.
+const diffPanel = document.getElementById('diff-panel');
+const diffBody = document.getElementById('diff-body');
+const diffTitle = document.getElementById('diff-title');
+
+function closeDiff() {
+  diffPanel.hidden = true;
+  diffBody.innerHTML = '';
+}
+
+// Colour a unified-diff line by its lead character (adds/dels/hunks/meta), the
+// full text HTML-escaped — the patch is untrusted agent output.
+function diffLineHtml(line) {
+  const c = line[0];
+  let cls = 'ctx';
+  if (line.startsWith('diff ') || line.startsWith('index ') || line.startsWith('--- ') || line.startsWith('+++ ')) cls = 'meta';
+  else if (c === '@') cls = 'hunk';
+  else if (c === '+') cls = 'add';
+  else if (c === '-') cls = 'del';
+  return `<span class="dl ${cls}">${esc(line) || ' '}</span>`;
+}
+
+async function openDiff(id, lane) {
+  closeTerminal();
+  diffPanel.hidden = false;
+  diffTitle.textContent = `${lane} — diff`;
+  diffBody.innerHTML = '<p class="boot">loading diff…</p>';
+  let d;
+  try {
+    d = await api(`/api/projects/${encodeURIComponent(id)}/diff?lane=${encodeURIComponent(lane)}`);
+  } catch (err) {
+    if (err.message !== 'unauthorized') diffBody.innerHTML = `<p class="missing">✗ ${esc(err.message)}</p>`;
+    return;
+  }
+  if (!d.exists) {
+    diffBody.innerHTML = `<p class="boot">lane <code>${esc(lane)}</code> has no branch <code>${esc(d.branch)}</code> yet — it hasn't run under git isolation.</p>`;
+    return;
+  }
+  diffTitle.textContent = `${lane} — ${d.branch} vs ${d.base}`;
+  const files = d.files.map((f) => `<li class="difffile">
+      <span class="difffile-stat">${f.binary ? 'bin' : `<span class="add">+${f.added}</span> <span class="del">−${f.deleted}</span>`}</span>
+      <span class="difffile-path">${esc(f.path)}</span>
+    </li>`).join('');
+  // Each .dl is display:block (its own line); join with '' so the pre's
+  // white-space:pre doesn't inject a blank line between every diff row.
+  const body = d.patch
+    ? `<pre class="diff">${d.patch.split('\n').map(diffLineHtml).join('')}</pre>`
+    : '<p class="boot">no textual changes</p>';
+  diffBody.innerHTML = `
+    <div class="diff-summary">
+      <span>${d.ahead} commit(s) ahead · ${d.files.length} file(s)</span>
+      ${d.dirty ? '<span class="diff-dirty">⚠ worktree has uncommitted changes</span>' : ''}
+    </div>
+    ${files ? `<ul class="difffiles">${files}</ul>` : ''}
+    ${body}
+    ${d.truncated ? `<p class="diff-trunc">diff truncated at ${d.bytes} bytes — use <code>taskherd diff ${esc(lane)}</code> for the full patch</p>` : ''}`;
+  diffBody.scrollTop = 0;
+}
+
+document.getElementById('diff-close').onclick = closeDiff;
 
 // ── boot ────────────────────────────────────────────────────────────────
 scheduleRefresh();

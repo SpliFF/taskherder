@@ -239,6 +239,63 @@ main { max-width: 1080px; margin: 0 auto; padding: 18px 14px 120px; }
 .term-host { flex: 1; min-height: 0; padding: 4px 0 calc(4px + env(safe-area-inset-bottom)) 8px; }
 .term-host .xterm { height: 100%; }
 
+/* ── diff panel (§15 Layer 2 — worktree diff viewer) ──────────────────── */
+
+.diff-panel {
+  position: fixed;
+  left: 0; right: 0; bottom: 0;
+  height: min(64vh, 640px);
+  background: var(--bg);
+  border-top: 2px solid var(--line-strong);
+  box-shadow: 0 -18px 40px #000000c0;
+  display: flex;
+  flex-direction: column;
+  z-index: 10;
+}
+
+.diff-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 10px 12px calc(12px + env(safe-area-inset-bottom));
+}
+
+.diff-summary {
+  display: flex;
+  gap: 14px;
+  flex-wrap: wrap;
+  color: var(--dim);
+  font-size: 12px;
+  padding-bottom: 8px;
+  border-bottom: 1px dashed var(--line);
+}
+.diff-dirty { color: var(--gate); }
+
+.difffiles { list-style: none; margin: 8px 0 12px; padding: 0; }
+.difffile { display: flex; gap: 12px; padding: 3px 0; font-size: 12px; }
+.difffile-stat { flex: none; width: 10ch; text-align: right; color: var(--faint); }
+.difffile-path { overflow-wrap: anywhere; }
+.difffile-stat .add, .dl.add { color: var(--run); }
+.difffile-stat .del, .dl.del { color: var(--fail); }
+
+.diff {
+  margin: 0;
+  font: 12px/1.45 var(--mono);
+  white-space: pre;
+  overflow-x: auto;
+  border-top: 1px solid var(--line);
+  padding-top: 8px;
+}
+.dl { display: block; }
+.dl.meta { color: var(--dim); font-weight: 600; }
+.dl.hunk { color: #6fb3d2; background: #6fb3d20d; }
+.dl.add { background: #52d2730d; }
+.dl.del { background: #ff6b5e0d; }
+.dl.ctx { color: var(--text); }
+
+.diff-trunc { color: var(--gate); font-size: 12px; margin-top: 10px; }
+.diff-body code { color: var(--gate); }
+
 /* ── toasts ───────────────────────────────────────────────────────────── */
 
 .toasts { position: fixed; right: 12px; bottom: 12px; display: flex; flex-direction: column; gap: 8px; z-index: 20; }
@@ -264,6 +321,7 @@ main { max-width: 1080px; margin: 0 auto; padding: 18px 14px 120px; }
 @media (max-width: 560px) {
   .lanes { grid-template-columns: 1fr; }
   .term-panel { height: 70vh; }
+  .diff-panel { height: 80vh; }
   .btn { padding: 9px 12px; min-height: 38px; }
   .project-spend { margin-left: 0; }
 }

@@ -22,6 +22,19 @@ async function git(cwd, ...args) {
   }
 }
 
+// Like git() but returns stdout verbatim (no trim) with a large buffer — for
+// diff output, where whitespace is meaningful and the default 1MB execFile cap
+// would throw on a big change set.
+async function gitRaw(cwd, ...args) {
+  try {
+    const { stdout } = await execFileAsync('git', ['-C', cwd, ...args], { maxBuffer: 64 * 1024 * 1024 });
+    return stdout;
+  } catch (err) {
+    const detail = (err.stderr || err.message || '').trim().split('\n')[0];
+    throw new Error(`git ${args.join(' ')}: ${detail}`);
+  }
+}
+
 export async function isGitRepo(repo) {
   try {
     await execFileAsync('git', ['-C', repo, 'rev-parse', '--git-dir']);
@@ -217,4 +230,56 @@ export async function gcWorktrees(repo, configBase = null) {
   }
   await git(repo, 'worktree', 'prune').catch(() => {});
   return report;
+}
+
+// Parse one `git diff --numstat` line: "<added>\t<deleted>\t<path>". A binary
+// file renders added/deleted as "-"; a rename keeps "old => new" (git's own
+// human-readable form) verbatim in the path field.
+function parseNumstat(line) {
+  const t1 = line.indexOf('\t');
+  const t2 = line.indexOf('\t', t1 + 1);
+  if (t1 === -1 || t2 === -1) return null;
+  const a = line.slice(0, t1);
+  const d = line.slice(t1 + 1, t2);
+  const binary = a === '-' && d === '-';
+  return {
+    path: line.slice(t2 + 1),
+    added: binary ? null : Number(a),
+    deleted: binary ? null : Number(d),
+    binary,
+  };
+}
+
+// The lane's branch diff, for reviewing an autonomous agent's work before
+// landing it (DESIGN §15 Layer 2 — the worktree diff viewer; the missing piece
+// of the manual-gate land loop). Three-dot `base...branch` shows what the lane
+// changed since it forked from base, so base moving forward doesn't read as
+// noise. The `taskherd/<lane>` branch lives in the main repo's object store
+// even for a worktree lane (worktrees share it), so this reads from `repo`
+// directly — no worktree checkout needed. The patch is capped (a runaway agent
+// could emit a huge diff); truncation is flagged, never silent. `dirty` surfaces
+// uncommitted work left in a pool worktree (e.g. a lane parked mid-run).
+export async function laneDiff(repo, laneName, { base = null, maxBytes = 400_000 } = {}) {
+  const branch = laneBranch(laneName);
+  if (!(await branchExists(repo, branch))) {
+    return { exists: false, branch };
+  }
+  const resolvedBase = base || (await branchBase(repo, branch)) || (await defaultBase(repo));
+  const range = `${resolvedBase}...${branch}`;
+  const numstat = (await gitRaw(repo, 'diff', '--numstat', range)).replace(/\n+$/, '');
+  const files = numstat ? numstat.split('\n').map(parseNumstat).filter(Boolean) : [];
+  const full = await gitRaw(repo, 'diff', range);
+  const bytes = Buffer.byteLength(full);
+  const truncated = bytes > maxBytes;
+  const patch = truncated ? full.slice(0, maxBytes) : full;
+  const ahead = await aheadCount(repo, branch, resolvedBase);
+
+  let dirty = false;
+  const wt = worktreeDir(repo, laneName);
+  if (existsSync(path.join(wt, '.git'))) {
+    dirty = !(await isClean(wt).catch(() => true));
+  }
+  return {
+    exists: true, branch, base: resolvedBase, ahead, files, patch, truncated, bytes, dirty,
+  };
 }

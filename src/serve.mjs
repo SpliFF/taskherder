@@ -26,6 +26,7 @@ import {
 } from './paths.mjs';
 import { loadProjects } from './registry.mjs';
 import { statusData } from './history.mjs';
+import { laneDiff } from './git.mjs';
 import {
   ackLane, addStep, forkLane, removeStep, moveStep, editStep, LaneValidationError,
 } from './tasks.mjs';
@@ -342,6 +343,16 @@ export async function createConsoleServer({ token } = {}) {
 
       if (req.method === 'GET' && url.pathname === '/api/projects') {
         sendJson(res, 200, { projects: await projectSummaries() });
+        return;
+      }
+
+      // Read-only: the lane's branch diff for review before landing (§15 L2).
+      const diffMatch = /^\/api\/projects\/([^/]+)\/diff$/.exec(url.pathname);
+      if (diffMatch && req.method === 'GET') {
+        const repo = await resolveProject(diffMatch[1]);
+        const lane = url.searchParams.get('lane');
+        if (!lane) throw new LaneValidationError("missing 'lane'");
+        sendJson(res, 200, await laneDiff(repo, lane, { base: url.searchParams.get('base') || null }));
         return;
       }
 

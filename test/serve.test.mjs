@@ -9,7 +9,8 @@ import { existsSync, chmodSync } from 'node:fs';
 import path from 'node:path';
 import WebSocket from 'ws';
 
-import { makeRepo, waitFor } from './helpers.mjs';
+import { makeRepo, makeGitRepo, waitFor } from './helpers.mjs';
+import { tick } from '../src/scheduler.mjs';
 import { registerProject, listProjects } from '../src/registry.mjs';
 import {
   addStep, loadLane, saveLane, removeStep, moveStep, editStep,
@@ -188,6 +189,35 @@ test('serve: API and WS refuse without the token; static assets and the SPA are 
   const wsFail = new WebSocket(`ws://127.0.0.1:${console_.server.address().port}/ws/events?project=${repoId(repo)}`);
   await new Promise((resolve) => { wsFail.on('error', resolve); wsFail.on('close', resolve); });
   assert.notEqual(wsFail.readyState, WebSocket.OPEN, 'tokenless WS upgrade must be refused');
+});
+
+test('serve: GET /diff returns a lane branch diff for review; missing lane is a 400 (§15 L2)', async (t) => {
+  const { repo, cleanup } = await makeGitRepo();
+  t.after(cleanup);
+  await registerProject(repo);
+  // A worktree lane commits a file on taskherd/feat.
+  await saveLane(repo, newLane('feat', {
+    steps: [{ type: 'command', run: 'echo hello > f.txt && git add f.txt && git commit -m add-f', status: 'pending' }],
+  }));
+  assert.equal((await tick(repo)).outcome, 'ran');
+
+  const { console_, api } = await startServer();
+  t.after(() => console_.close());
+  const id = repoId(repo);
+
+  const { status, body: d } = await api('GET', `/api/projects/${id}/diff?lane=feat`);
+  assert.equal(status, 200);
+  assert.equal(d.exists, true);
+  assert.equal(d.branch, 'taskherd/feat');
+  assert.equal(d.ahead, 1);
+  assert.deepEqual(d.files.map((f) => f.path), ['f.txt']);
+  assert.match(d.patch, /\+hello/);
+
+  // A lane with no branch yet → exists:false (not an error).
+  assert.equal((await api('GET', `/api/projects/${id}/diff?lane=none`)).body.exists, false);
+  // Missing lane param → 400. No token → 401.
+  assert.equal((await api('GET', `/api/projects/${id}/diff`)).status, 400);
+  assert.equal((await api('GET', `/api/projects/${id}/diff?lane=feat`, null, null)).status, 401);
 });
 
 test('serve: answer a gate + edit the queue + pause through the API (the phone flow)', async (t) => {

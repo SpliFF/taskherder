@@ -12,7 +12,7 @@ import { tick } from '../src/scheduler.mjs';
 import {
   newLane, saveLane, loadLane, ackLane, nextAction, defaultFallback,
 } from '../src/tasks.mjs';
-import { gcWorktrees } from '../src/git.mjs';
+import { gcWorktrees, laneDiff } from '../src/git.mjs';
 import { worktreeDir, projectConfigFile, laneFile } from '../src/paths.mjs';
 import { readHistory } from '../src/history.mjs';
 
@@ -214,4 +214,64 @@ test('nextAction fallback unit: lane-level values win; the config onEmpty marker
   assert.equal(action.step.run, 'echo d');
   assert.equal(action.step.onEmpty, undefined);
   assert.equal(nextAction(newLane('y', { onEmpty: 'idle' }), fallback).kind, 'idle');
+});
+
+// ── M7 — worktree diff viewer (DESIGN §15 Layer 2) ────────────────────────
+
+test('laneDiff: reports the lane branch diff vs base (files, numstat, patch, ahead)', async (t) => {
+  const { repo, cleanup } = await makeGitRepo();
+  t.after(cleanup);
+  // A worktree lane commits two files on taskherd/feat.
+  await saveLane(repo, newLane('feat', {
+    steps: [commandStep(COMMIT_A), commandStep('printf "l1\\nl2\\n" > multi.txt && git add multi.txt && git commit -m multi')],
+  }));
+  assert.equal((await tick(repo)).outcome, 'ran');
+  assert.equal((await tick(repo)).outcome, 'ran');
+
+  const d = await laneDiff(repo, 'feat');
+  assert.equal(d.exists, true);
+  assert.equal(d.branch, 'taskherd/feat');
+  assert.equal(d.base, 'main');
+  assert.equal(d.ahead, 2, 'two commits ahead of base');
+  const paths = d.files.map((f) => f.path).sort();
+  assert.deepEqual(paths, ['a.txt', 'multi.txt']);
+  const multi = d.files.find((f) => f.path === 'multi.txt');
+  assert.equal(multi.added, 2);
+  assert.equal(multi.deleted, 0);
+  assert.equal(multi.binary, false);
+  // The patch is the real unified diff, and the base's seed file is NOT in it
+  // (three-dot: only what the lane changed).
+  assert.match(d.patch, /\+\+\+ b\/multi\.txt/);
+  assert.match(d.patch, /^\+l1$/m);
+  assert.doesNotMatch(d.patch, /README/);
+  assert.equal(d.truncated, false);
+  assert.equal(d.dirty, false);
+});
+
+test('laneDiff: exists:false for a lane that never ran under git isolation', async (t) => {
+  const { repo, cleanup } = await makeGitRepo();
+  t.after(cleanup);
+  const d = await laneDiff(repo, 'ghost');
+  assert.equal(d.exists, false);
+  assert.equal(d.branch, 'taskherd/ghost');
+  assert.equal(d.files, undefined);
+});
+
+test('laneDiff: flags uncommitted worktree changes and caps a large patch', async (t) => {
+  const { repo, cleanup } = await makeGitRepo();
+  t.after(cleanup);
+  await saveLane(repo, newLane('big', { steps: [commandStep(COMMIT_A)] }));
+  assert.equal((await tick(repo)).outcome, 'ran');
+
+  // Dirty the pool worktree by hand (a lane parked mid-edit leaves this).
+  const wt = worktreeDir(repo, 'big');
+  await writeFile(path.join(wt, 'scratch.txt'), 'uncommitted\n');
+  const dirty = await laneDiff(repo, 'big');
+  assert.equal(dirty.dirty, true, 'uncommitted worktree change surfaced');
+
+  // A tiny cap forces truncation, flagged (never a silent partial diff).
+  const capped = await laneDiff(repo, 'big', { maxBytes: 20 });
+  assert.equal(capped.truncated, true);
+  assert.ok(capped.patch.length <= 20);
+  assert.ok(capped.bytes > 20);
 });
