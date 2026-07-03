@@ -5,9 +5,11 @@
 > with manual gates, git-branch isolation, per-account auth, and an optional web
 > console. CLI-first; the GUI is a view over the same files.
 
-**Status:** core built through M3 — scheduler + pty/control seam, AI providers +
-auth profiles + budgets, and git isolation (worktrees, `taskherd/<lane>` branches,
-land gates, `gc`). Next: MCP server + `/task` skill (M4). The full architecture is
+**Status:** core built through M4 — scheduler + pty/control seam, AI providers +
+auth profiles + budgets, git isolation (worktrees, `taskherd/<lane>` branches,
+land gates, `gc`), and the agent loop: `taskherd-mcp` (`tasks_*` tools) + the
+bundled `/task` skill, so a scheduled run enqueues its own next step, gates on a
+human, or forks a sibling lane. Next: web console (M5). The full architecture is
 in **[DESIGN.md](DESIGN.md)** — read it first.
 
 ## The idea in one picture
@@ -33,11 +35,20 @@ independently; a **manual gate** blocks one lane while its siblings keep going.
 
 ```
 taskherd init | run | status | add | block | fork | ack | attach
-             | pause | resume | gc | history | cost | auth | serve | doctor
+             | pause | resume | gc | history | cost | auth | serve
+             | install | doctor
 ```
 
 Package `@spliff/taskherder` · command `taskherd` (opt-in `task`/`th` aliases) ·
 MCP server `taskherd-mcp` · skill `/task` · MIT.
+
+`taskherd install` registers `taskherd-mcp` in the claude CLI's **user-global**
+MCP config and links the bundled `/task` skill into `~/.claude/skills/` —
+`taskherd doctor` checks both. The MCP server exposes `tasks_init · tasks_status
+· tasks_add · tasks_block · tasks_fork · tasks_ack` (deliberately no
+`tasks_run`: an agent must not spawn itself). Scheduled ai steps get the same
+tools automatically via a per-run merged `--mcp-config`, so the `/task`
+finalization loop works inside isolated worktree runs too.
 
 ## Roadmap
 

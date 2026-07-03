@@ -18,7 +18,12 @@ export const BUILTIN_PROVIDERS = {
     sessionArgs: { resume: ['--resume', '{id}'], continue: ['-c'] },
     permission: { flag: ['--permission-mode', '{permissionMode}'], default: 'bypassPermissions' },
     defaultArgs: ['--add-dir', '/tmp'],
-    mcpArgs: ['--mcp-config', '{repo}/.mcp.json', '--strict-mcp-config'],
+    // {mcpConfig} is the executor-generated merged config (the tree's own
+    // .mcp.json servers + the taskherd-mcp entry, §16) — NOT the raw
+    // {repo}/.mcp.json: --strict-mcp-config would otherwise hide the tasks_*
+    // tools from every scheduled run. A user override may still reference
+    // {repo} the documented §8 way; both vars are supplied at render time.
+    mcpArgs: ['--mcp-config', '{mcpConfig}', '--strict-mcp-config'],
     maxTurnsArg: ['--max-turns', '{maxTurns}'],
     costJson: ['--output-format', 'json'], // parsed for §10 cost logging
   },
@@ -75,7 +80,7 @@ function renderArgs(template, vars) {
 // Renders the full argv for one ai step. Session modes (§8): fresh (default) /
 // resume <id> / continue. Returns { command, args, permissionMode, captureCost }.
 export function renderInvocation(provider, {
-  task, model, permissionMode, maxTurns, session, repo, mcp = true,
+  task, model, permissionMode, maxTurns, session, repo, mcpConfig, mcp = true,
 } = {}) {
   const args = [];
 
@@ -103,11 +108,17 @@ export function renderInvocation(provider, {
     if (r) args.push(...r);
   }
 
-  // MCP config only when the repo actually has one — passing --mcp-config at a
-  // missing path would make the provider CLI error.
-  if (mcp && provider.mcpArgs && repo && existsSync(path.join(repo, '.mcp.json'))) {
-    const r = renderArgs(provider.mcpArgs, { repo });
-    if (r) args.push(...r);
+  // MCP config: the built-in template references {mcpConfig} (the executor's
+  // merged file); a user override may reference {repo}/.mcp.json per the §8
+  // example — only rendered when that file actually exists, since passing
+  // --mcp-config at a missing path would make the provider CLI error. Either
+  // way renderArgs drops the whole group when its var is unresolved.
+  if (mcp && provider.mcpArgs) {
+    const wantsRepoFile = provider.mcpArgs.some((a) => a.includes('{repo}'));
+    if (!wantsRepoFile || (repo && existsSync(path.join(repo, '.mcp.json')))) {
+      const r = renderArgs(provider.mcpArgs, { repo, mcpConfig });
+      if (r) args.push(...r);
+    }
   }
 
   if (provider.costJson) args.push(...provider.costJson);

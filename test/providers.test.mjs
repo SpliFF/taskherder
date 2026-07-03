@@ -50,14 +50,23 @@ test('renderInvocation: an overriding permissionMode wins over the provider defa
   assert.equal(inv.permissionMode, 'acceptEdits');
 });
 
-test('renderInvocation: mcpArgs only appear when the repo has a .mcp.json', async (t) => {
+test('renderInvocation: built-in mcpArgs key off the executor-merged {mcpConfig}', () => {
+  const without = renderInvocation(claude, { task: 't', repo: '/nope' });
+  assert.ok(!without.args.includes('--mcp-config'), 'no --mcp-config without a merged config');
+  const withMcp = renderInvocation(claude, { task: 't', repo: '/nope', mcpConfig: '/tmp/x/run/main.mcp.json' });
+  assert.ok(withMcp.args.includes('--mcp-config') && withMcp.args.includes('--strict-mcp-config'));
+  assert.ok(withMcp.args.includes('/tmp/x/run/main.mcp.json'), 'the merged file path is what gets passed');
+});
+
+test('renderInvocation: a user override referencing {repo}/.mcp.json keeps the §8 documented behavior', async (t) => {
   const dir = await mkdtemp(path.join(os.tmpdir(), 'th-mcp-'));
   t.after(() => rm(dir, { recursive: true, force: true }));
-  const without = renderInvocation(claude, { task: 't', repo: dir });
-  assert.ok(!without.args.includes('--mcp-config'), 'no --mcp-config without a .mcp.json');
+  const override = { ...claude, mcpArgs: ['--mcp-config', '{repo}/.mcp.json', '--strict-mcp-config'] };
+  const without = renderInvocation(override, { task: 't', repo: dir, mcpConfig: '/tmp/merged.json' });
+  assert.ok(!without.args.includes('--mcp-config'), 'no --mcp-config while {repo}/.mcp.json is missing');
   await writeFile(path.join(dir, '.mcp.json'), '{}');
-  const withMcp = renderInvocation(claude, { task: 't', repo: dir });
-  assert.ok(withMcp.args.includes('--mcp-config') && withMcp.args.includes('--strict-mcp-config'));
+  const withMcp = renderInvocation(override, { task: 't', repo: dir, mcpConfig: '/tmp/merged.json' });
+  assert.ok(withMcp.args.includes(`${dir}/.mcp.json`), 'the repo file is passed, not the merged one');
 });
 
 test('renderInvocation: a template needing a task but given none throws loudly', () => {

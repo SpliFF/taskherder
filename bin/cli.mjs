@@ -1,12 +1,14 @@
 #!/usr/bin/env node
 // taskherd — CLI entry (DESIGN.md §18). M1: init/run/status/add/block/ack/
 // attach/pause/resume, command + manual step types only.
-import { existsSync, statSync } from 'node:fs';
+import { existsSync, statSync, lstatSync } from 'node:fs';
 import {
-  writeFile, rm, mkdir, chmod,
+  writeFile, rm, mkdir, chmod, symlink, realpath,
 } from 'node:fs/promises';
+import os from 'node:os';
 import path from 'node:path';
 import { connect } from 'node:net';
+import { fileURLToPath } from 'node:url';
 import { parseArgs } from 'node:util';
 import { spawnSync } from 'node:child_process';
 
@@ -14,7 +16,7 @@ import {
   repoTasksDir, pausedFile, runSocketPath, profileDir, profileFile,
 } from '../src/paths.mjs';
 import {
-  initTasksDir, laneExists, loadLane, saveLane, newLane, validateStep, ackLane,
+  initTasksDir, ackLane, addStep, forkLane,
 } from '../src/tasks.mjs';
 import { tick } from '../src/scheduler.mjs';
 import { renderStatus, readHistory } from '../src/history.mjs';
@@ -96,41 +98,36 @@ async function cmdStatus(argv) {
   console.log(await renderStatus(repo));
 }
 
-// Builds a step object from parsed CLI options + the trailing task string.
-function buildStepFromOpts(values, task) {
-  if (values.type === 'manual') {
-    return {
-      type: 'manual',
-      message: values.message || task,
-      ...(values.file ? { file: values.file } : {}),
-      status: 'pending',
-    };
-  }
-  if (values.type === 'ai') {
-    const step = { type: 'ai', status: 'pending' };
-    if (values.file) step.file = values.file;
-    else step.task = task;
-    if (values.provider) step.provider = values.provider;
-    if (values.model) step.model = values.model;
-    if (values.profile) step.profile = values.profile;
-    if (values.runner) step.runner = values.runner;
-    if (values.session) step.session = { mode: values.session };
-    const args = {};
-    if (values['permission-mode']) args.permissionMode = values['permission-mode'];
-    if (values['max-turns']) args.maxTurns = Number(values['max-turns']);
-    if (Object.keys(args).length) step.args = args;
-    let budget = null;
-    if (values['budget-usd'] != null) {
-      budget = { usd: Number(values['budget-usd']) };
-      if (values['budget-per-run']) budget.perRun = true;
-    }
-    if (values['budget-per-day'] != null) {
-      budget = { ...(budget || {}), usdPerDay: Number(values['budget-per-day']) };
-    }
-    if (budget) step.budget = budget;
-    return step;
-  }
-  return { type: 'command', run: task, status: 'pending' };
+// Maps parsed CLI flags onto the canonical camelCase opts that
+// tasks.mjs buildStep/addStep/forkLane take (one step builder for every
+// client — DESIGN §3; the MCP tools use the same one).
+function stepOptsFromFlags(values, task) {
+  return {
+    type: values.type,
+    task: task || undefined,
+    message: values.message,
+    file: values.file,
+    provider: values.provider,
+    model: values.model,
+    profile: values.profile,
+    runner: values.runner,
+    session: values.session,
+    permissionMode: values['permission-mode'],
+    maxTurns: values['max-turns'],
+    budgetUsd: values['budget-usd'],
+    budgetPerDay: values['budget-per-day'],
+    budgetPerRun: values['budget-per-run'],
+  };
+}
+
+function laneOptsFromFlags(values) {
+  return {
+    isolation: values.isolation,
+    land: values.land,
+    base: values.base,
+    onEmpty: values['on-empty'],
+    asDefault: values.default,
+  };
 }
 
 const ADD_OPTIONS = {
@@ -166,31 +163,35 @@ async function cmdAdd(argv) {
   }
   const task = taskParts.join(' ');
 
-  const lane = (await laneExists(repo, laneName)) ? await loadLane(repo, laneName) : newLane(laneName);
-  const step = buildStepFromOpts(values, task);
-  validateStep(step);
-
-  // Isolation, land policy, and base are lane-level (DESIGN §7: "Isolation is
-  // per-lane") — the branch and land decision belong to the lane, not one step.
-  if (values.isolation) lane.isolation = values.isolation;
-  if (values.land) lane.land = values.land;
-  if (values.base) lane.base = values.base;
-
-  if (values.default) {
-    // Define the lane's recurring default step (DESIGN §6): each fire runs it
-    // when the queue is empty. Strip the transient `status`.
-    const { status, ...defaultStep } = step;
-    lane.default = defaultStep;
-    lane.onEmpty = 'default';
-    await saveLane(repo, lane);
+  const { step, index } = await addStep(repo, laneName, stepOptsFromFlags(values, task), laneOptsFromFlags(values));
+  if (index === 'default') {
     console.log(`taskherd: set lane '${laneName}' default (${step.type}, onEmpty=default)`);
-    return;
+  } else {
+    console.log(`taskherd: added step ${index} (${step.type}) to lane '${laneName}'`);
   }
+}
 
-  lane.steps.push(step);
-  if (values['on-empty']) lane.onEmpty = values['on-empty'];
-  await saveLane(repo, lane);
-  console.log(`taskherd: added step ${lane.steps.length - 1} (${step.type}) to lane '${laneName}'`);
+// taskherd fork <lane> --from <parent> (DESIGN §18): a NEW lane with `parent`
+// set — an independent workstream (own branch/worktree) split off an existing
+// lane. Optional trailing task / --type / --default seed its first work.
+async function cmdFork(argv) {
+  const { values, positionals } = parseRepoOnly(argv, { ...ADD_OPTIONS, from: { type: 'string' } });
+  const { repo, rest } = resolveRepo(values.repo, positionals);
+  requireTasksDir(repo);
+  const [laneName, ...taskParts] = rest;
+  if (!laneName || !values.from) {
+    console.error('taskherd: usage: taskherd fork [-C repo] <new-lane> --from <parent> [add opts] ["<task>"]');
+    process.exit(1);
+  }
+  const task = taskParts.join(' ');
+  const hasStep = Boolean(task || values.file || values.message);
+  const lane = await forkLane(repo, laneName, values.from, {
+    stepOpts: hasStep ? stepOptsFromFlags(values, task) : null,
+    laneOpts: laneOptsFromFlags(values),
+  });
+  const seeded = lane.default ? ', recurring default set'
+    : (lane.steps.length ? `, ${lane.steps.length} initial step(s)` : ', empty');
+  console.log(`taskherd: forked lane '${laneName}' from '${values.from}'${seeded}`);
 }
 
 async function cmdBlock(argv) {
@@ -457,6 +458,87 @@ async function cmdCost(argv) {
   console.log(`total  $${total.toFixed(4)}`);
 }
 
+function mcpBinPath() {
+  return fileURLToPath(new URL('./mcp.mjs', import.meta.url));
+}
+
+function skillSrcDir() {
+  return fileURLToPath(new URL('../skill/task', import.meta.url));
+}
+
+// The /task skill is linked into the user's Claude skills dir (user-global,
+// like the MCP registration — DESIGN §19 "bundled skill").
+function skillLinkPath() {
+  const configDir = process.env.CLAUDE_CONFIG_DIR || path.join(os.homedir(), '.claude');
+  return path.join(configDir, 'skills', 'task');
+}
+
+async function skillLinkState() {
+  const link = skillLinkPath();
+  let st;
+  try {
+    st = lstatSync(link);
+  } catch {
+    return 'missing';
+  }
+  if (st.isSymbolicLink()) {
+    try {
+      if (await realpath(link) === await realpath(skillSrcDir())) return 'ok';
+    } catch {
+      return 'broken';
+    }
+  }
+  return 'other'; // a real dir or a foreign symlink — never clobber it
+}
+
+function mcpRegistrationState() {
+  if (!commandOnPath('claude')) return 'no-claude';
+  const r = spawnSync('claude', ['mcp', 'get', 'taskherd'], { encoding: 'utf8' });
+  return r.status === 0 ? 'ok' : 'missing';
+}
+
+// taskherd install — user-global integrations (DESIGN §16, §19): register
+// taskherd-mcp in the claude CLI's user scope and link the bundled /task
+// skill. Idempotent; refuses loudly rather than clobbering anything foreign.
+// (§18 has no verb for this — recorded in PLAN as a CLI addition.)
+async function cmdInstall() {
+  let problems = 0;
+
+  const mcpState = mcpRegistrationState();
+  if (mcpState === 'ok') {
+    console.log("✓ MCP server 'taskherd' already registered (claude mcp get taskherd)");
+  } else if (mcpState === 'no-claude') {
+    problems += 1;
+    console.log('✗ claude CLI not on PATH — register taskherd-mcp in your agent\'s user-global MCP config yourself:');
+    console.log(`    command: ${commandOnPath('taskherd-mcp') ? 'taskherd-mcp' : `${process.execPath} ${mcpBinPath()}`}`);
+  } else {
+    // A global npm install puts taskherd-mcp on PATH (survives package moves);
+    // a dev checkout registers the absolute script path instead.
+    const cmdArgs = commandOnPath('taskherd-mcp') ? ['taskherd-mcp'] : [process.execPath, mcpBinPath()];
+    const r = spawnSync('claude', ['mcp', 'add', '--scope', 'user', 'taskherd', '--', ...cmdArgs], { encoding: 'utf8' });
+    if (r.status === 0) {
+      console.log(`✓ registered MCP server 'taskherd' user-globally (${cmdArgs.join(' ')})`);
+    } else {
+      problems += 1;
+      console.log(`✗ claude mcp add failed: ${(r.stderr || r.stdout || `exit ${r.status}`).trim()}`);
+    }
+  }
+
+  const skillState = await skillLinkState();
+  if (skillState === 'ok') {
+    console.log(`✓ /task skill already linked (${skillLinkPath()})`);
+  } else if (skillState === 'other' || skillState === 'broken') {
+    problems += 1;
+    console.log(`✗ ${skillLinkPath()} exists but is not a link to this package's skill/task — move it aside, then re-run \`taskherd install\``);
+  } else {
+    await mkdir(path.dirname(skillLinkPath()), { recursive: true });
+    await symlink(skillSrcDir(), skillLinkPath());
+    console.log(`✓ linked /task skill: ${skillLinkPath()} -> ${skillSrcDir()}`);
+  }
+
+  if (problems > 0) process.exit(1);
+}
+
 // taskherd doctor — check providers, profiles, MCP, node-pty (DESIGN §18).
 async function cmdDoctor() {
   let problems = 0;
@@ -482,6 +564,26 @@ async function cmdDoctor() {
     } catch (err) {
       problems += 1;
       console.log(`  ✗ ${p}: ${err.message}`);
+    }
+  }
+
+  console.log('integrations:');
+  {
+    const mcpState = mcpRegistrationState();
+    if (mcpState === 'no-claude') {
+      console.log('  · claude CLI not on PATH — cannot check the MCP registration');
+    } else if (mcpState === 'ok') {
+      console.log("  ✓ MCP server 'taskherd' registered");
+    } else {
+      problems += 1;
+      console.log("  ✗ taskherd-mcp not registered — run `taskherd install` (agents can't enqueue their own next step/gate without it)");
+    }
+    const skillState = await skillLinkState();
+    if (skillState === 'ok') {
+      console.log('  ✓ /task skill linked');
+    } else {
+      problems += 1;
+      console.log(`  ✗ /task skill not linked (${skillState}) — run \`taskherd install\``);
     }
   }
 
@@ -511,6 +613,7 @@ const COMMANDS = {
   status: cmdStatus,
   add: cmdAdd,
   block: cmdBlock,
+  fork: cmdFork,
   ack: cmdAck,
   attach: cmdAttach,
   pause: cmdPause,
@@ -519,6 +622,7 @@ const COMMANDS = {
   auth: cmdAuth,
   history: cmdHistory,
   cost: cmdCost,
+  install: cmdInstall,
   doctor: cmdDoctor,
 };
 

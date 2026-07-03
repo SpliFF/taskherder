@@ -5,14 +5,17 @@
 import {
   createWriteStream, existsSync, chmodSync, statSync, readdirSync, mkdirSync,
 } from 'node:fs';
-import { rm, symlink, readFile } from 'node:fs/promises';
+import {
+  rm, symlink, readFile, writeFile, mkdir,
+} from 'node:fs/promises';
+import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
 import path from 'node:path';
 import pty from 'node-pty';
 import {
-  logsDir, runtimeDir, runSocketPath, runSocketLink, repoTasksDir,
+  logsDir, runtimeDir, runSocketPath, runSocketLink, repoTasksDir, runDir,
 } from './paths.mjs';
 import { appendEvent } from './events.mjs';
 import { resolveProvider, renderInvocation, parseCost } from './providers.mjs';
@@ -166,6 +169,48 @@ async function resolveWorkdir(repo, lane, resolvedConfig) {
   throw new Error(`taskherd: unknown isolation ${JSON.stringify(isolation)} (worktree | inplace | none)`);
 }
 
+// A scheduled ai run must see the taskherd-mcp tasks_* tools (DESIGN §16, §17
+// — the /task finalization loop enqueues its own next step/gate), but the
+// provider is invoked with --strict-mcp-config, which hides everything not in
+// the passed config. So each ai run gets a merged config: the tree's own
+// .mcp.json servers (if any) plus a `taskherd` entry pinned to this package's
+// bin/mcp.mjs, written to .tasks/run/<lane>.mcp.json. The entry's env carries
+// the MAIN repo path + lane name so the tools target the right .tasks/ even
+// though the agent's cwd is a worktree (which never contains .tasks/ — it's
+// gitignored). A tree .mcp.json that defines its own `taskherd` server wins
+// (deliberate pin), loudly.
+export async function writeMcpConfig(repo, lane, workdir) {
+  const mcpBin = fileURLToPath(new URL('../bin/mcp.mjs', import.meta.url));
+  const taskherd = {
+    command: process.execPath,
+    args: [mcpBin],
+    env: {
+      TASKHERD_REPO: path.resolve(repo),
+      TASKHERD_LANE: lane.name,
+      ...(process.env.TASKHERD_HOME ? { TASKHERD_HOME: process.env.TASKHERD_HOME } : {}),
+    },
+  };
+  let treeServers = {};
+  const treeCfg = path.join(workdir, '.mcp.json');
+  if (existsSync(treeCfg)) {
+    try {
+      treeServers = JSON.parse(await readFile(treeCfg, 'utf8')).mcpServers || {};
+    } catch (err) {
+      // Malformed project config is a setup error — park the lane loudly
+      // rather than silently running the agent without its project's servers.
+      throw new Error(`taskherd: malformed ${treeCfg}: ${err.message}`);
+    }
+    if (treeServers.taskherd) {
+      console.error(`taskherd: NOTE ${treeCfg} defines its own 'taskherd' MCP server — using the repo's, not the built-in`);
+    }
+  }
+  const merged = { mcpServers: { taskherd, ...treeServers } };
+  await mkdir(runDir(repo), { recursive: true });
+  const file = path.join(runDir(repo), `${lane.name}.mcp.json`);
+  await writeFile(file, `${JSON.stringify(merged, null, 2)}\n`);
+  return file;
+}
+
 // Builds the concrete spawn spec for a step. `command` → the shell/argv, the
 // ambient env, no cost capture. `ai` → the provider-rendered argv, the profile's
 // isolated env, and cost capture on (DESIGN §8, §9, §13). Throws on setup errors
@@ -192,8 +237,9 @@ async function buildInvocation(repo, lane, step, resolvedConfig = {}, workdir = 
   const permissionMode = step.args?.permissionMode ?? null;
   const session = resolveSession(step, lane);
 
+  const mcpConfig = await writeMcpConfig(repo, lane, workdir);
   const inv = renderInvocation(provider, {
-    task, model: resolvedConfig.model, permissionMode, maxTurns, session, repo: workdir,
+    task, model: resolvedConfig.model, permissionMode, maxTurns, session, repo: workdir, mcpConfig,
   });
 
   let env = process.env;
@@ -320,7 +366,10 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     cols: 80,
     rows: 30,
     cwd: workdir,
-    env: spawnEnv,
+    // TASKHERD_REPO/LANE: the seam letting anything the step spawns (the /task
+    // skill, a script calling the CLI, taskherd-mcp) target the MAIN repo's
+    // .tasks/ and its own lane — the step's cwd is a worktree under isolation.
+    env: { ...spawnEnv, TASKHERD_REPO: path.resolve(repo), TASKHERD_LANE: lane.name },
   });
   for (const msg of preSpawn.splice(0)) applyControl(msg);
 

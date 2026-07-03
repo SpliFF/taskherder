@@ -285,6 +285,117 @@ export async function ackLane(repo, name) {
   return { kind: 'failure', lane };
 }
 
+// Lane names become file paths (`.tasks/<name>.json`) and branch names
+// (`taskherd/<name>`), and MCP clients pass them straight from an agent — a
+// separator or a leading dot must fail loudly, never escape .tasks/.
+export function validateLaneName(name) {
+  if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._-]*$/.test(name)) {
+    throw new LaneValidationError(
+      `taskherd: invalid lane name ${JSON.stringify(name)} (letters, digits, ., _, - only; must not start with .)`,
+    );
+  }
+  return name;
+}
+
+// Canonical step builder shared by every client of the lane files (the CLI's
+// `add`, MCP `tasks_add`/`tasks_block`/`tasks_fork` — DESIGN §3: they must not
+// drift apart). Opts are camelCase; validates before returning.
+export function buildStep(opts = {}) {
+  const type = opts.type || 'command';
+  if (type === 'manual') {
+    return validateStep({
+      type: 'manual',
+      message: opts.message || opts.task,
+      ...(opts.file ? { file: opts.file } : {}),
+      status: 'pending',
+    });
+  }
+  if (type === 'ai') {
+    const step = { type: 'ai', status: 'pending' };
+    if (opts.file) step.file = opts.file;
+    else if (opts.task) step.task = opts.task;
+    if (opts.provider) step.provider = opts.provider;
+    if (opts.model) step.model = opts.model;
+    if (opts.profile) step.profile = opts.profile;
+    if (opts.runner) step.runner = opts.runner;
+    if (opts.session) step.session = typeof opts.session === 'string' ? { mode: opts.session } : opts.session;
+    const args = {};
+    if (opts.permissionMode) args.permissionMode = opts.permissionMode;
+    if (opts.maxTurns != null) args.maxTurns = Number(opts.maxTurns);
+    if (Object.keys(args).length) step.args = args;
+    let budget = null;
+    if (opts.budgetUsd != null) {
+      budget = { usd: Number(opts.budgetUsd) };
+      if (opts.budgetPerRun) budget.perRun = true;
+    }
+    if (opts.budgetPerDay != null) budget = { ...(budget || {}), usdPerDay: Number(opts.budgetPerDay) };
+    if (budget) step.budget = budget;
+    return validateStep(step);
+  }
+  return validateStep({ type: 'command', run: opts.run ?? opts.task, status: 'pending' });
+}
+
+// Lane-level axis settings a client may set alongside a step (DESIGN §7:
+// isolation/land/base are per-lane, not per-step).
+function applyLaneOpts(lane, laneOpts = {}) {
+  if (laneOpts.isolation) lane.isolation = laneOpts.isolation;
+  if (laneOpts.land) lane.land = laneOpts.land;
+  if (laneOpts.base) lane.base = laneOpts.base;
+  if (laneOpts.onEmpty) lane.onEmpty = laneOpts.onEmpty;
+}
+
+// Appends a step to a lane (creating the lane on first use), or — with
+// `asDefault` — sets the lane's recurring default (DESIGN §6). Shared by the
+// CLI `add`/`block` and MCP `tasks_add`/`tasks_block`.
+export async function addStep(repo, laneName, stepOpts, laneOpts = {}) {
+  validateLaneName(laneName);
+  const lane = (await laneExists(repo, laneName)) ? await loadLane(repo, laneName) : newLane(laneName);
+  const step = buildStep(stepOpts);
+  applyLaneOpts(lane, laneOpts);
+  if (laneOpts.asDefault) {
+    const { status: _transient, ...defaultStep } = step;
+    lane.default = defaultStep;
+    lane.onEmpty = 'default';
+    await saveLane(repo, lane);
+    return { lane, step: defaultStep, index: 'default' };
+  }
+  lane.steps.push(step);
+  await saveLane(repo, lane);
+  return { lane, step, index: lane.steps.length - 1 };
+}
+
+// Forks a sibling lane off a parent (DESIGN §18 `taskherd fork`, MCP
+// `tasks_fork`, §17 "independent workstreams"): a NEW lane with `parent` set,
+// running independently from creation. The parent must exist — forking off a
+// typo must fail loudly, not scaffold an orphan. An initial step (or default)
+// gives the fork something to do on its first fire.
+export async function forkLane(repo, name, from, { stepOpts = null, laneOpts = {} } = {}) {
+  validateLaneName(name);
+  if (await laneExists(repo, name)) {
+    throw new LaneValidationError(`taskherd: lane '${name}' already exists — fork needs a new lane name`);
+  }
+  if (!from) {
+    throw new LaneValidationError('taskherd: fork needs a parent lane (--from <lane>)');
+  }
+  if (!(await laneExists(repo, from))) {
+    throw new LaneValidationError(`taskherd: parent lane '${from}' does not exist`);
+  }
+  const lane = newLane(name, { parent: from });
+  applyLaneOpts(lane, laneOpts);
+  if (stepOpts) {
+    const step = buildStep(stepOpts);
+    if (laneOpts.asDefault) {
+      const { status: _transient, ...defaultStep } = step;
+      lane.default = defaultStep;
+      lane.onEmpty = 'default';
+    } else {
+      lane.steps.push(step);
+    }
+  }
+  await saveLane(repo, lane);
+  return lane;
+}
+
 async function ensureGlobalGitignore() {
   let excludesFile;
   try {
