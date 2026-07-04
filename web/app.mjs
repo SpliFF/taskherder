@@ -56,6 +56,8 @@ function renderAuthHelp() {
 // ── state + rendering ───────────────────────────────────────────────────
 let projects = [];
 let allowShell = false; // whether serve was started with --allow-shell (web-SSH)
+let allowGfx = false; // whether serve was started with --allow-gfx (graphical streaming)
+let gfxRunners = []; // names of runners.json runners that declare a graphical endpoint
 
 let refreshTimer = null;
 function scheduleRefresh() {
@@ -66,6 +68,8 @@ function scheduleRefresh() {
       const data = await api('/api/projects');
       projects = data.projects;
       allowShell = !!data.allowShell;
+      allowGfx = !!data.allowGfx;
+      gfxRunners = data.gfxRunners || [];
       render();
       syncEventSockets();
     } catch (err) {
@@ -146,6 +150,7 @@ function render() {
         <span class="project-path">${esc(p.path)}</span>
         <span class="project-spend">${p.totalSpent ? `Σ $${p.totalSpent.toFixed(2)}` : ''}</span>
         ${allowShell ? `<button class="btn ghost" data-action="shell" title="open a shell on this host (web-SSH)">SHELL</button>` : ''}
+        ${allowGfx && gfxRunners.length ? `<button class="btn ghost" data-action="gui" title="stream a runner's GUI (Xpra/noVNC)">GUI</button>` : ''}
         <button class="btn ${p.paused ? 'primary' : 'warn'}" data-action="${p.paused ? 'resume' : 'pause'}">${p.paused ? 'RESUME' : 'PAUSE'}</button>
       </div>
       ${p.paused ? '<div class="paused-banner">⏸ PAUSED — no lanes will run until resumed</div>' : ''}
@@ -197,6 +202,8 @@ app.addEventListener('click', (e) => {
     openTerminal(id, lane);
   } else if (action === 'shell') {
     openShell(id, 'local');
+  } else if (action === 'gui') {
+    openGui(id);
   } else if (action === 'diff') {
     openDiff(id, lane);
   }
@@ -285,6 +292,7 @@ function closeReason(code) {
 function openPty(wsUrl, title) {
   closeTerminal();
   closeDiff();
+  closeGfx();
   panel.hidden = false;
   termTitle.textContent = title;
   term = new Terminal({ fontSize: 13, fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', theme: { background: '#0a0c0a' }, convertEol: false });
@@ -369,6 +377,7 @@ function diffLineHtml(line) {
 
 async function openDiff(id, lane) {
   closeTerminal();
+  closeGfx();
   diffPanel.hidden = false;
   diffTitle.textContent = `${lane} — diff`;
   diffBody.innerHTML = '<p class="boot">loading diff…</p>';
@@ -405,6 +414,44 @@ async function openDiff(id, lane) {
 }
 
 document.getElementById('diff-close').onclick = closeDiff;
+
+// ── graphical stream (§15 Layer 2 — Xpra/noVNC) ──────────────────────────
+// The runner runs its own Xpra/noVNC server; serve reverse-proxies its HTML5
+// client under an unguessable capability path (minted by gfx-open) that we drop
+// into an iframe. A runner with no graphical endpoint returns a 400+standin —
+// surfaced as a toast, never a silent blank frame.
+const gfxPanel = document.getElementById('gfx-panel');
+const gfxFrame = document.getElementById('gfx-frame');
+const gfxTitle = document.getElementById('gfx-title');
+
+function closeGfx() {
+  gfxPanel.hidden = true;
+  gfxFrame.removeAttribute('src'); // stop the stream + drop the proxied WS
+}
+
+async function openGui(id) {
+  let runner = gfxRunners[0];
+  if (gfxRunners.length > 1) {
+    const pick = prompt(`stream which runner's GUI?\n(${gfxRunners.join(', ')})`, gfxRunners[0]);
+    if (!pick) return;
+    runner = pick.trim();
+  }
+  if (!runner) { toast('error', 'no graphical runner configured (runners.json "graphical")'); return; }
+  let r;
+  try {
+    r = await api(`/api/projects/${encodeURIComponent(id)}/gfx-open`, { runner });
+  } catch (err) {
+    if (err.message !== 'unauthorized') toast('error', err.message); // 400+standin lands here
+    return;
+  }
+  closeTerminal();
+  closeDiff();
+  gfxPanel.hidden = false;
+  gfxTitle.textContent = `${r.name} — ${r.kind}`;
+  gfxFrame.src = r.url;
+}
+
+document.getElementById('gfx-close').onclick = closeGfx;
 
 // ── boot ────────────────────────────────────────────────────────────────
 scheduleRefresh();

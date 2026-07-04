@@ -37,6 +37,16 @@
     </div>
     <div class="diff-body" id="diff-body"></div>
   </section>
+  <section class="gfx-panel" id="gfx-panel" hidden>
+    <div class="term-bar">
+      <span class="term-title" id="gfx-title">—</span>
+      <span class="term-actions">
+        <button class="btn" id="gfx-close">CLOSE</button>
+      </span>
+    </div>
+    <iframe class="gfx-frame" id="gfx-frame" title="runner GUI stream"
+            allow="clipboard-read; clipboard-write; fullscreen"></iframe>
+  </section>
   <div class="toasts" id="toasts"></div>
   <script type="module" src="/app.mjs"></script>
 </body>

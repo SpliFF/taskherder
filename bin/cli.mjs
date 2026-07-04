@@ -21,7 +21,7 @@ import {
 import { tick } from '../src/scheduler.mjs';
 import { renderStatus, readHistory } from '../src/history.mjs';
 import { loadProviders } from '../src/providers.mjs';
-import { loadRunners } from '../src/runners.mjs';
+import { loadRunners, graphicalEndpoint } from '../src/runners.mjs';
 import { listProfiles, loadProfile, isolationWarnings } from '../src/profiles.mjs';
 import { isGitRepo, gcWorktrees, laneDiff } from '../src/git.mjs';
 import { loadProjectConfig } from '../src/config.mjs';
@@ -383,13 +383,15 @@ async function cmdServe(argv) {
     port: { type: 'string', short: 'p' },
     host: { type: 'string' },
     'allow-shell': { type: 'boolean', default: false },
+    'allow-gfx': { type: 'boolean', default: false },
   });
   const { repo } = resolveRepo(values.repo, positionals, { laneless: true });
   if (existsSync(repoTasksDir(repo))) await registerProject(repo);
 
   const { createConsoleServer } = await import('../src/serve.mjs');
   const allowShell = values['allow-shell'];
-  const console_ = await createConsoleServer({ allowShell });
+  const allowGfx = values['allow-gfx'];
+  const console_ = await createConsoleServer({ allowShell, allowGfx });
   const host = values.host || '127.0.0.1';
   const port = values.port ? Number(values.port) : 4373; // H-E-R-D on a phone keypad
   const addr = await console_.listen(port, host);
@@ -413,6 +415,14 @@ async function cmdServe(argv) {
   if (allowShell) {
     console.log('taskherd: WARNING web-SSH ENABLED (--allow-shell) — the console can open interactive');
     console.log('          shells (local / docker / ssh) as this user; anyone with the token gets a shell.');
+    if (host !== '127.0.0.1') {
+      console.log('          You are NOT on loopback — make sure the token stays private (DESIGN §12/§15).');
+    }
+  }
+  if (allowGfx) {
+    console.log('taskherd: WARNING graphical streaming ENABLED (--allow-gfx) — the console can proxy an');
+    console.log('          in-runner Xpra/noVNC GUI (interactive desktop control) for runners.json runners');
+    console.log('          that declare a "graphical" endpoint; anyone with the token gets that GUI.');
     if (host !== '127.0.0.1') {
       console.log('          You are NOT on loopback — make sure the token stays private (DESIGN §12/§15).');
     }
@@ -661,6 +671,17 @@ async function cmdDoctor() {
       if (!ok) problems += 1;
       const target = def.container || def.image || def.host || '?';
       console.log(`  ${ok ? '✓' : '✗'} ${name} (${def.kind || 'no kind'} → ${target})${ok ? '' : ` — ${def.kind ? `${cli} not on PATH` : 'needs "kind": docker|ssh'}`}`);
+      if (def.graphical) {
+        // §15 L2 graphical endpoint — validate the block shape (reachability needs a
+        // live server, verified only when the console proxies it under --allow-gfx).
+        try {
+          const g = graphicalEndpoint(def);
+          console.log(`      ↳ graphical: ${g.kind} → ${g.httpBase} (stream via \`taskherd serve --allow-gfx\`)`);
+        } catch (err) {
+          problems += 1;
+          console.log(`      ↳ ✗ graphical misconfigured: ${err.message}`);
+        }
+      }
     }
     // Flag the inline-runner CLIs so `docker:`/`ssh:` axis values fail loud, not late.
     for (const cli of ['docker', 'ssh']) {

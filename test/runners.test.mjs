@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  resolveRunner, wrapForRunner, shquote, loadRunners, shellInvocation,
+  resolveRunner, wrapForRunner, shquote, loadRunners, shellInvocation, graphicalEndpoint,
 } from '../src/runners.mjs';
 
 // A minimal inner invocation (what a provider/shell step rendered).
@@ -170,4 +170,38 @@ test('shellInvocation(ssh): a -tt login shell on the remote host', () => {
 test('shellInvocation: an explicit shell overrides the default', () => {
   const s = shellInvocation({ kind: 'docker', container: 'c', name: 'docker:c' }, { cwd: '/r', shell: '/bin/bash' });
   assert.equal(s.args[s.args.length - 1], '/bin/bash');
+});
+
+// ── graphical streaming (M7c, DESIGN §15 Layer 2 / §11) ────────────────────
+
+test('graphicalEndpoint: a runner with no graphical block returns null (caller fires a FIDELITY-STANDIN)', () => {
+  assert.equal(graphicalEndpoint({ kind: 'local' }), null);
+  assert.equal(graphicalEndpoint({ kind: 'docker', container: 'x' }), null);
+  assert.equal(graphicalEndpoint(null), null);
+});
+
+test('graphicalEndpoint: novnc/xpra endpoints normalize (httpBase, origin, ws scheme, client page)', () => {
+  const nv = graphicalEndpoint({ name: 'desk', kind: 'docker', graphical: { kind: 'novnc', url: 'http://127.0.0.1:8080/' } });
+  assert.equal(nv.kind, 'novnc');
+  assert.equal(nv.name, 'desk');
+  assert.equal(nv.httpBase, 'http://127.0.0.1:8080/');
+  assert.equal(nv.origin, 'http://127.0.0.1:8080');
+  assert.equal(nv.wsScheme, 'ws:'); // derived from http
+  assert.equal(nv.clientPath, 'vnc.html'); // noVNC default entry page
+
+  // Xpra: served at the server root by default; https → wss; explicit path wins.
+  const xp = graphicalEndpoint({ name: 'app', kind: 'docker', graphical: { kind: 'xpra', url: 'https://gui.box/xpra/', path: '/index.html' } });
+  assert.equal(xp.kind, 'xpra');
+  assert.equal(xp.wsScheme, 'wss:');
+  assert.equal(xp.httpBase, 'https://gui.box/xpra/');
+  assert.equal(xp.origin, 'https://gui.box');
+  assert.equal(xp.clientPath, 'index.html'); // leading slash stripped for relative embed
+  assert.equal(graphicalEndpoint({ kind: 'd', graphical: { kind: 'xpra', url: 'http://h:1/' } }).clientPath, '');
+});
+
+test('graphicalEndpoint: a malformed graphical block fails loud (misconfig never degrades silently, §12)', () => {
+  assert.throws(() => graphicalEndpoint({ graphical: { kind: 'weston', url: 'http://h/' } }), /use xpra \| novnc \| kasmvnc/);
+  assert.throws(() => graphicalEndpoint({ graphical: { kind: 'novnc' } }), /needs a "url"/);
+  assert.throws(() => graphicalEndpoint({ graphical: { kind: 'novnc', url: 'not a url' } }), /not a valid URL/);
+  assert.throws(() => graphicalEndpoint({ graphical: { kind: 'novnc', url: 'ftp://h/' } }), /must be http/);
 });

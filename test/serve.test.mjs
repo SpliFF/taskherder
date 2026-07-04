@@ -4,10 +4,11 @@
 // answer-a-gate / interrupt-a-task work from a browser.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import http from 'node:http';
 import { readFile, writeFile } from 'node:fs/promises';
 import { existsSync, chmodSync } from 'node:fs';
 import path from 'node:path';
-import WebSocket from 'ws';
+import WebSocket, { WebSocketServer } from 'ws';
 
 import { makeRepo, makeGitRepo, waitFor } from './helpers.mjs';
 import { tick } from '../src/scheduler.mjs';
@@ -439,4 +440,113 @@ test('web-SSH: an unknown runner closes the shell WS loudly (4400), never a sile
   const ws = new WebSocket(`ws://127.0.0.1:${addr.port}/ws/shell?project=${repoId(repo)}&runner=podman:box&token=${console_.token}`);
   assert.equal(await wsCloseCode(ws), 4400, 'a bad runner is rejected, not silently run on localhost');
   assert.equal(console_.shellSessionCount(), 0);
+});
+
+// ── graphical streaming: reverse proxy to an in-runner GUI (M7c, DESIGN §15 L2) ──
+
+// Stands in for an Xpra/noVNC HTML5 server running inside a runner (none is
+// installed on this machine): an HTTP page/asset server + a WS echo endpoint.
+async function startFakeGfxServer(t) {
+  const srv = http.createServer((req, res) => {
+    res.writeHead(200, { 'content-type': 'text/html' });
+    res.end(`GFX-CLIENT ${req.url}`);
+  });
+  const gws = new WebSocketServer({ server: srv, path: '/websockify' });
+  gws.on('connection', (ws) => ws.on('message', (d, isBinary) => ws.send(d, { binary: isBinary })));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => new Promise((r) => srv.close(r)));
+  return srv.address().port;
+}
+
+test('graphical: gfx-open mints a capability; HTTP + WS proxy reach the in-runner GUI; no-graphical runner is a loud standin (§15 L2)', async (t) => {
+  const { repo, home, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await registerProject(repo);
+  const gfxPort = await startFakeGfxServer(t);
+
+  // Declare the fake server as a runner's graphical endpoint (runners.json).
+  await writeFile(path.join(home, 'runners.json'), JSON.stringify({
+    desktop: {
+      kind: 'docker', container: 'gui',
+      graphical: { kind: 'novnc', url: `http://127.0.0.1:${gfxPort}/`, path: 'vnc.html' },
+    },
+  }));
+
+  const console_ = await createConsoleServer({ allowGfx: true });
+  const addr = await console_.listen(0, '127.0.0.1');
+  t.after(() => console_.close());
+  const base = `http://127.0.0.1:${addr.port}`;
+  const id = repoId(repo);
+  const authed = (method, p, body) => fetch(`${base}${p}`, {
+    method,
+    headers: { authorization: `Bearer ${console_.token}`, ...(body ? { 'content-type': 'application/json' } : {}) },
+    body: body ? JSON.stringify(body) : undefined,
+  });
+
+  // The console learns the capability is on + which runners can be streamed.
+  const projects = await (await authed('GET', '/api/projects')).json();
+  assert.equal(projects.allowGfx, true);
+  assert.deepEqual(projects.gfxRunners, ['desktop']);
+
+  // gfx-open mints a session URL under an unguessable capability path.
+  const openRes = await authed('POST', `/api/projects/${id}/gfx-open`, { runner: 'desktop' });
+  assert.equal(openRes.status, 200);
+  const open = await openRes.json();
+  assert.equal(open.kind, 'novnc');
+  assert.match(open.url, /^\/gfx\/[^/]+\/vnc\.html$/);
+  assert.equal(console_.graphicalSessionCount(), 1);
+
+  // HTTP proxy: the iframe's client page loads through serve WITHOUT a token (the
+  // capability in the path is the auth), and reaches the in-runner server.
+  const page = await fetch(`${base}${open.url}`);
+  assert.equal(page.status, 200);
+  assert.match(await page.text(), /GFX-CLIENT \/vnc\.html/);
+  // A sub-resource under the same capability prefix flows through too (relative
+  // asset loads from the HTML5 client).
+  const asset = await fetch(`${base}${open.url.replace(/vnc\.html$/, 'ui/app.js')}`);
+  assert.match(await asset.text(), /GFX-CLIENT \/ui\/app\.js/);
+
+  // WS proxy: the graphical protocol WebSocket is piped byte-transparently.
+  const sessionId = open.url.split('/')[2];
+  const ws = new WebSocket(`ws://127.0.0.1:${addr.port}/gfx/${sessionId}/websockify`);
+  await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject); });
+  const echoed = new Promise((resolve) => ws.on('message', (d) => resolve(Buffer.from(d))));
+  ws.send(Buffer.from([0, 1, 2, 254, 255]));
+  assert.deepEqual([...(await echoed)], [0, 1, 2, 254, 255], 'binary frames round-trip through the proxy');
+  ws.close();
+
+  // A runner with NO graphical block → 400 + standin flag (a FIDELITY-STANDIN is
+  // logged), never a silent blank frame.
+  const none = await authed('POST', `/api/projects/${id}/gfx-open`, { runner: 'local' });
+  assert.equal(none.status, 400);
+  assert.equal((await none.json()).standin, true);
+
+  // Unknown runner → 400 (LaneValidationError), not a 500; an unknown capability
+  // path 404s (never proxies).
+  assert.equal((await authed('POST', `/api/projects/${id}/gfx-open`, { runner: 'ghost' })).status, 400);
+  assert.equal((await fetch(`${base}/gfx/deadbeefdeadbeef/vnc.html`)).status, 404);
+});
+
+test('graphical: --allow-gfx off refuses gfx-open (403) and darkens /gfx (404); no runners advertised', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await registerProject(repo);
+  const console_ = await createConsoleServer(); // gfx off by default
+  const addr = await console_.listen(0, '127.0.0.1');
+  t.after(() => console_.close());
+  const base = `http://127.0.0.1:${addr.port}`;
+  const id = repoId(repo);
+  assert.equal(console_.allowGfx, false);
+
+  const projects = await (await fetch(`${base}/api/projects`, { headers: { authorization: `Bearer ${console_.token}` } })).json();
+  assert.equal(projects.allowGfx, false);
+  assert.deepEqual(projects.gfxRunners, []);
+
+  const open = await fetch(`${base}/api/projects/${id}/gfx-open`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${console_.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ runner: 'local' }),
+  });
+  assert.equal(open.status, 403, 'the dangerous capability is opt-in (§12)');
+  assert.equal((await fetch(`${base}/gfx/anything/here`)).status, 404, 'the /gfx surface is dark when disabled');
 });

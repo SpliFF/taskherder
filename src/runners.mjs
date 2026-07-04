@@ -200,3 +200,61 @@ export function shellInvocation(runner, { cwd, shell } = {}) {
   });
   return { ...spec, label: runner.name || runner.kind };
 }
+
+// ── graphical streaming (DESIGN §15 Layer 2, §11) ──────────────────────────
+// A runner may declare a graphical server running *inside* it — an Xpra per-app
+// HTML5 endpoint, or a noVNC/KasmVNC containerized-desktop endpoint (DESIGN §11:
+// "graphical streaming lives most naturally inside these containers"). Shape in
+// ~/.taskherd/runners.json:
+//   "graphical": { "kind": "xpra" | "novnc" | "kasmvnc",
+//                  "url":  "http://127.0.0.1:8080/",  // the server's HTTP(S) base,
+//                                                      // reachable from the serve host
+//                                                      // (e.g. a docker -p published port)
+//                  "path": "vnc.html" }               // initial HTML5 client page (optional)
+// The console reverse-proxies this base under an unguessable capability path and
+// embeds the HTML5 client in an iframe (src/serve.mjs). The client's own assets
+// and its protocol WebSocket are loaded relative to that /gfx/<session>/ prefix,
+// so they flow back through the same proxy transparently.
+const GRAPHICAL_KINDS = new Set(['xpra', 'novnc', 'kasmvnc']);
+// Where each HTML5 client's entry page lives by default (overridable per runner).
+// Xpra serves its client at the server root; noVNC/KasmVNC at vnc.html.
+const DEFAULT_CLIENT_PATH = { xpra: '', novnc: 'vnc.html', kasmvnc: 'vnc.html' };
+
+// Resolve a runner's declared graphical endpoint to a normalized descriptor, or
+// null when it declares none. A null return is NOT an error — but the caller MUST
+// surface it as a loud FIDELITY-STANDIN (never a silent blank frame), since a
+// graphical stream needs an Xpra/noVNC server the operator stood up in the runner
+// (DESIGN §1/§12: no silent capability gaps). A malformed `graphical` block IS a
+// loud throw (misconfiguration must fail loud, not degrade silently).
+export function graphicalEndpoint(runner) {
+  const g = runner && runner.graphical;
+  if (!g) return null;
+  const who = JSON.stringify(runner.name || runner.kind || 'runner');
+  const kind = g.kind || 'xpra';
+  if (!GRAPHICAL_KINDS.has(kind)) {
+    throw new Error(`taskherd: runner ${who} graphical.kind ${JSON.stringify(kind)} — use xpra | novnc | kasmvnc (DESIGN §15)`);
+  }
+  if (!g.url || typeof g.url !== 'string') {
+    throw new Error(`taskherd: runner ${who} graphical needs a "url" — the in-runner ${kind} server's HTTP(S) base reachable from the serve host (DESIGN §15)`);
+  }
+  let http;
+  try {
+    http = new URL(g.url);
+  } catch {
+    throw new Error(`taskherd: runner ${who} graphical.url ${JSON.stringify(g.url)} is not a valid URL`);
+  }
+  if (http.protocol !== 'http:' && http.protocol !== 'https:') {
+    throw new Error(`taskherd: runner ${who} graphical.url must be http(s):// (got ${JSON.stringify(http.protocol)})`);
+  }
+  const clientPath = (g.path != null ? String(g.path) : DEFAULT_CLIENT_PATH[kind]).replace(/^\/+/, '');
+  return {
+    kind,
+    name: runner.name || runner.kind || 'runner',
+    // A trailing slash so `new URL(remainder, httpBase)` resolves *under* the base
+    // (and origin-checks keep the proxy from being aimed at another host).
+    httpBase: http.href.endsWith('/') ? http.href : `${http.href}/`,
+    origin: http.origin,
+    wsScheme: http.protocol === 'https:' ? 'wss:' : 'ws:',
+    clientPath,
+  };
+}

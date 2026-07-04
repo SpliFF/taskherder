@@ -17,9 +17,10 @@ import { existsSync } from 'node:fs';
 import fs from 'node:fs';
 import path from 'node:path';
 import { connect } from 'node:net';
+import { Readable } from 'node:stream';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
-import { WebSocketServer } from 'ws';
+import { WebSocket, WebSocketServer } from 'ws';
 import pty from 'node-pty';
 
 import {
@@ -28,7 +29,9 @@ import {
 import { loadProjects } from './registry.mjs';
 import { statusData } from './history.mjs';
 import { laneDiff } from './git.mjs';
-import { resolveRunner, shellInvocation } from './runners.mjs';
+import {
+  resolveRunner, shellInvocation, graphicalEndpoint, loadRunners,
+} from './runners.mjs';
 import { ensureSpawnHelperExecutable } from './executor.mjs';
 import {
   ackLane, addStep, forkLane, removeStep, moveStep, editStep, LaneValidationError,
@@ -414,9 +417,173 @@ async function shellSession(ws, repo, runnerValue, sessions, max) {
   ws.on('close', () => end('client disconnected'));
 }
 
-export async function createConsoleServer({ token, allowShell = false, maxShellSessions = MAX_SHELL_SESSIONS } = {}) {
+// ── graphical streaming: a reverse proxy to a runner's in-runner GUI server ──
+// (DESIGN §15 Layer 2 — Xpra per-app HTML5 / noVNC·KasmVNC desktop). Unlike the
+// pty bridge and web-shell (which own a pty), this proxies an HTTP+WS endpoint
+// the OPERATOR declared inside a runner (runners.json `graphical`, resolved by
+// runners.mjs). Two independent gates keep it safe (§12): it only reaches URLs
+// the operator explicitly configured (never an arbitrary target), and the whole
+// capability is default-OFF behind `serve --allow-gfx`. A browser reaches it via
+// an unguessable capability path minted by an authed gfx-open — the session id in
+// the path IS the auth (same posture as the WS `?token=`), so the embedding
+// iframe's sub-resources + protocol WS need no bearer header.
+const MAX_GFX_SESSIONS = 8;
+const GFX_SESSION_TTL_MS = 30 * 60 * 1000; // a capability path lives 30 min
+
+// --allow-gfx off, or a runner with no `graphical` block → these mark the two
+// distinct non-200s the request handler maps to 403 / 400+standin.
+class GfxDisabled extends Error {}
+class GfxStandin extends Error {}
+
+// A ws close code is only re-sendable if it is a valid application code; 1005/1006
+// (and out-of-range values) would throw on close(), so collapse them to 1000.
+function normalizeGfxCloseCode(code) {
+  return (code >= 1000 && code <= 4999 && code !== 1005 && code !== 1006) ? code : 1000;
+}
+
+// Byte-transparent bidirectional WS proxy: the browser's graphical-protocol
+// WebSocket (Xpra/noVNC binary framing) piped to the in-runner server and back,
+// binary-ness preserved. The subprotocol the client offered is forwarded upstream
+// (both Xpra and noVNC negotiate 'binary'). Either side closing tears down the
+// other, so a dropped viewer never leaks an upstream socket.
+function bridgeGfxWs(clientWs, upstreamUrl, subprotoHeader) {
+  const protocols = subprotoHeader
+    ? subprotoHeader.split(',').map((s) => s.trim()).filter(Boolean)
+    : [];
+  let upstream;
+  try {
+    upstream = new WebSocket(upstreamUrl, protocols);
+  } catch {
+    if (clientWs.readyState === clientWs.OPEN) clientWs.close(1011, 'gfx upstream error');
+    return;
+  }
+  const pending = [];
+  upstream.on('open', () => {
+    for (const [data, binary] of pending) upstream.send(data, { binary });
+    pending.length = 0;
+  });
+  upstream.on('message', (data, isBinary) => {
+    if (clientWs.readyState === clientWs.OPEN) clientWs.send(data, { binary: isBinary });
+  });
+  upstream.on('close', (code, reason) => {
+    if (clientWs.readyState === clientWs.OPEN) clientWs.close(normalizeGfxCloseCode(code), reason);
+  });
+  upstream.on('error', () => {
+    if (clientWs.readyState === clientWs.OPEN) clientWs.close(1011, 'gfx upstream error');
+  });
+  clientWs.on('message', (data, isBinary) => {
+    if (upstream.readyState === upstream.OPEN) upstream.send(data, { binary: isBinary });
+    else if (upstream.readyState === upstream.CONNECTING) pending.push([data, isBinary]);
+  });
+  const closeUpstream = () => { try { upstream.close(); } catch { /* already gone */ } };
+  clientWs.on('close', closeUpstream);
+  clientWs.on('error', closeUpstream);
+}
+
+export async function createConsoleServer({
+  token, allowShell = false, maxShellSessions = MAX_SHELL_SESSIONS,
+  allowGfx = false, maxGfxSessions = MAX_GFX_SESSIONS,
+} = {}) {
   const authToken = token || await ensureServeToken();
   const shellSessions = new Set();
+  // Live graphical capabilities: session id → { endpoint, expires }. The id is an
+  // unguessable path capability minted by gfx-open; it expires (lazy sweep on use)
+  // and the set is capacity-capped, so a leaked/forgotten iframe can't stream forever.
+  const gfxSessions = new Map();
+
+  function getGfxSession(id) {
+    const s = gfxSessions.get(id);
+    if (!s) return null;
+    if (Date.now() > s.expires) { gfxSessions.delete(id); return null; }
+    return s;
+  }
+
+  // Names of runners that declare a graphical endpoint — drives the console's GUI
+  // button (which runners can be streamed). Empty when --allow-gfx is off.
+  async function gfxRunnerNames() {
+    if (!allowGfx) return [];
+    try {
+      const runners = await loadRunners();
+      return Object.entries(runners).filter(([, def]) => def && def.graphical).map(([name]) => name);
+    } catch {
+      return []; // a malformed runners.json is surfaced by `doctor`, not here
+    }
+  }
+
+  // POST /api/projects/:id/gfx-open {runner} — mint a capability path for a
+  // runner's declared graphical endpoint. --allow-gfx off → 403; a runner with no
+  // graphical block → a loud FIDELITY-STANDIN + 400 (never a silent blank frame).
+  async function openGfxSession(body) {
+    if (!allowGfx) throw new GfxDisabled('graphical streaming disabled — start `taskherd serve --allow-gfx`');
+    const runnerValue = requireStr(body, 'runner');
+    let endpoint;
+    try {
+      endpoint = graphicalEndpoint(await resolveRunner(runnerValue));
+    } catch (err) {
+      throw new LaneValidationError(err.message); // unknown runner / malformed graphical → 400
+    }
+    if (!endpoint) {
+      console.error(
+        `FIDELITY-STANDIN: runner '${runnerValue}' declares no graphical endpoint — add a `
+        + '"graphical": { "kind": "xpra"|"novnc"|"kasmvnc", "url": "http://…" } block to '
+        + '~/.taskherd/runners.json (the GUI server runs INSIDE the runner, DESIGN §11/§15). '
+        + 'No graphical stream available.',
+      );
+      throw new GfxStandin(`runner '${runnerValue}' has no graphical endpoint configured — see runners.json "graphical" (DESIGN §15); no GUI stream (a FIDELITY-STANDIN was logged).`);
+    }
+    if (gfxSessions.size >= maxGfxSessions) throw new LaneValidationError(`too many graphical sessions (max ${maxGfxSessions})`);
+    const id = randomBytes(18).toString('base64url');
+    gfxSessions.set(id, { endpoint, expires: Date.now() + GFX_SESSION_TTL_MS });
+    console.error(`taskherd: serve gfx OPEN runner=${endpoint.name} kind=${endpoint.kind} target=${endpoint.httpBase} session=${id.slice(0, 8)}… (${gfxSessions.size} live)`);
+    return {
+      ok: true, session: id, kind: endpoint.kind, name: endpoint.name, url: `/gfx/${id}/${endpoint.clientPath}`,
+    };
+  }
+
+  // Resolve /gfx/<id>/<remainder> to the upstream URL, origin-checked so the
+  // capability can never be aimed at another host. Returns null on a bad/expired
+  // session, throws LaneValidationError on a path that escapes the graphical origin.
+  function resolveGfxTarget(pathname, search) {
+    const m = /^\/gfx\/([^/]+)(?:\/(.*))?$/.exec(pathname);
+    if (!m) return null;
+    const session = getGfxSession(m[1]);
+    if (!session) return null;
+    const target = new URL((m[2] || '') + (search || ''), session.endpoint.httpBase);
+    if (target.origin !== session.endpoint.origin) {
+      throw new LaneValidationError('graphical path escapes the configured origin');
+    }
+    return { session, target };
+  }
+
+  // GET/HEAD /gfx/<id>/... — reverse-proxy the HTML5 client's static assets. The
+  // token gate does NOT apply (the iframe can't send a bearer header); the session
+  // capability in the path is the auth.
+  async function proxyGfxHttp(req, res, url) {
+    if (req.method !== 'GET' && req.method !== 'HEAD') { sendJson(res, 405, { error: 'method not allowed' }); return; }
+    const resolved = resolveGfxTarget(url.pathname, url.search); // may throw LaneValidationError (→ 400)
+    if (!resolved) { sendJson(res, 404, { error: 'graphical session expired or unknown' }); return; }
+    const fwd = {};
+    for (const h of ['range', 'accept', 'accept-language', 'if-none-match', 'if-modified-since']) {
+      if (req.headers[h]) fwd[h] = req.headers[h];
+    }
+    let upstream;
+    try {
+      upstream = await fetch(resolved.target, { method: req.method, headers: fwd, redirect: 'manual' });
+    } catch (err) {
+      console.error(`taskherd: serve gfx proxy → ${resolved.target.href} failed: ${err.message}`);
+      sendJson(res, 502, { error: `graphical server unreachable at ${resolved.session.endpoint.httpBase} — is the ${resolved.session.endpoint.kind} server running in the runner? (${err.message})` });
+      return;
+    }
+    const headers = {};
+    for (const [k, v] of upstream.headers) {
+      // content-encoding/length are wrong post-decode; hop-by-hop headers don't cross a proxy.
+      if (['transfer-encoding', 'connection', 'content-encoding', 'content-length'].includes(k.toLowerCase())) continue;
+      headers[k] = v;
+    }
+    res.writeHead(upstream.status, headers);
+    if (req.method === 'HEAD' || !upstream.body) { res.end(); return; }
+    Readable.fromWeb(upstream.body).pipe(res);
+  }
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -430,6 +597,15 @@ export async function createConsoleServer({ token, allowShell = false, maxShellS
         return;
       }
 
+      // Graphical reverse proxy (§15 L2) — auth is the unguessable capability in
+      // the path (minted by an authed gfx-open), NOT the bearer token, so this is
+      // handled BEFORE the /api/ token gate. Off unless --allow-gfx.
+      if (url.pathname.startsWith('/gfx/')) {
+        if (!allowGfx) { sendJson(res, 404, { error: 'not found' }); return; }
+        await proxyGfxHttp(req, res, url);
+        return;
+      }
+
       if (!url.pathname.startsWith('/api/')) {
         sendJson(res, 404, { error: 'not found' });
         return;
@@ -440,7 +616,17 @@ export async function createConsoleServer({ token, allowShell = false, maxShellS
       }
 
       if (req.method === 'GET' && url.pathname === '/api/projects') {
-        sendJson(res, 200, { projects: await projectSummaries(), allowShell });
+        sendJson(res, 200, {
+          projects: await projectSummaries(), allowShell, allowGfx, gfxRunners: await gfxRunnerNames(),
+        });
+        return;
+      }
+
+      // Mint a graphical capability path for a runner's declared GUI endpoint (§15 L2).
+      const gfxMatch = /^\/api\/projects\/([^/]+)\/gfx-open$/.exec(url.pathname);
+      if (gfxMatch && req.method === 'POST') {
+        await resolveProject(gfxMatch[1]); // validate the project exists (404/400 path)
+        sendJson(res, 200, await openGfxSession(await readBody(req)));
         return;
       }
 
@@ -464,7 +650,11 @@ export async function createConsoleServer({ token, allowShell = false, maxShellS
 
       sendJson(res, 404, { error: 'not found' });
     } catch (err) {
-      if (err instanceof LaneValidationError) {
+      if (err instanceof GfxDisabled) {
+        sendJson(res, 403, { error: err.message });
+      } else if (err instanceof GfxStandin) {
+        sendJson(res, 400, { error: err.message, standin: true });
+      } else if (err instanceof LaneValidationError) {
         sendJson(res, 400, { error: err.message });
       } else if (/no running step/.test(err.message || '')) {
         sendJson(res, 409, { error: err.message });
@@ -476,8 +666,34 @@ export async function createConsoleServer({ token, allowShell = false, maxShellS
   });
 
   const wss = new WebSocketServer({ noServer: true });
+  // Separate WS server for the graphical proxy: it echoes the client's first
+  // offered subprotocol (Xpra/noVNC negotiate 'binary'), which the shared events/
+  // pty server never does.
+  const gfxWss = new WebSocketServer({
+    noServer: true,
+    handleProtocols: (protocols) => { for (const p of protocols) return p; return false; },
+  });
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, 'http://localhost');
+    // Graphical protocol WS — capability in the path, not a bearer token (the
+    // in-iframe client opens it relative to its own /gfx/<id>/ location), so it is
+    // handled BEFORE the token gate. Off unless --allow-gfx.
+    if (url.pathname.startsWith('/gfx/')) {
+      if (!allowGfx) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); return; }
+      let resolved;
+      try {
+        resolved = resolveGfxTarget(url.pathname, url.search);
+      } catch {
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy(); return;
+      }
+      if (!resolved) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); return; }
+      const wsTarget = new URL(resolved.target.href);
+      wsTarget.protocol = resolved.session.endpoint.wsScheme;
+      gfxWss.handleUpgrade(req, socket, head, (clientWs) => {
+        bridgeGfxWs(clientWs, wsTarget.href, req.headers['sec-websocket-protocol']);
+      });
+      return;
+    }
     if (!tokenMatches(authToken, presentedToken(req, url))) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
@@ -512,7 +728,9 @@ export async function createConsoleServer({ token, allowShell = false, maxShellS
     server,
     token: authToken,
     allowShell,
+    allowGfx,
     shellSessionCount: () => shellSessions.size,
+    graphicalSessionCount: () => gfxSessions.size,
     listen(port, host) {
       return new Promise((resolve, reject) => {
         server.on('error', reject);
@@ -524,6 +742,9 @@ export async function createConsoleServer({ token, allowShell = false, maxShellS
       // a shutdown must leave no orphan interactive process behind).
       for (const s of shellSessions) hangupTree(s.child, 'SIGKILL');
       shellSessions.clear();
+      // Drop graphical capabilities and tear down any live proxy sockets.
+      gfxSessions.clear();
+      for (const ws of gfxWss.clients) ws.terminate();
       for (const ws of wss.clients) ws.terminate();
       await new Promise((resolve) => server.close(resolve));
     },
