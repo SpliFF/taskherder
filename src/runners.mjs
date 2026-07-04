@@ -36,6 +36,25 @@ export async function loadRunners() {
 // An unknown name / kind is a loud setup error (the lane parks), never a silent
 // fall-through to local — a step asking for isolation it didn't get is exactly
 // the silent-guardrail failure DESIGN §1/§12 forbid.
+// A runner target (ssh host, docker container/image) is placed as a bare,
+// leading-position argv element for `ssh`/`docker`. A value beginning with `-`
+// would be parsed by those tools as an OPTION — e.g. `ssh:-oProxyCommand=<cmd>`
+// makes ssh run <cmd> through /bin/sh to "connect", i.e. arbitrary host RCE
+// outside any container. Reject a leading dash and any whitespace/control chars
+// (never a legitimate host/container name) so a runner value can't inject flags.
+function assertRunnerTarget(kind, field, target) {
+  if (typeof target !== 'string' || target === '') {
+    throw new Error(`taskherd: ${kind} runner needs a non-empty ${field} (DESIGN §11)`);
+  }
+  if (target.startsWith('-') || /\s/.test(target)) {
+    throw new Error(
+      `taskherd: invalid ${kind} ${field} ${JSON.stringify(target)} — must not start with '-' `
+      + 'or contain whitespace (prevents argv option-injection into the runner) (DESIGN §11/§12)',
+    );
+  }
+  return target;
+}
+
 export async function resolveRunner(value) {
   if (!value || value === 'local') return { kind: 'local' };
 
@@ -43,8 +62,14 @@ export async function resolveRunner(value) {
   if (colon !== -1) {
     const kind = value.slice(0, colon);
     const target = value.slice(colon + 1);
-    if (kind === 'docker') return { kind: 'docker', container: target, name: value };
-    if (kind === 'ssh') return { kind: 'ssh', host: target, name: value };
+    if (kind === 'docker') {
+      assertRunnerTarget('docker', 'container', target);
+      return { kind: 'docker', container: target, name: value };
+    }
+    if (kind === 'ssh') {
+      assertRunnerTarget('ssh', 'host', target);
+      return { kind: 'ssh', host: target, name: value };
+    }
     throw new Error(
       `taskherd: unknown runner kind ${JSON.stringify(kind)} in ${JSON.stringify(value)} `
       + '(inline forms: docker:<container> | ssh:<host>) (DESIGN §11)',
@@ -62,6 +87,13 @@ export async function resolveRunner(value) {
   }
   if (def.kind !== 'docker' && def.kind !== 'ssh') {
     throw new Error(`taskherd: runner ${JSON.stringify(value)} needs "kind": "docker" | "ssh" in runners.json (got ${JSON.stringify(def.kind)})`);
+  }
+  // Named runners come from the operator's runners.json, but validate their
+  // targets too — the same argv-option-injection guard, defense in depth.
+  if (def.kind === 'ssh') assertRunnerTarget('ssh', 'host', def.host);
+  if (def.kind === 'docker') {
+    if (def.container != null) assertRunnerTarget('docker', 'container', def.container);
+    if (def.image != null) assertRunnerTarget('docker', 'image', def.image);
   }
   return { name: value, ...def };
 }

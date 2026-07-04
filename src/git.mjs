@@ -44,6 +44,22 @@ export async function isGitRepo(repo) {
   }
 }
 
+// A `base` ref is caller/agent-controlled (lane config, serve `?base=`, CLI
+// `--base`) and reaches git as a bare positional revision argument. A value
+// starting with `-` would be parsed as an OPTION — e.g. `--output=<file>` on
+// `git diff` writes the diff to an attacker-chosen path (an arbitrary-write
+// primitive), and this runs in the un-token-gated scheduler. Reject a leading
+// dash (never a legitimate ref); callers also pass `--end-of-options` as a
+// second layer. Branch names are always `taskherd/`-prefixed, hence safe.
+function assertSafeBase(base) {
+  if (typeof base !== 'string' || base === '' || base.startsWith('-')) {
+    throw new Error(
+      `taskherd: unsafe base ref ${JSON.stringify(base)} — must be a non-empty ref that does not start with '-' (§7/§12)`,
+    );
+  }
+  return base;
+}
+
 export function laneBranch(laneName) {
   return `taskherd/${laneName}`;
 }
@@ -96,6 +112,7 @@ export async function branchBase(repo, branch) {
 }
 
 async function ensureBranch(repo, branch, base) {
+  assertSafeBase(base);
   if (await branchExists(repo, branch)) return;
   await git(repo, 'branch', branch, base);
   await git(repo, 'config', `branch.${branch}.taskherdbase`, base);
@@ -133,11 +150,13 @@ export async function ensureInplaceBranch(repo, laneName, base) {
 }
 
 export async function aheadCount(repo, branch, base) {
+  assertSafeBase(base);
   if (!(await branchExists(repo, branch))) return 0;
-  return Number(await git(repo, 'rev-list', '--count', `${base}..${branch}`));
+  return Number(await git(repo, 'rev-list', '--count', '--end-of-options', `${base}..${branch}`));
 }
 
 export async function mergedIntoBase(repo, branch, base) {
+  assertSafeBase(base);
   try {
     await execFileAsync('git', ['-C', repo, 'merge-base', '--is-ancestor', branch, base]);
     return true;
@@ -164,6 +183,7 @@ export async function headCommit(dir) {
 // git refuses when base is checked out elsewhere or the merge isn't an ff —
 // those cases throw and the land gate stays blocked for a human to resolve.
 export async function landMerge(repo, branch, base) {
+  assertSafeBase(base);
   if ((await currentBranch(repo)) === base) {
     await git(repo, 'merge', '--no-ff', '-m', `taskherd: land ${branch}`, branch);
   } else {
@@ -265,10 +285,11 @@ export async function laneDiff(repo, laneName, { base = null, maxBytes = 400_000
     return { exists: false, branch };
   }
   const resolvedBase = base || (await branchBase(repo, branch)) || (await defaultBase(repo));
+  assertSafeBase(resolvedBase);
   const range = `${resolvedBase}...${branch}`;
-  const numstat = (await gitRaw(repo, 'diff', '--numstat', range)).replace(/\n+$/, '');
+  const numstat = (await gitRaw(repo, 'diff', '--numstat', '--end-of-options', range)).replace(/\n+$/, '');
   const files = numstat ? numstat.split('\n').map(parseNumstat).filter(Boolean) : [];
-  const full = await gitRaw(repo, 'diff', range);
+  const full = await gitRaw(repo, 'diff', '--end-of-options', range);
   const bytes = Buffer.byteLength(full);
   const truncated = bytes > maxBytes;
   const patch = truncated ? full.slice(0, maxBytes) : full;

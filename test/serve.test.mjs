@@ -488,27 +488,32 @@ test('graphical: gfx-open mints a capability; HTTP + WS proxy reach the in-runne
   assert.equal(projects.allowGfx, true);
   assert.deepEqual(projects.gfxRunners, ['desktop']);
 
-  // gfx-open mints a session URL under an unguessable capability path.
+  // gfx-open mints a session URL under an unguessable capability path, served on
+  // a SEPARATE origin (a distinct port) from the console so a proxied runner GUI
+  // cannot read the console token (localStorage is per-origin).
   const openRes = await authed('POST', `/api/projects/${id}/gfx-open`, { runner: 'desktop' });
   assert.equal(openRes.status, 200);
   const open = await openRes.json();
   assert.equal(open.kind, 'novnc');
-  assert.match(open.url, /^\/gfx\/[^/]+\/vnc\.html$/);
+  assert.match(open.url, /^http:\/\/127\.0\.0\.1:\d+\/gfx\/[^/]+\/vnc\.html$/);
+  const gfxUrl = new URL(open.url);
+  assert.notEqual(gfxUrl.port, String(addr.port), 'gfx served from a separate origin/port (token-theft isolation)');
+  assert.equal(Number(gfxUrl.port), console_.gfxPort(), 'gfx URL uses the bound gfx port');
   assert.equal(console_.graphicalSessionCount(), 1);
 
   // HTTP proxy: the iframe's client page loads through serve WITHOUT a token (the
   // capability in the path is the auth), and reaches the in-runner server.
-  const page = await fetch(`${base}${open.url}`);
+  const page = await fetch(open.url);
   assert.equal(page.status, 200);
   assert.match(await page.text(), /GFX-CLIENT \/vnc\.html/);
   // A sub-resource under the same capability prefix flows through too (relative
   // asset loads from the HTML5 client).
-  const asset = await fetch(`${base}${open.url.replace(/vnc\.html$/, 'ui/app.js')}`);
+  const asset = await fetch(open.url.replace(/vnc\.html$/, 'ui/app.js'));
   assert.match(await asset.text(), /GFX-CLIENT \/ui\/app\.js/);
 
-  // WS proxy: the graphical protocol WebSocket is piped byte-transparently.
-  const sessionId = open.url.split('/')[2];
-  const ws = new WebSocket(`ws://127.0.0.1:${addr.port}/gfx/${sessionId}/websockify`);
+  // WS proxy: the graphical protocol WebSocket is piped byte-transparently (on
+  // the gfx origin, derived from the minted URL).
+  const ws = new WebSocket(open.url.replace(/^http/, 'ws').replace(/vnc\.html$/, 'websockify'));
   await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject); });
   const echoed = new Promise((resolve) => ws.on('message', (d) => resolve(Buffer.from(d))));
   ws.send(Buffer.from([0, 1, 2, 254, 255]));
@@ -521,9 +526,10 @@ test('graphical: gfx-open mints a capability; HTTP + WS proxy reach the in-runne
   assert.equal(none.status, 400);
   assert.equal((await none.json()).standin, true);
 
-  // Unknown runner → 400 (LaneValidationError), not a 500; an unknown capability
-  // path 404s (never proxies).
+  // Unknown runner → 400 (LaneValidationError), not a 500. An unknown capability
+  // on the gfx origin 404s (never proxies); the console origin serves no /gfx.
   assert.equal((await authed('POST', `/api/projects/${id}/gfx-open`, { runner: 'ghost' })).status, 400);
+  assert.equal((await fetch(`${gfxUrl.origin}/gfx/deadbeefdeadbeef/vnc.html`)).status, 404);
   assert.equal((await fetch(`${base}/gfx/deadbeefdeadbeef/vnc.html`)).status, 404);
 });
 

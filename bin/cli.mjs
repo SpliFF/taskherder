@@ -423,6 +423,12 @@ async function cmdServe(argv) {
     console.log('taskherd: WARNING graphical streaming ENABLED (--allow-gfx) — the console can proxy an');
     console.log('          in-runner Xpra/noVNC GUI (interactive desktop control) for runners.json runners');
     console.log('          that declare a "graphical" endpoint; anyone with the token gets that GUI.');
+    const gfxPort = console_.gfxPort?.();
+    if (gfxPort) {
+      console.log(`          The GUI proxy is served on a SEPARATE origin (port ${gfxPort}) so a proxied`);
+      console.log('          runner GUI cannot read the console token — that port must be reachable by the');
+      console.log('          browser too (a single-port tunnel will not forward it).');
+    }
     if (host !== '127.0.0.1') {
       console.log('          You are NOT on loopback — make sure the token stays private (DESIGN §12/§15).');
     }
@@ -437,7 +443,13 @@ async function cmdServe(argv) {
 }
 
 function commandOnPath(cmd) {
-  const r = spawnSync(process.platform === 'win32' ? 'where' : 'command', process.platform === 'win32' ? [cmd] : ['-v', cmd], { encoding: 'utf8', shell: process.platform !== 'win32' });
+  // `command -v` is a POSIX shell builtin (not an external binary), so it needs a
+  // shell — but pass the name as a positional ($1), NOT interpolated into the
+  // command line, so a provider name like `x; rm -rf ~` from providers.json can't
+  // execute (no `shell:true`).
+  const r = process.platform === 'win32'
+    ? spawnSync('where', [cmd], { encoding: 'utf8' })
+    : spawnSync('sh', ['-c', 'command -v "$1"', 'sh', cmd], { encoding: 'utf8' });
   return r.status === 0;
 }
 

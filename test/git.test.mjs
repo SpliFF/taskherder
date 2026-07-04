@@ -246,6 +246,12 @@ test('laneDiff: reports the lane branch diff vs base (files, numstat, patch, ahe
   assert.doesNotMatch(d.patch, /README/);
   assert.equal(d.truncated, false);
   assert.equal(d.dirty, false);
+
+  // Security (§12): a `base` that git would parse as an option (leading '-') is
+  // rejected, so `base=--output=<file>` can't turn `git diff` into an arbitrary
+  // file-write. A legitimate base still works.
+  await assert.rejects(laneDiff(repo, 'feat', { base: '--output=/tmp/pwn' }), /unsafe base ref/);
+  assert.equal((await laneDiff(repo, 'feat', { base: 'main' })).ahead, 2);
 });
 
 test('laneDiff: exists:false for a lane that never ran under git isolation', async (t) => {

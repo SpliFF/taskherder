@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { writeFile, readdir } from 'node:fs/promises';
 import {
   newLane, saveLane, loadLane, nextAction, validateStep, LaneValidationError,
-  loadAllLanesResilient, buildStep,
+  loadAllLanesResilient, buildStep, ackLane, removeStep, forkLane,
 } from '../src/tasks.mjs';
 import { laneFile } from '../src/paths.mjs';
 import { makeRepo } from './helpers.mjs';
@@ -21,6 +21,16 @@ test('lane save/load round-trip preserves steps', async (t) => {
   assert.equal(reloaded.steps.length, 2);
   assert.equal(reloaded.steps[0].run, 'echo hi');
   assert.equal(reloaded.steps[1].message, 'sign off');
+});
+
+test('lane mutations reject path-traversal names at every entry point (MCP/serve reach these; §12)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  const evil = '../../../../etc/whatever';
+  await assert.rejects(() => ackLane(repo, evil), /invalid lane name/);
+  await assert.rejects(() => removeStep(repo, evil, 0), /invalid lane name/);
+  await assert.rejects(() => forkLane(repo, 'ok', evil), /invalid lane name/); // the parent (from)
+  await assert.rejects(() => forkLane(repo, '../escape', 'parent'), /invalid lane name/); // the new name
 });
 
 test('validateStep rejects unknown types and missing required fields', () => {

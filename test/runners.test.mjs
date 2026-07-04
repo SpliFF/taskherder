@@ -17,6 +17,17 @@ test('resolveRunner: local / inline docker: / inline ssh: shorthands', async () 
   assert.deepEqual(await resolveRunner('ssh:user@box'), { kind: 'ssh', host: 'user@box', name: 'ssh:user@box' });
 });
 
+test('resolveRunner: rejects argv option-injection targets, allows internal dashes (§12)', async () => {
+  // A leading-dash target is parsed by ssh/docker as an OPTION — `ssh:-oProxyCommand=…`
+  // is arbitrary host RCE. Reject it (and any whitespace); never silently pass it through.
+  await assert.rejects(() => resolveRunner('ssh:-oProxyCommand=touch /tmp/pwn'), /must not start with '-'/);
+  await assert.rejects(() => resolveRunner('docker:-v/etc:/host'), /must not start with '-'/);
+  await assert.rejects(() => resolveRunner('ssh:has space'), /whitespace/);
+  // Legitimate hosts/containers with INTERNAL dashes still resolve.
+  assert.deepEqual(await resolveRunner('ssh:web-01.example.com'), { kind: 'ssh', host: 'web-01.example.com', name: 'ssh:web-01.example.com' });
+  assert.deepEqual(await resolveRunner('docker:my-container'), { kind: 'docker', container: 'my-container', name: 'docker:my-container' });
+});
+
 test('resolveRunner: an unknown runner name / kind fails loudly (parks, never silent-local)', async (t) => {
   const home = await mkdtemp(path.join(os.tmpdir(), 'th-run-'));
   const prev = process.env.TASKHERD_HOME;

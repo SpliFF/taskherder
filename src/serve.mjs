@@ -34,7 +34,7 @@ import {
 } from './runners.mjs';
 import { ensureSpawnHelperExecutable } from './executor.mjs';
 import {
-  ackLane, addStep, forkLane, removeStep, moveStep, editStep, LaneValidationError,
+  ackLane, addStep, forkLane, removeStep, moveStep, editStep, validateLaneName, LaneValidationError,
 } from './tasks.mjs';
 
 const require = createRequire(import.meta.url);
@@ -87,9 +87,21 @@ function presentedToken(req, url) {
   return url.searchParams.get('token');
 }
 
+// Baseline hardening on the console's own (main-origin) responses: refuse
+// framing (clickjacking an authed operator into ACK/pause/interrupt clicks),
+// stop MIME-sniffing, and leak no referrer (the token can ride a URL). These are
+// NOT applied to the /gfx reverse-proxy responses — that content is deliberately
+// framed by the console and served from a separate origin (see the gfx server).
+const SECURITY_HEADERS = {
+  'x-content-type-options': 'nosniff',
+  'x-frame-options': 'DENY',
+  'content-security-policy': "frame-ancestors 'none'",
+  'referrer-policy': 'no-referrer',
+};
+
 function sendJson(res, status, body) {
   const data = `${JSON.stringify(body)}\n`;
-  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' });
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8', ...SECURITY_HEADERS });
   res.end(data);
 }
 
@@ -480,6 +492,19 @@ function bridgeGfxWs(clientWs, upstreamUrl, subprotoHeader) {
   clientWs.on('error', closeUpstream);
 }
 
+// Listen once, resolving to the bound address or rejecting on error (e.g.
+// EADDRINUSE), with listeners cleaned up so the server can be re-listened on a
+// fallback port.
+function bindOnce(srv, port, host) {
+  return new Promise((resolve, reject) => {
+    const onError = (err) => { srv.removeListener('listening', onListening); reject(err); };
+    const onListening = () => { srv.removeListener('error', onError); resolve(srv.address()); };
+    srv.once('error', onError);
+    srv.once('listening', onListening);
+    srv.listen(port, host);
+  });
+}
+
 export async function createConsoleServer({
   token, allowShell = false, maxShellSessions = MAX_SHELL_SESSIONS,
   allowGfx = false, maxGfxSessions = MAX_GFX_SESSIONS,
@@ -490,12 +515,33 @@ export async function createConsoleServer({
   // unguessable path capability minted by gfx-open; it expires (lazy sweep on use)
   // and the set is capacity-capped, so a leaked/forgotten iframe can't stream forever.
   const gfxSessions = new Map();
+  // The graphical proxy binds a SEPARATE origin (a distinct port on the same
+  // host) from the console. Origin = scheme+host+port, so a proxied in-runner GUI
+  // (which could serve hostile JS — noVNC/Xpra have a CVE history) runs on an
+  // origin that has NO access to the console origin's localStorage, where the
+  // bearer token lives — closing the runner→host token-theft path. Set when
+  // listen() binds the gfx server below.
+  let gfxBoundPort = null;
 
   function getGfxSession(id) {
     const s = gfxSessions.get(id);
     if (!s) return null;
     if (Date.now() > s.expires) { gfxSessions.delete(id); return null; }
     return s;
+  }
+
+  // Build the absolute iframe URL for a minted capability, on the gfx origin:
+  // same hostname the browser used to reach the console (from the Host header),
+  // but the gfx port. Different port ⇒ different origin ⇒ token isolation.
+  function gfxUrlFor(hostHeader, id, clientPath) {
+    let origin;
+    try {
+      origin = new URL(`http://${hostHeader || '127.0.0.1'}`);
+    } catch {
+      origin = new URL('http://127.0.0.1');
+    }
+    origin.port = String(gfxBoundPort);
+    return `${origin.origin}/gfx/${id}/${clientPath}`;
   }
 
   // Names of runners that declare a graphical endpoint — drives the console's GUI
@@ -513,7 +559,7 @@ export async function createConsoleServer({
   // POST /api/projects/:id/gfx-open {runner} — mint a capability path for a
   // runner's declared graphical endpoint. --allow-gfx off → 403; a runner with no
   // graphical block → a loud FIDELITY-STANDIN + 400 (never a silent blank frame).
-  async function openGfxSession(body) {
+  async function openGfxSession(body, hostHeader) {
     if (!allowGfx) throw new GfxDisabled('graphical streaming disabled — start `taskherd serve --allow-gfx`');
     const runnerValue = requireStr(body, 'runner');
     let endpoint;
@@ -536,7 +582,11 @@ export async function createConsoleServer({
     gfxSessions.set(id, { endpoint, expires: Date.now() + GFX_SESSION_TTL_MS });
     console.error(`taskherd: serve gfx OPEN runner=${endpoint.name} kind=${endpoint.kind} target=${endpoint.httpBase} session=${id.slice(0, 8)}… (${gfxSessions.size} live)`);
     return {
-      ok: true, session: id, kind: endpoint.kind, name: endpoint.name, url: `/gfx/${id}/${endpoint.clientPath}`,
+      ok: true,
+      session: id,
+      kind: endpoint.kind,
+      name: endpoint.name,
+      url: gfxUrlFor(hostHeader, id, endpoint.clientPath), // absolute, on the separate gfx origin
     };
   }
 
@@ -592,20 +642,15 @@ export async function createConsoleServer({
       if (staticEntry) {
         const [file, type] = staticEntry;
         const data = await readFile(file);
-        res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache' });
+        res.writeHead(200, { 'content-type': type, 'cache-control': 'no-cache', ...SECURITY_HEADERS });
         res.end(data);
         return;
       }
 
-      // Graphical reverse proxy (§15 L2) — auth is the unguessable capability in
-      // the path (minted by an authed gfx-open), NOT the bearer token, so this is
-      // handled BEFORE the /api/ token gate. Off unless --allow-gfx.
-      if (url.pathname.startsWith('/gfx/')) {
-        if (!allowGfx) { sendJson(res, 404, { error: 'not found' }); return; }
-        await proxyGfxHttp(req, res, url);
-        return;
-      }
-
+      // The graphical reverse proxy (§15 L2) is NOT served here — it lives on a
+      // separate origin (the gfx server, a distinct port) so a proxied runner GUI
+      // can't reach this origin's token. A stray /gfx request on the console
+      // origin falls through to the 404 below.
       if (!url.pathname.startsWith('/api/')) {
         sendJson(res, 404, { error: 'not found' });
         return;
@@ -626,7 +671,7 @@ export async function createConsoleServer({
       const gfxMatch = /^\/api\/projects\/([^/]+)\/gfx-open$/.exec(url.pathname);
       if (gfxMatch && req.method === 'POST') {
         await resolveProject(gfxMatch[1]); // validate the project exists (404/400 path)
-        sendJson(res, 200, await openGfxSession(await readBody(req)));
+        sendJson(res, 200, await openGfxSession(await readBody(req), req.headers.host));
         return;
       }
 
@@ -636,6 +681,7 @@ export async function createConsoleServer({
         const repo = await resolveProject(diffMatch[1]);
         const lane = url.searchParams.get('lane');
         if (!lane) throw new LaneValidationError("missing 'lane'");
+        validateLaneName(lane); // no traversal into arbitrary .json / worktree paths
         sendJson(res, 200, await laneDiff(repo, lane, { base: url.searchParams.get('base') || null }));
         return;
       }
@@ -675,25 +721,8 @@ export async function createConsoleServer({
   });
   server.on('upgrade', (req, socket, head) => {
     const url = new URL(req.url, 'http://localhost');
-    // Graphical protocol WS — capability in the path, not a bearer token (the
-    // in-iframe client opens it relative to its own /gfx/<id>/ location), so it is
-    // handled BEFORE the token gate. Off unless --allow-gfx.
-    if (url.pathname.startsWith('/gfx/')) {
-      if (!allowGfx) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); return; }
-      let resolved;
-      try {
-        resolved = resolveGfxTarget(url.pathname, url.search);
-      } catch {
-        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy(); return;
-      }
-      if (!resolved) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); return; }
-      const wsTarget = new URL(resolved.target.href);
-      wsTarget.protocol = resolved.session.endpoint.wsScheme;
-      gfxWss.handleUpgrade(req, socket, head, (clientWs) => {
-        bridgeGfxWs(clientWs, wsTarget.href, req.headers['sec-websocket-protocol']);
-      });
-      return;
-    }
+    // The graphical-protocol WS is served on the separate gfx origin (below), not
+    // here — so this handler only ever sees token-authed console WS.
     if (!tokenMatches(authToken, presentedToken(req, url))) {
       socket.write('HTTP/1.1 401 Unauthorized\r\n\r\n');
       socket.destroy();
@@ -724,18 +753,66 @@ export async function createConsoleServer({
     });
   });
 
+  // The graphical reverse proxy runs on its OWN http server / origin (a distinct
+  // port), created only when --allow-gfx is on. It exposes NOTHING but the
+  // capability-authed /gfx/<id>/* proxy — no SPA, no API, no token in storage —
+  // so a proxied in-runner GUI's JS is same-origin with an empty page, never with
+  // the console token. The capability (session id) in the path is the auth, so no
+  // bearer token is required (the iframe can't send one anyway).
+  let gfxServer = null;
+  if (allowGfx) {
+    gfxServer = http.createServer(async (req, res) => {
+      const url = new URL(req.url, 'http://localhost');
+      try {
+        if (url.pathname.startsWith('/gfx/')) { await proxyGfxHttp(req, res, url); return; }
+        sendJson(res, 404, { error: 'not found' });
+      } catch (err) {
+        if (err instanceof LaneValidationError) { sendJson(res, 400, { error: err.message }); return; }
+        console.error(`taskherd: serve gfx error on ${req.method} ${url.pathname}: ${err.stack || err.message}`);
+        sendJson(res, 500, { error: err.message });
+      }
+    });
+    gfxServer.on('upgrade', (req, socket, head) => {
+      const url = new URL(req.url, 'http://localhost');
+      if (!url.pathname.startsWith('/gfx/')) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); return; }
+      let resolved;
+      try {
+        resolved = resolveGfxTarget(url.pathname, url.search);
+      } catch {
+        socket.write('HTTP/1.1 400 Bad Request\r\n\r\n'); socket.destroy(); return;
+      }
+      if (!resolved) { socket.write('HTTP/1.1 404 Not Found\r\n\r\n'); socket.destroy(); return; }
+      const wsTarget = new URL(resolved.target.href);
+      wsTarget.protocol = resolved.session.endpoint.wsScheme;
+      gfxWss.handleUpgrade(req, socket, head, (clientWs) => {
+        bridgeGfxWs(clientWs, wsTarget.href, req.headers['sec-websocket-protocol']);
+      });
+    });
+  }
+
   return {
     server,
+    gfxServer,
     token: authToken,
     allowShell,
     allowGfx,
     shellSessionCount: () => shellSessions.size,
     graphicalSessionCount: () => gfxSessions.size,
-    listen(port, host) {
-      return new Promise((resolve, reject) => {
-        server.on('error', reject);
-        server.listen(port, host, () => resolve(server.address()));
-      });
+    gfxPort: () => gfxBoundPort,
+    async listen(port, host) {
+      const addr = await bindOnce(server, port, host);
+      if (gfxServer) {
+        // Prefer a deterministic gfx port (main + 1) for firewalling/tunnelling;
+        // fall back to an ephemeral port if it is taken. The SPA learns the URL
+        // from gfx-open at runtime, so the exact port need not be fixed.
+        const desired = port === 0 ? 0 : addr.port + 1;
+        try {
+          gfxBoundPort = (await bindOnce(gfxServer, desired, host)).port;
+        } catch {
+          gfxBoundPort = (await bindOnce(gfxServer, 0, host)).port;
+        }
+      }
+      return addr;
     },
     async close() {
       // Reap every serve-owned shell (a disconnecting client kills its own, but
@@ -747,6 +824,7 @@ export async function createConsoleServer({
       for (const ws of gfxWss.clients) ws.terminate();
       for (const ws of wss.clients) ws.terminate();
       await new Promise((resolve) => server.close(resolve));
+      if (gfxServer) await new Promise((resolve) => gfxServer.close(resolve));
     },
   };
 }

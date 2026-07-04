@@ -242,6 +242,7 @@ export async function maybeLand(repo, lane) {
 // manual gate advances past (cursor++), a parked failure resets for retry in
 // place. Shared by the CLI's `ack` and (later) the MCP `tasks_ack` tool.
 export async function ackLane(repo, name) {
+  validateLaneName(name);
   const lane = await loadLane(repo, name);
   const step = lane.steps[lane.cursor];
   if (!step || (step.status !== 'blocked' && step.status !== 'failed')) {
@@ -400,6 +401,7 @@ function assertEditableIndex(repo, lane, index, verb) {
 }
 
 export async function removeStep(repo, laneName, index) {
+  validateLaneName(laneName);
   const lane = await loadLane(repo, laneName);
   assertEditableIndex(repo, lane, index, 'remove');
   const [removed] = lane.steps.splice(index, 1);
@@ -408,6 +410,7 @@ export async function removeStep(repo, laneName, index) {
 }
 
 export async function moveStep(repo, laneName, from, to) {
+  validateLaneName(laneName);
   const lane = await loadLane(repo, laneName);
   assertEditableIndex(repo, lane, from, 'move');
   assertEditableIndex(repo, lane, to, 'move to');
@@ -420,6 +423,7 @@ export async function moveStep(repo, laneName, from, to) {
 // Patches fields onto a pending step and re-validates. Run-state fields can
 // never ride in through a patch — status/attempts are the scheduler's.
 export async function editStep(repo, laneName, index, patch = {}) {
+  validateLaneName(laneName);
   const lane = await loadLane(repo, laneName);
   assertEditableIndex(repo, lane, index, 'edit');
   const {
@@ -447,6 +451,7 @@ export async function forkLane(repo, name, from, { stepOpts = null, laneOpts = {
   if (!from) {
     throw new LaneValidationError('taskherd: fork needs a parent lane (--from <lane>)');
   }
+  validateLaneName(from);
   if (!(await laneExists(repo, from))) {
     throw new LaneValidationError(`taskherd: parent lane '${from}' does not exist`);
   }

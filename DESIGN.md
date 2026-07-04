@@ -5,9 +5,9 @@
 > schedule, with manual gates, git-branch isolation, per-account auth, and an
 > optional web console. CLI-first; the GUI is a view over the same files.
 
-**Package:** `@spliff/taskherder` · **command:** `taskherd` (aliases `taskherder`,
-opt-in `task`/`th`) · **MCP server:** `taskherd-mcp` · **skill:** `/task` ·
-**repo:** `SpliFF/taskherder` · **license:** MIT.
+**Package:** `taskherder` (npm, unscoped) · **command:** `taskherd` (bins also
+`taskherder`, `taskherd-mcp`; opt-in `task`/`th`) · **MCP server:** `taskherd-mcp`
+· **skill:** `/task` · **repo:** `SpliFF/taskherder` · **license:** MIT.
 
 ---
 
@@ -491,13 +491,15 @@ taskherd doctor                             check providers, runners, auth, MCP
 
 ## 19. Distribution & packaging
 
-- **npm:** `@spliff/taskherder` (public), bins `taskherd` (+ `taskherder`,
-  `taskherd-mcp`); `task`/`th` are **opt-in** aliases created by `taskherd alias`
-  only when free (avoids clobbering Taskwarrior / go-task, whose command is `task`).
+- **npm:** `taskherder` (unscoped, public — decided 2026-07-04, was
+  `@spliff/taskherder`), bins `taskherd` (+ `taskherder`, `taskherd-mcp`);
+  `task`/`th` are **opt-in** aliases (added by the user; a `taskherd alias` helper
+  is intended but unbuilt) — avoids clobbering Taskwarrior / go-task, whose
+  command is `task`.
 - **GitHub:** `SpliFF/taskherder`, MIT.
 - **Runtime deps:** minimal — Node built-ins for the core; a small WS lib + the
   MCP SDK only where needed (console, MCP server). ESM, `engines: node >=18`.
-- **Install:** `npm i -g @spliff/taskherder` or `npx @spliff/taskherder …`.
+- **Install:** `npm i -g taskherder` or `npx taskherder …`.
   MCP registered user-globally; skill `/task` shipped as a bundled skill.
 - **Platforms:** Linux + macOS. Windows optional/untested.
 
@@ -542,7 +544,7 @@ Each ships something runnable; each builds against this complete design.
   (§11). *Exit:* run a lane in a container under a separate account.
 - **M7 — Graphical + advanced.** Xpra/noVNC streaming, web-SSH, worktree diff
   viewer (§15 Layer 2).
-- **M8 — Publish.** npm `@spliff/taskherder`, GitHub, docs, `NOTICE`.
+- **M8 — Publish.** npm `taskherder`, GitHub, docs, `NOTICE`.
 
 ---
 
