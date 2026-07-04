@@ -55,6 +55,7 @@ function renderAuthHelp() {
 
 // ── state + rendering ───────────────────────────────────────────────────
 let projects = [];
+let allowShell = false; // whether serve was started with --allow-shell (web-SSH)
 
 let refreshTimer = null;
 function scheduleRefresh() {
@@ -62,7 +63,9 @@ function scheduleRefresh() {
   refreshTimer = setTimeout(async () => {
     refreshTimer = null;
     try {
-      ({ projects } = await api('/api/projects'));
+      const data = await api('/api/projects');
+      projects = data.projects;
+      allowShell = !!data.allowShell;
       render();
       syncEventSockets();
     } catch (err) {
@@ -142,6 +145,7 @@ function render() {
         <h2>${esc(p.name)}</h2>
         <span class="project-path">${esc(p.path)}</span>
         <span class="project-spend">${p.totalSpent ? `Σ $${p.totalSpent.toFixed(2)}` : ''}</span>
+        ${allowShell ? `<button class="btn ghost" data-action="shell" title="open a shell on this host (web-SSH)">SHELL</button>` : ''}
         <button class="btn ${p.paused ? 'primary' : 'warn'}" data-action="${p.paused ? 'resume' : 'pause'}">${p.paused ? 'RESUME' : 'PAUSE'}</button>
       </div>
       ${p.paused ? '<div class="paused-banner">⏸ PAUSED — no lanes will run until resumed</div>' : ''}
@@ -191,6 +195,8 @@ app.addEventListener('click', (e) => {
     if (name) act(id, 'fork', { name: name.trim(), from: lane }, `forked ${name.trim()}`);
   } else if (action === 'attach') {
     openTerminal(id, lane);
+  } else if (action === 'shell') {
+    openShell(id, 'local');
   } else if (action === 'diff') {
     openDiff(id, lane);
   }
@@ -263,19 +269,31 @@ function closeTerminal() {
   panel.hidden = true;
 }
 
-function openTerminal(id, lane) {
+// Map a WS close code to a short human status shown in the panel title.
+function closeReason(code) {
+  if (code === 4404) return 'not running';
+  if (code === 4403) return 'disabled (start serve with --allow-shell)';
+  if (code === 4429) return 'too many shell sessions';
+  if (code === 4400 || code === 4500) return 'unavailable';
+  return 'ended';
+}
+
+// Opens the xterm panel bridged onto a WS pty stream. Both a running step's
+// control socket (/ws/pty, attach) and a serve-owned runner shell (/ws/shell,
+// web-SSH) speak the same frame protocol — output frames out, input/resize/
+// signal in — so they share this exact wiring; only the URL + title differ.
+function openPty(wsUrl, title) {
   closeTerminal();
   closeDiff();
   panel.hidden = false;
-  termTitle.textContent = `${lane} — live`;
+  termTitle.textContent = title;
   term = new Terminal({ fontSize: 13, fontFamily: 'ui-monospace, SF Mono, Menlo, monospace', theme: { background: '#0a0c0a' }, convertEol: false });
   fit = new FitAddon();
   term.loadAddon(fit);
   term.open(termHost);
   fit.fit();
 
-  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  termWs = new WebSocket(`${proto}://${location.host}/ws/pty?project=${encodeURIComponent(id)}&lane=${encodeURIComponent(lane)}&token=${encodeURIComponent(token())}`);
+  termWs = new WebSocket(wsUrl);
   const sendResize = () => {
     if (termWs?.readyState === WebSocket.OPEN && term) {
       termWs.send(JSON.stringify({ type: 'resize', cols: term.cols, rows: term.rows }));
@@ -291,7 +309,7 @@ function openTerminal(id, lane) {
     } catch { /* ignore malformed lines */ }
   };
   termWs.onclose = (e) => {
-    termTitle.textContent = `${lane} — ${e.code === 4404 ? 'not running' : 'ended'}`;
+    termTitle.textContent = `${title} — ${closeReason(e.code)}`;
     if (term) term.write('\r\n\x1b[33m[taskherd: stream closed]\x1b[0m\r\n');
     termWs = null;
   };
@@ -300,6 +318,25 @@ function openTerminal(id, lane) {
   });
   term.onResize(sendResize);
   window.addEventListener('resize', () => { if (fit) fit.fit(); });
+}
+
+const wsProto = () => (location.protocol === 'https:' ? 'wss' : 'ws');
+
+function openTerminal(id, lane) {
+  openPty(
+    `${wsProto()}://${location.host}/ws/pty?project=${encodeURIComponent(id)}&lane=${encodeURIComponent(lane)}&token=${encodeURIComponent(token())}`,
+    `${lane} — live`,
+  );
+}
+
+// Web-SSH (§15 L2): a serve-owned interactive shell into a runner host. Only
+// reachable when serve ran with --allow-shell (the SHELL button is hidden
+// otherwise); a disabled server closes the WS with 4403, surfaced in the title.
+function openShell(id, runner) {
+  openPty(
+    `${wsProto()}://${location.host}/ws/shell?project=${encodeURIComponent(id)}&runner=${encodeURIComponent(runner)}&token=${encodeURIComponent(token())}`,
+    `${runner} shell`,
+  );
 }
 
 document.getElementById('term-close').onclick = closeTerminal;

@@ -182,3 +182,21 @@ export function wrapForRunner(runner, {
 
   throw new Error(`taskherd: unsupported runner kind ${JSON.stringify(runner.kind)} (local | docker | ssh) (DESIGN §11)`);
 }
+
+// The interactive-shell spawn spec for the web-SSH console feature (DESIGN §15
+// Layer 2 — "pty over the web for a runner host"). Unlike wrapForRunner, which
+// wraps a *specific step command*, this opens a bare shell under the resolved
+// runner and reuses the SAME argv-wrapping seam, so `local` / `docker` / `ssh`
+// all reach the serve-owned local pty identically. No auth env crosses — a web
+// shell is the operator's own session, so the runner host authenticates as
+// itself (§11), never a profile secret on the argv. Returns wrapForRunner's
+// spawn spec plus a human `label` for the audit log. `cwd` is the shell's
+// working dir (the project repo, for local; the docker/ssh client cwd otherwise).
+export function shellInvocation(runner, { cwd, shell } = {}) {
+  const sh = shell
+    || (runner.kind === 'local' ? (process.env.SHELL || '/bin/sh') : (runner.shell || '/bin/sh'));
+  const spec = wrapForRunner(runner, {
+    file: sh, args: [], cwd, worktree: cwd, repo: cwd, laneName: 'shell', isAi: false,
+  });
+  return { ...spec, label: runner.name || runner.kind };
+}

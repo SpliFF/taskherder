@@ -326,3 +326,117 @@ test('serve: WS pty bridge — watch output, type input, interrupt from the cons
   assert.equal(result.timedOut, false, 'killed by the signal, not the timeout');
   ws.close();
 });
+
+// ── web-SSH: serve-owned runner shells (M7b, DESIGN §15 Layer 2) ───────────
+
+// Resolves to the WS close code (or -1 if it errored before opening).
+function wsCloseCode(ws) {
+  return new Promise((resolve) => {
+    ws.on('close', (code) => resolve(code));
+    ws.on('error', () => {});
+  });
+}
+
+test('web-SSH: an --allow-shell console opens a serve-owned shell; disconnect reaps the shell process', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await registerProject(repo);
+  // Force a clean POSIX shell so the test doesn't depend on the machine's
+  // interactive rc files (speed + hermeticity); restore after.
+  const prevShell = process.env.SHELL;
+  process.env.SHELL = '/bin/sh';
+  t.after(() => { if (prevShell === undefined) delete process.env.SHELL; else process.env.SHELL = prevShell; });
+
+  const console_ = await createConsoleServer({ allowShell: true });
+  const addr = await console_.listen(0, '127.0.0.1');
+  t.after(() => console_.close());
+  const id = repoId(repo);
+
+  const ws = new WebSocket(`ws://127.0.0.1:${addr.port}/ws/shell?project=${id}&runner=local&token=${console_.token}`);
+  let output = '';
+  ws.on('message', (d) => {
+    const msg = JSON.parse(d.toString());
+    if (msg.event === 'output') output += Buffer.from(msg.data, 'base64').toString('utf8');
+  });
+  await new Promise((resolve, reject) => { ws.on('open', resolve); ws.on('error', reject); });
+  // The session is registered inside the server's async upgrade path, a beat
+  // after the client's `open` fires — poll rather than assume it is synchronous.
+  await waitFor(() => console_.shellSessionCount() === 1); // tracked (capacity + teardown accounting)
+
+  // A real interactive shell: it runs a typed command and reports its own pid.
+  ws.send(JSON.stringify({ type: 'input', data: 'echo "SHELL_PID:$$"; echo READY\n' }));
+  await waitFor(() => /SHELL_PID:\d+/.test(output) && output.includes('READY'));
+  const shellPid = Number(/SHELL_PID:(\d+)/.exec(output)[1]);
+  assert.doesNotThrow(() => process.kill(shellPid, 0), 'the serve-owned shell is alive while connected');
+
+  // Kill-on-disconnect: a dropped client must leave NO orphan shell (the whole
+  // point of gating this behind --allow-shell — an interactive RCE surface, §12).
+  ws.close();
+  await waitFor(() => console_.shellSessionCount() === 0);
+  await waitFor(() => {
+    try { process.kill(shellPid, 0); return false; } catch { return true; }
+  }, { timeout: 6000 });
+});
+
+test('web-SSH: /ws/shell is refused (4403) when the console was NOT started with --allow-shell', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await registerProject(repo);
+  const console_ = await createConsoleServer(); // default: web-SSH off
+  const addr = await console_.listen(0, '127.0.0.1');
+  t.after(() => console_.close());
+
+  assert.equal(console_.allowShell, false);
+  const ws = new WebSocket(`ws://127.0.0.1:${addr.port}/ws/shell?project=${repoId(repo)}&runner=local&token=${console_.token}`);
+  assert.equal(await wsCloseCode(ws), 4403, 'the disabled endpoint closes with a greppable 4403');
+});
+
+test('web-SSH: a tokenless /ws/shell upgrade is refused (auth is required for every WS)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await registerProject(repo);
+  const console_ = await createConsoleServer({ allowShell: true });
+  const addr = await console_.listen(0, '127.0.0.1');
+  t.after(() => console_.close());
+
+  const ws = new WebSocket(`ws://127.0.0.1:${addr.port}/ws/shell?project=${repoId(repo)}&runner=local`);
+  await new Promise((resolve) => { ws.on('open', resolve); ws.on('error', resolve); ws.on('close', resolve); });
+  assert.notEqual(ws.readyState, WebSocket.OPEN, 'no shell without the token');
+  assert.equal(console_.shellSessionCount(), 0, 'a rejected upgrade never spawns a shell');
+});
+
+test('web-SSH: concurrent shell sessions are capped (bounds the RCE surface, §12)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await registerProject(repo);
+  const prevShell = process.env.SHELL;
+  process.env.SHELL = '/bin/sh';
+  t.after(() => { if (prevShell === undefined) delete process.env.SHELL; else process.env.SHELL = prevShell; });
+
+  const console_ = await createConsoleServer({ allowShell: true, maxShellSessions: 1 });
+  const addr = await console_.listen(0, '127.0.0.1');
+  t.after(() => console_.close());
+  const id = repoId(repo);
+
+  const ws1 = new WebSocket(`ws://127.0.0.1:${addr.port}/ws/shell?project=${id}&runner=local&token=${console_.token}`);
+  await new Promise((resolve, reject) => { ws1.on('open', resolve); ws1.on('error', reject); });
+  await waitFor(() => console_.shellSessionCount() === 1);
+
+  const ws2 = new WebSocket(`ws://127.0.0.1:${addr.port}/ws/shell?project=${id}&runner=local&token=${console_.token}`);
+  assert.equal(await wsCloseCode(ws2), 4429, 'the second session over the cap is turned away');
+  assert.equal(console_.shellSessionCount(), 1, 'the capped session never spawned a shell');
+  ws1.close();
+});
+
+test('web-SSH: an unknown runner closes the shell WS loudly (4400), never a silent local fallback', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await registerProject(repo);
+  const console_ = await createConsoleServer({ allowShell: true });
+  const addr = await console_.listen(0, '127.0.0.1');
+  t.after(() => console_.close());
+
+  const ws = new WebSocket(`ws://127.0.0.1:${addr.port}/ws/shell?project=${repoId(repo)}&runner=podman:box&token=${console_.token}`);
+  assert.equal(await wsCloseCode(ws), 4400, 'a bad runner is rejected, not silently run on localhost');
+  assert.equal(console_.shellSessionCount(), 0);
+});

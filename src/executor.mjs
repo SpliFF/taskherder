@@ -43,7 +43,7 @@ function killGraceMs() {
 // without the executable bit (observed here: prebuild ships 0644), which
 // makes every run fail with an opaque `posix_spawnp failed.`. Self-heal it
 // once per process instead of surfacing that cryptic error to every user.
-function ensureSpawnHelperExecutable() {
+export function ensureSpawnHelperExecutable() {
   try {
     const require = createRequire(import.meta.url);
     const prebuildsDir = path.join(path.dirname(require.resolve('node-pty/package.json')), 'prebuilds');

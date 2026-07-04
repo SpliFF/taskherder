@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  resolveRunner, wrapForRunner, shquote, loadRunners,
+  resolveRunner, wrapForRunner, shquote, loadRunners, shellInvocation,
 } from '../src/runners.mjs';
 
 // A minimal inner invocation (what a provider/shell step rendered).
@@ -132,4 +132,42 @@ test('shquote: wraps and escapes embedded single quotes the POSIX way', () => {
   assert.equal(shquote('plain'), "'plain'");
   assert.equal(shquote("a'b"), "'a'\\''b'");
   assert.equal(shquote('a b; rm -rf /'), "'a b; rm -rf /'", 'metacharacters are inert inside single quotes');
+});
+
+// ── shellInvocation (web-SSH, DESIGN §15 L2) ──────────────────────────────
+
+test('shellInvocation(local): runs the host $SHELL as a bare interactive shell in cwd', () => {
+  const prev = process.env.SHELL;
+  process.env.SHELL = '/bin/zsh';
+  try {
+    const s = shellInvocation({ kind: 'local' }, { cwd: '/repo' });
+    assert.equal(s.file, '/bin/zsh');
+    assert.deepEqual(s.args, [], 'no command — an interactive shell, not a one-shot');
+    assert.equal(s.cwd, '/repo');
+    assert.equal(s.env.PATH, process.env.PATH, 'inherits ambient env');
+    assert.equal(s.label, 'local');
+  } finally {
+    if (prev === undefined) delete process.env.SHELL; else process.env.SHELL = prev;
+  }
+});
+
+test('shellInvocation(docker exec): opens a shell inside the container, no auth env crosses', () => {
+  const s = shellInvocation({ kind: 'docker', container: 'web', name: 'docker:web' }, { cwd: '/repo' });
+  assert.equal(s.file, 'docker');
+  assert.deepEqual(s.args, ['exec', '-i', '-t', 'web', '/bin/sh'], 'docker exec into the container running /bin/sh');
+  assert.ok(!s.args.includes('-e'), 'no profile secrets forwarded to a web shell');
+  assert.equal(s.label, 'docker:web');
+});
+
+test('shellInvocation(ssh): a -tt login shell on the remote host', () => {
+  const s = shellInvocation({ kind: 'ssh', host: 'box', name: 'ssh:box' }, { cwd: '/repo' });
+  assert.equal(s.file, 'ssh');
+  assert.deepEqual(s.args.slice(0, 2), ['-tt', 'box']);
+  assert.match(s.args[2], /exec '\/bin\/sh'/, 'runs an interactive shell on the remote through the forced pty');
+  assert.equal(s.label, 'ssh:box');
+});
+
+test('shellInvocation: an explicit shell overrides the default', () => {
+  const s = shellInvocation({ kind: 'docker', container: 'c', name: 'docker:c' }, { cwd: '/r', shell: '/bin/bash' });
+  assert.equal(s.args[s.args.length - 1], '/bin/bash');
 });

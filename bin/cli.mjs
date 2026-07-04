@@ -382,12 +382,14 @@ async function cmdServe(argv) {
   const { values, positionals } = parseRepoOnly(argv, {
     port: { type: 'string', short: 'p' },
     host: { type: 'string' },
+    'allow-shell': { type: 'boolean', default: false },
   });
   const { repo } = resolveRepo(values.repo, positionals, { laneless: true });
   if (existsSync(repoTasksDir(repo))) await registerProject(repo);
 
   const { createConsoleServer } = await import('../src/serve.mjs');
-  const console_ = await createConsoleServer();
+  const allowShell = values['allow-shell'];
+  const console_ = await createConsoleServer({ allowShell });
   const host = values.host || '127.0.0.1';
   const port = values.port ? Number(values.port) : 4373; // H-E-R-D on a phone keypad
   const addr = await console_.listen(port, host);
@@ -407,6 +409,13 @@ async function cmdServe(argv) {
   for (const u of urls) console.log(`  ${u}/?token=${console_.token}`);
   if (host === '127.0.0.1') {
     console.log('  (loopback only — use --host 0.0.0.0 or a tunnel for phone access)');
+  }
+  if (allowShell) {
+    console.log('taskherd: WARNING web-SSH ENABLED (--allow-shell) — the console can open interactive');
+    console.log('          shells (local / docker / ssh) as this user; anyone with the token gets a shell.');
+    if (host !== '127.0.0.1') {
+      console.log('          You are NOT on loopback — make sure the token stays private (DESIGN §12/§15).');
+    }
   }
 
   await new Promise((resolve) => {

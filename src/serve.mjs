@@ -20,6 +20,7 @@ import { connect } from 'node:net';
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { WebSocketServer } from 'ws';
+import pty from 'node-pty';
 
 import {
   taskherdHome, repoTasksDir, pausedFile, eventsFile, runSocketPath,
@@ -27,6 +28,8 @@ import {
 import { loadProjects } from './registry.mjs';
 import { statusData } from './history.mjs';
 import { laneDiff } from './git.mjs';
+import { resolveRunner, shellInvocation } from './runners.mjs';
+import { ensureSpawnHelperExecutable } from './executor.mjs';
 import {
   ackLane, addStep, forkLane, removeStep, moveStep, editStep, LaneValidationError,
 } from './tasks.mjs';
@@ -317,8 +320,103 @@ function bridgePty(ws, repo, lane) {
   ws.on('close', () => sock.destroy());
 }
 
-export async function createConsoleServer({ token } = {}) {
+// ── web-SSH: a serve-OWNED interactive pty into a runner (DESIGN §15 Layer 2) ──
+// This is a strict escalation over bridgePty (which only relays a step the user
+// already scheduled): here the serve process spawns a brand-new shell with no
+// lane behind it — an interactive RCE surface running as the serve user. So it
+// is default-OFF (§12 safety-first: the dangerous capability opts in), gated by
+// `--allow-shell`, and every session is: token-gated (like all WS), capacity-
+// capped, loudly audit-logged (open/exit/kill to stderr), and KILLED when the
+// client disconnects so no orphan shell lingers.
+const MAX_SHELL_SESSIONS = 8;
+
+// Hang up the shell's whole process group like a real terminal (node-pty children
+// are session leaders, pgid == pid, so -pid reaches jobs the shell spawned), then
+// hard-kill the group if it ignores the hangup — no lingering interactive process.
+function hangupTree(child, signal) {
+  try {
+    process.kill(-child.pid, signal);
+  } catch {
+    try { child.kill(signal); } catch { /* already gone */ }
+  }
+}
+
+// Opens one shell session on `ws`. `sessions` is the server-wide live set (for
+// the capacity cap + teardown on server close). The frame protocol is identical
+// to the pty bridge — `{event:'output', data:base64}` out; `{type:'input'|
+// 'resize'|'signal'}` in — so the SPA's xterm panel drives it unchanged.
+async function shellSession(ws, repo, runnerValue, sessions, max) {
+  if (sessions.size >= max) {
+    ws.close(4429, 'too many shell sessions');
+    return;
+  }
+  let runner;
+  let inv;
+  try {
+    runner = await resolveRunner(runnerValue);
+    inv = shellInvocation(runner, { cwd: repo });
+  } catch (err) {
+    ws.close(4400, (err.message || 'bad runner').slice(0, 100));
+    return;
+  }
+  for (const w of inv.warnings || []) console.error(w);
+
+  ensureSpawnHelperExecutable(); // self-heal a bad node-pty prebuild (see executor.mjs)
+  let child;
+  try {
+    child = pty.spawn(inv.file, inv.args, {
+      name: 'xterm-color', cols: 80, rows: 30, cwd: inv.cwd, env: inv.env,
+    });
+  } catch (err) {
+    console.error(`taskherd: serve web-shell spawn failed (${inv.label}): ${err.message}`);
+    ws.close(4500, 'shell spawn failed');
+    return;
+  }
+
+  const session = { child, ws };
+  sessions.add(session);
+  console.error(`taskherd: serve web-shell OPEN runner=${inv.label} argv=[${[inv.file, ...inv.args].join(' ')}] pid=${child.pid} (${sessions.size} live)`);
+
+  let killTimer = null;
+  const end = (reason) => {
+    if (!sessions.has(session)) return;
+    sessions.delete(session);
+    // Client gone → hang up, then hard-kill the group if it lingers.
+    hangupTree(child, 'SIGHUP');
+    killTimer = setTimeout(() => hangupTree(child, 'SIGKILL'), 3000);
+    console.error(`taskherd: serve web-shell CLOSE runner=${inv.label} pid=${child.pid} (${reason}; ${sessions.size} live)`);
+  };
+
+  child.onData((data) => {
+    if (ws.readyState === ws.OPEN) {
+      ws.send(JSON.stringify({ event: 'output', data: Buffer.from(data, 'utf8').toString('base64') }));
+    }
+  });
+  child.onExit(({ exitCode, signal }) => {
+    if (killTimer) { clearTimeout(killTimer); killTimer = null; }
+    const wasLive = sessions.delete(session);
+    if (wasLive) {
+      console.error(`taskherd: serve web-shell EXIT runner=${inv.label} pid=${child.pid} code=${exitCode}${signal ? ` signal=${signal}` : ''} (${sessions.size} live)`);
+    }
+    if (ws.readyState === ws.OPEN) ws.close(1000, 'shell exited');
+  });
+  ws.on('message', (data) => {
+    try {
+      const msg = JSON.parse(data.toString('utf8'));
+      if (msg.type === 'input') child.write(String(msg.data ?? ''));
+      else if (msg.type === 'resize' && msg.cols && msg.rows) child.resize(msg.cols, msg.rows);
+      else if (msg.type === 'signal' && CONTROL_SIGNALS.has(msg.signal || 'SIGINT')) child.kill(msg.signal || 'SIGINT');
+      // 'detach'/anything else → let the client just close the socket
+    } catch {
+      // malformed client frame — drop it, never crash the session
+    }
+  });
+  ws.on('close', () => end('client disconnected'));
+}
+
+export async function createConsoleServer({ token, allowShell = false, maxShellSessions = MAX_SHELL_SESSIONS } = {}) {
   const authToken = token || await ensureServeToken();
+  const shellSessions = new Set();
 
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, 'http://localhost');
@@ -342,7 +440,7 @@ export async function createConsoleServer({ token } = {}) {
       }
 
       if (req.method === 'GET' && url.pathname === '/api/projects') {
-        sendJson(res, 200, { projects: await projectSummaries() });
+        sendJson(res, 200, { projects: await projectSummaries(), allowShell });
         return;
       }
 
@@ -397,6 +495,10 @@ export async function createConsoleServer({ token } = {}) {
           const lane = url.searchParams.get('lane');
           if (!lane) { ws.close(4400, 'missing lane'); return; }
           bridgePty(ws, repo, lane);
+        } else if (url.pathname === '/ws/shell') {
+          // Web-SSH (§15 L2) — off unless the operator opted in with --allow-shell.
+          if (!allowShell) { ws.close(4403, 'web-SSH disabled — start `taskherd serve --allow-shell`'); return; }
+          shellSession(ws, repo, url.searchParams.get('runner') || 'local', shellSessions, maxShellSessions);
         } else {
           ws.close(4404, 'unknown endpoint');
         }
@@ -409,6 +511,8 @@ export async function createConsoleServer({ token } = {}) {
   return {
     server,
     token: authToken,
+    allowShell,
+    shellSessionCount: () => shellSessions.size,
     listen(port, host) {
       return new Promise((resolve, reject) => {
         server.on('error', reject);
@@ -416,6 +520,10 @@ export async function createConsoleServer({ token } = {}) {
       });
     },
     async close() {
+      // Reap every serve-owned shell (a disconnecting client kills its own, but
+      // a shutdown must leave no orphan interactive process behind).
+      for (const s of shellSessions) hangupTree(s.child, 'SIGKILL');
+      shellSessions.clear();
       for (const ws of wss.clients) ws.terminate();
       await new Promise((resolve) => server.close(resolve));
     },
