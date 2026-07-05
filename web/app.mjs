@@ -88,10 +88,10 @@ function laneHtml(p, lane) {
     const cls = active ? 'running' : s.status;
     const tools = (i >= editableFrom && s.status === 'pending') ? `
       <span class="step-tools">
-        <button class="btn ghost" data-action="step-up" data-lane="${esc(lane.name)}" data-idx="${i}" ${i <= editableFrom ? 'disabled' : ''}>↑</button>
-        <button class="btn ghost" data-action="step-down" data-lane="${esc(lane.name)}" data-idx="${i}" ${i >= lane.steps.length - 1 ? 'disabled' : ''}>↓</button>
-        <button class="btn ghost" data-action="step-edit" data-lane="${esc(lane.name)}" data-idx="${i}" data-type="${esc(s.type)}">✎</button>
-        <button class="btn ghost" data-action="step-del" data-lane="${esc(lane.name)}" data-idx="${i}">✕</button>
+        <button class="btn ghost" title="Move this step earlier in the queue" data-action="step-up" data-lane="${esc(lane.name)}" data-idx="${i}" ${i <= editableFrom ? 'disabled' : ''}>↑</button>
+        <button class="btn ghost" title="Move this step later in the queue" data-action="step-down" data-lane="${esc(lane.name)}" data-idx="${i}" ${i >= lane.steps.length - 1 ? 'disabled' : ''}>↓</button>
+        <button class="btn ghost" title="Edit this step's prompt/command" data-action="step-edit" data-lane="${esc(lane.name)}" data-idx="${i}" data-type="${esc(s.type)}">✎</button>
+        <button class="btn ghost" title="Remove this step from the queue" data-action="step-del" data-lane="${esc(lane.name)}" data-idx="${i}">✕</button>
       </span>` : '';
     return `<li class="step ${esc(s.status)}">
       <span class="step-idx">${i}</span>
@@ -110,21 +110,21 @@ function laneHtml(p, lane) {
     </div>
     ${lane.gate ? `<div class="gate-banner">
       <span class="gate-reason">◆ ${esc(lane.gate)}</span>
-      <button class="btn primary" data-action="ack" data-lane="${esc(lane.name)}">ACK</button>
+      <button class="btn primary" title="Approve this gate — the lane continues on the next run" data-action="ack" data-lane="${esc(lane.name)}">ACK</button>
     </div>` : ''}
     ${steps ? `<ul class="steps">${steps}</ul>` : ''}
     ${lane.onEmpty === 'default' && lane.default ? `<div class="lane-default">${esc(lane.default.task || lane.default.run || 'default')} <span class="step-type">(${esc(lane.default.type || 'ai')} · recurring)</span></div>` : ''}
     <div class="lane-actions">
       ${running ? `
-        <button class="btn" data-action="attach" data-project="${esc(p.id)}" data-lane="${esc(lane.name)}">ATTACH</button>
-        <button class="btn warn" data-action="interrupt" data-lane="${esc(lane.name)}">INTERRUPT</button>` : ''}
-      <button class="btn ghost" data-action="diff" data-lane="${esc(lane.name)}">DIFF</button>
-      <button class="btn ghost" data-action="fork" data-lane="${esc(lane.name)}">FORK</button>
+        <button class="btn" title="Watch the running step's live terminal" data-action="attach" data-project="${esc(p.id)}" data-lane="${esc(lane.name)}">ATTACH</button>
+        <button class="btn warn" title="Send SIGINT (Ctrl-C) to the running step" data-action="interrupt" data-lane="${esc(lane.name)}">INTERRUPT</button>` : ''}
+      <button class="btn ghost" title="Review this lane's branch diff before landing (worktree/inplace lanes)" data-action="diff" data-lane="${esc(lane.name)}">DIFF</button>
+      <button class="btn ghost" title="Create a new sibling lane branched from this one" data-action="fork" data-lane="${esc(lane.name)}">FORK</button>
     </div>
     <form class="add-row" data-action="add-step" data-lane="${esc(lane.name)}">
       <select name="type"><option>command</option><option>ai</option><option>manual</option></select>
-      <input name="task" placeholder="queue a step…" autocomplete="off">
-      <button class="btn" type="submit">ADD</button>
+      <input name="task" placeholder="queue a step…" autocomplete="off" title="A prompt (ai), a shell command (command), or gate text (manual)">
+      <button class="btn" type="submit" title="Queue this step onto the lane">ADD</button>
     </form>
   </article>`;
 }
@@ -151,7 +151,7 @@ function render() {
         <span class="project-spend">${p.totalSpent ? `Σ $${p.totalSpent.toFixed(2)}` : ''}</span>
         ${allowShell ? `<button class="btn ghost" data-action="shell" title="open a shell on this host (web-SSH)">SHELL</button>` : ''}
         ${allowGfx && gfxRunners.length ? `<button class="btn ghost" data-action="gui" title="stream a runner's GUI (Xpra/noVNC)">GUI</button>` : ''}
-        <button class="btn ${p.paused ? 'primary' : 'warn'}" data-action="${p.paused ? 'resume' : 'pause'}">${p.paused ? 'RESUME' : 'PAUSE'}</button>
+        <button class="btn ${p.paused ? 'primary' : 'warn'}" title="${p.paused ? 'Resume the herd — lanes can run again' : 'Pause the herd — no lanes run until resumed'}" data-action="${p.paused ? 'resume' : 'pause'}">${p.paused ? 'RESUME' : 'PAUSE'}</button>
       </div>
       ${p.paused ? '<div class="paused-banner">⏸ PAUSED — no lanes will run until resumed</div>' : ''}
       ${p.error ? `<p class="missing">✗ ${esc(p.error)}</p>` : ''}
@@ -452,6 +452,29 @@ async function openGui(id) {
 }
 
 document.getElementById('gfx-close').onclick = closeGfx;
+
+// ── resizable bottom pane ────────────────────────────────────────────────
+// Drag a panel's top-edge handle to resize the lanes/panel split. The height is
+// a shared CSS var, so it applies to whichever of term/diff/gfx is open. On drag
+// we re-emit `resize` so the xterm fit addon reflows to the new height.
+for (const handle of document.querySelectorAll('.panel-resize')) {
+  handle.addEventListener('pointerdown', (e) => {
+    e.preventDefault();
+    handle.setPointerCapture(e.pointerId);
+    const onMove = (ev) => {
+      const h = Math.max(140, Math.min(window.innerHeight * 0.82, window.innerHeight - ev.clientY));
+      document.documentElement.style.setProperty('--panel-h', `${h}px`);
+      window.dispatchEvent(new Event('resize'));
+    };
+    const onUp = (ev) => {
+      handle.releasePointerCapture(ev.pointerId);
+      handle.removeEventListener('pointermove', onMove);
+      handle.removeEventListener('pointerup', onUp);
+    };
+    handle.addEventListener('pointermove', onMove);
+    handle.addEventListener('pointerup', onUp);
+  });
+}
 
 // ── boot ────────────────────────────────────────────────────────────────
 scheduleRefresh();

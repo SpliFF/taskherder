@@ -5,6 +5,29 @@ based on [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/). Pre-1.0: minor versions may include breaking
 changes.
 
+## 0.1.1 — 2026-07-05
+
+### Fixed
+- **Web console: the bottom panel was always visible.** The terminal/diff/gfx
+  panels were toggled via the `hidden` attribute, but a `.panel { display: flex }`
+  rule overrode the user-agent `[hidden]` style — so a panel (the graphical pane,
+  an empty ~78vh black iframe) rendered on load, covered the lanes, and couldn't
+  be closed. Panels are now genuinely hidden until opened.
+- **Web console: the lanes were clipped and the panel wasn't resizable.** Reworked
+  the layout as a flex app-shell — the lanes area scrolls on its own and the bottom
+  panel is a **resizable** pane (drag its top edge) instead of a fixed overlay that
+  sat on top of the content.
+- **Web console: lanes now flow to fill the window** (wrapping flex, ~340–460px per
+  lane) instead of a centered 1080px column — more lanes per row on wide monitors,
+  each kept to a legible width.
+- **CLI `status` printed `undefined`** as a lane's state before its first run (now
+  shows `idle`).
+
+### Added
+- **Web console: tooltips on every button.** The glyph step-tools (↑ ↓ ✎ ✕) and
+  all action buttons (ACK, ATTACH, INTERRUPT, DIFF, FORK, ADD, PAUSE/RESUME, and
+  the panel INT/TERM/CLOSE) now carry a `title` explaining what they do.
+
 ## 0.1.0 — 2026-07-04
 
 First public release. Every milestone in [DESIGN.md](DESIGN.md) §21 is built and

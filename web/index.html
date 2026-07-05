@@ -18,30 +18,33 @@
     <p class="boot">connecting…</p>
   </main>
   <section class="term-panel" id="term-panel" hidden>
+    <div class="panel-resize" title="drag to resize"></div>
     <div class="term-bar">
       <span class="term-title" id="term-title">—</span>
       <span class="term-actions">
-        <button class="btn warn" id="term-int">INT</button>
-        <button class="btn danger" id="term-term">TERM</button>
-        <button class="btn" id="term-close">CLOSE</button>
+        <button class="btn warn" id="term-int" title="Send SIGINT (Ctrl-C) to the terminal">INT</button>
+        <button class="btn danger" id="term-term" title="Send SIGTERM to the terminal">TERM</button>
+        <button class="btn" id="term-close" title="Close the terminal panel">CLOSE</button>
       </span>
     </div>
     <div class="term-host" id="term-host"></div>
   </section>
   <section class="diff-panel" id="diff-panel" hidden>
+    <div class="panel-resize" title="drag to resize"></div>
     <div class="term-bar">
       <span class="term-title" id="diff-title">—</span>
       <span class="term-actions">
-        <button class="btn" id="diff-close">CLOSE</button>
+        <button class="btn" id="diff-close" title="Close the diff panel">CLOSE</button>
       </span>
     </div>
     <div class="diff-body" id="diff-body"></div>
   </section>
   <section class="gfx-panel" id="gfx-panel" hidden>
+    <div class="panel-resize" title="drag to resize"></div>
     <div class="term-bar">
       <span class="term-title" id="gfx-title">—</span>
       <span class="term-actions">
-        <button class="btn" id="gfx-close">CLOSE</button>
+        <button class="btn" id="gfx-close" title="Close the GUI stream">CLOSE</button>
       </span>
     </div>
     <iframe class="gfx-frame" id="gfx-frame" title="runner GUI stream"

@@ -85,7 +85,7 @@ export async function renderStatus(repo) {
   const lines = [];
   for (const lane of lanes) {
     const spent = lane.spent ? `  spent: ${fmtUsd(lane.spent)}` : '';
-    lines.push(`${lane.name}  [${lane.cursor}/${lane.steps.length}]  ${lane.status}  last: ${lane.last ? lane.last.result : 'never run'}${spent}`);
+    lines.push(`${lane.name}  [${lane.cursor}/${lane.steps.length}]  ${lane.status || 'idle'}  last: ${lane.last ? lane.last.result : 'never run'}${spent}`);
     if (lane.gate) lines.push(`  gate: ${lane.gate}`);
   }
   for (const bad of unloadable) {
