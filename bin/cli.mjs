@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 // taskherd — CLI entry (DESIGN.md §18). M1: init/run/status/add/block/ack/
 // attach/pause/resume, command + manual step types only.
-import { existsSync, statSync, lstatSync } from 'node:fs';
+import { existsSync, statSync, lstatSync, readFileSync } from 'node:fs';
 import {
   writeFile, rm, mkdir, chmod, symlink, realpath,
 } from 'node:fs/promises';
@@ -68,6 +68,72 @@ function requireTasksDir(repo) {
     console.error(`taskherd: no .tasks/ in ${repo} — run \`taskherd init\` first`);
     process.exit(1);
   }
+}
+
+// ── help + version ────────────────────────────────────────────────────────
+// One table drives all three surfaces so they can never drift: the command
+// list in `taskherd help`, each command's `help <cmd>` page, and the one-line
+// usage a command prints when it is called wrong (usageError below). Order here
+// is the order shown in help; keys must match COMMANDS (dispatch, bottom).
+const COMMAND_HELP = {
+  init: { summary: 'Initialize .tasks/ in a repo (register it, scaffold config)', usage: 'taskherd init [-C repo | <repo>] [--no-global-gitignore]' },
+  run: { summary: 'Fire the scheduler once — run ONE step (--lane targets one lane)', usage: 'taskherd run [-C repo | <repo>] [--lane <name>] [--force]' },
+  status: { summary: 'Show lanes, last result, open gates, and cost', usage: 'taskherd status [-C repo | <repo>]' },
+  add: { summary: 'Queue a step onto a lane (command | ai | manual)', usage: 'taskherd add [-C repo] <lane> [--type command|ai|manual] [--isolation worktree|inplace|none] [--land manual-gate|pr|leave] [--base <branch>] [opts] "<task>"' },
+  block: { summary: 'Add a manual gate that blocks a lane until acked', usage: 'taskherd block [-C repo] <lane> --message "<text>" [--file <path>]' },
+  fork: { summary: 'Split a new sibling lane off an existing one', usage: 'taskherd fork [-C repo] <new-lane> --from <parent> [add opts] ["<task>"]' },
+  ack: { summary: 'Answer a gate / clear a parked failure / land a branch', usage: 'taskherd ack [-C repo] <lane>' },
+  diff: { summary: "Show a lane's branch diff before landing", usage: 'taskherd diff [-C repo] <lane> [--base <branch>]' },
+  attach: { summary: "Attach to a running step's live terminal (Ctrl-] detaches)", usage: 'taskherd attach [-C repo] <lane>' },
+  pause: { summary: 'Halt all lanes (the kill-switch)', usage: 'taskherd pause [-C repo | <repo>]' },
+  resume: { summary: 'Clear the pause', usage: 'taskherd resume [-C repo | <repo>]' },
+  gc: { summary: 'Remove finished worktrees and prune', usage: 'taskherd gc [-C repo | <repo>]' },
+  auth: { summary: 'Manage per-account auth profiles', usage: 'taskherd auth login|list|logout <profile> [--provider <name>]' },
+  history: { summary: 'Show recent run history', usage: 'taskherd history [-C repo | <repo>] [--limit <n>]' },
+  cost: { summary: 'Show spend per lane', usage: 'taskherd cost [-C repo | <repo>]' },
+  serve: { summary: 'Start the web console (HTTP + WebSocket)', usage: 'taskherd serve [-C repo | <repo>] [-p port] [--host <addr>] [--allow-shell] [--allow-gfx]' },
+  install: { summary: 'Register the taskherd MCP server + link the /task skill', usage: 'taskherd install' },
+  doctor: { summary: 'Check providers, runners, profiles, integrations', usage: 'taskherd doctor' },
+};
+
+function version() {
+  return JSON.parse(readFileSync(new URL('../package.json', import.meta.url), 'utf8')).version;
+}
+
+// A command called with missing/invalid args: its one-line usage to stderr,
+// exit 1 (a usage error, not a help request). Shared string, so `help <cmd>`
+// and the "called wrong" message are always identical.
+function usageError(name) {
+  console.error(`taskherd: usage: ${COMMAND_HELP[name].usage}`);
+  process.exit(1);
+}
+
+// `taskherd help [command]`, `--help`, `-h`, or a bare invocation. With a known
+// command name → that command's page; otherwise the full command list. Prints
+// to stdout and the caller exits 0 — help was asked for, it is not an error.
+function printHelp(name) {
+  if (name && COMMAND_HELP[name]) {
+    const { summary, usage } = COMMAND_HELP[name];
+    console.log(`taskherd ${name} — ${summary}\n\nUsage: ${usage}`);
+    return;
+  }
+  const width = Math.max(...Object.keys(COMMAND_HELP).map((c) => c.length));
+  const commands = Object.entries(COMMAND_HELP)
+    .map(([c, h]) => `  ${c.padEnd(width)}  ${h.summary}`)
+    .join('\n');
+  console.log(`taskherd ${version()} — herd scheduled task lanes across projects, containers, and hosts
+
+Usage: taskherd <command> [options]
+
+Commands:
+${commands}
+
+Global options:
+  -C, --repo <path>   Operate on this repo (default: the current directory)
+  -h, --help          Show help; \`taskherd help <command>\` for one command
+  -v, --version       Show the version
+
+Docs: https://github.com/SpliFF/taskherder#readme`);
 }
 
 async function cmdInit(argv) {
@@ -167,11 +233,7 @@ async function cmdAdd(argv) {
   const { repo, rest } = resolveRepo(values.repo, positionals);
   requireTasksDir(repo);
   const [laneName, ...taskParts] = rest;
-  if (!laneName) {
-    console.error('taskherd: usage: taskherd add [-C repo] <lane> [--type command|ai|manual] '
-      + '[--isolation worktree|inplace|none] [--land manual-gate|pr|leave] [--base <branch>] [opts] "<task>"');
-    process.exit(1);
-  }
+  if (!laneName) usageError('add');
   const task = taskParts.join(' ');
 
   const { step, index } = await addStep(repo, laneName, stepOptsFromFlags(values, task), laneOptsFromFlags(values));
@@ -190,10 +252,7 @@ async function cmdFork(argv) {
   const { repo, rest } = resolveRepo(values.repo, positionals);
   requireTasksDir(repo);
   const [laneName, ...taskParts] = rest;
-  if (!laneName || !values.from) {
-    console.error('taskherd: usage: taskherd fork [-C repo] <new-lane> --from <parent> [add opts] ["<task>"]');
-    process.exit(1);
-  }
+  if (!laneName || !values.from) usageError('fork');
   const task = taskParts.join(' ');
   const hasStep = Boolean(task || values.file || values.message);
   const lane = await forkLane(repo, laneName, values.from, {
@@ -221,10 +280,7 @@ async function cmdAck(argv) {
   const { repo, rest } = resolveRepo(values.repo, positionals);
   requireTasksDir(repo);
   const [laneName] = rest;
-  if (!laneName) {
-    console.error('taskherd: usage: taskherd ack [-C repo] <lane>');
-    process.exit(1);
-  }
+  if (!laneName) usageError('ack');
   const { kind, lane, merged } = await ackLane(repo, laneName);
   if (kind === 'land') console.log(`taskherd: landed '${laneName}' — merged ${merged.branch} into ${merged.base} (${merged.commit}); \`taskherd gc\` reclaims the worktree`);
   else if (kind === 'gate') console.log(`taskherd: acked manual gate on '${laneName}', cursor -> ${lane.cursor}`);
@@ -263,10 +319,7 @@ async function cmdDiff(argv) {
   const { repo, rest } = resolveRepo(values.repo, positionals);
   requireTasksDir(repo);
   const [laneName] = rest;
-  if (!laneName) {
-    console.error('taskherd: usage: taskherd diff [-C repo] <lane> [--base <branch>]');
-    process.exit(1);
-  }
+  if (!laneName) usageError('diff');
   if (!(await isGitRepo(repo))) {
     console.log('taskherd: not a git repository — no lane branches to diff');
     return;
@@ -292,10 +345,7 @@ async function cmdAttach(argv) {
   const { repo, rest } = resolveRepo(values.repo, positionals);
   requireTasksDir(repo);
   const [laneName] = rest;
-  if (!laneName) {
-    console.error('taskherd: usage: taskherd attach [-C repo] <lane>');
-    process.exit(1);
-  }
+  if (!laneName) usageError('attach');
   const sockPath = runSocketPath(repo, laneName);
   if (!existsSync(sockPath)) {
     console.log(`taskherd: '${laneName}' has no running step`);
@@ -493,10 +543,7 @@ async function cmdAuth(argv) {
     return;
   }
 
-  if (!name) {
-    console.error('taskherd: usage: taskherd auth login|list|logout <profile>');
-    process.exit(1);
-  }
+  if (!name) usageError('auth');
 
   if (sub === 'login') {
     const provider = values.provider || 'claude';
@@ -798,10 +845,27 @@ const COMMANDS = {
 };
 
 const [, , cmd, ...rest] = process.argv;
+
+// Version + help are global, resolved before command dispatch (CLI convention:
+// -v/--version, -h/--help, a bare invocation, and a `help [command]` verb).
+if (cmd === '--version' || cmd === '-v') {
+  console.log(`taskherd ${version()}`);
+  process.exit(0);
+}
+if (!cmd || cmd === 'help' || cmd === '--help' || cmd === '-h') {
+  printHelp(rest[0]);
+  process.exit(0);
+}
+
 const handler = COMMANDS[cmd];
 if (!handler) {
-  console.error(`taskherd: unknown command '${cmd}'\nAvailable: ${Object.keys(COMMANDS).join(', ')}`);
+  console.error(`taskherd: unknown command '${cmd}' — run \`taskherd help\` for the command list`);
   process.exit(1);
+}
+// `taskherd <command> --help` / `-h` → that command's page, without running it.
+if (rest.includes('--help') || rest.includes('-h')) {
+  printHelp(cmd);
+  process.exit(0);
 }
 try {
   await handler(rest);

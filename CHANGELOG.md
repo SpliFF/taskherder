@@ -5,6 +5,17 @@ based on [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/). Pre-1.0: minor versions may include breaking
 changes.
 
+## 0.1.3 — 2026-07-08
+
+### Added
+- **`taskherd --version` / `-v`** prints the version.
+- **Help.** `taskherd --help` / `-h`, the `taskherd help [command]` verb, and a
+  bare `taskherd` print a command list with one-line summaries (or one command's
+  usage); `taskherd <command> --help` shows that command's usage without running
+  it. An unknown command now errors with a pointer to `taskherd help`. One shared
+  table drives the command list, the per-command help, and each command's
+  "called wrong" usage string, so the three can never drift.
+
 ## 0.1.2 — 2026-07-08
 
 ### Added
