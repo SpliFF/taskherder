@@ -22,7 +22,9 @@ test('renderInvocation: claude renders model, permission, max-turns, cost-json a
     ['--permission-mode', 'bypassPermissions'],
     'permission defaults to bypassPermissions when unset (DESIGN §8)',
   );
-  assert.ok(inv.args.includes('--output-format') && inv.args.includes('json'), 'cost-json mode on');
+  // Streaming JSONL for a live transcript; the final result event still carries cost (§10, §22 monitor).
+  assert.ok(inv.args.includes('--output-format') && inv.args.includes('stream-json'), 'stream-json cost mode on');
+  assert.ok(inv.args.includes('--verbose') && inv.args.includes('--include-partial-messages'), 'streaming requires both flags in -p mode');
   assert.equal(inv.captureCost, true);
   assert.equal(inv.permissionMode, 'bypassPermissions');
 });
@@ -108,6 +110,20 @@ test('parseCost: pulls usd, tokens and session id from a claude result object', 
   assert.equal(cost.sessionId, 'sess-9');
   assert.equal(cost.inputTokens, 100);
   assert.equal(cost.outputTokens, 50);
+});
+
+test('parseCost: reads cost from the final result event of a stream-json run (§10/§22)', () => {
+  // claude --output-format stream-json emits a JSONL stream; the FINAL event is
+  // type:"result" with the cost — parseCost must find it past all the deltas.
+  const stream = [
+    JSON.stringify({ type: 'system', subtype: 'init', model: 'opus' }),
+    JSON.stringify({ type: 'stream_event', event: { type: 'content_block_delta', delta: { type: 'text_delta', text: 'ok' } } }),
+    JSON.stringify({ type: 'result', total_cost_usd: 0.42, session_id: 'sess-str', usage: { input_tokens: 7, output_tokens: 3 } }),
+  ].join('\n') + '\n';
+  const cost = parseCost(stream);
+  assert.equal(cost.usd, 0.42);
+  assert.equal(cost.sessionId, 'sess-str');
+  assert.equal(cost.inputTokens, 7);
 });
 
 test('parseCost: unrecognisable output returns null (caller logs a stand-in)', () => {

@@ -5,6 +5,21 @@ based on [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/). Pre-1.0: minor versions may include breaking
 changes.
 
+## Unreleased
+
+### Changed
+- **Live AI transcripts in the console.** AI (Claude) steps now run in
+  `--output-format stream-json` (with `--verbose --include-partial-messages`)
+  instead of the buffered `--output-format json`. Previously an attached run
+  showed nothing until it finished, then a single JSON blob; now the console's
+  monitor pane renders a **live transcript** — assistant text as it streams, tool
+  calls, rate-limit/retry notices, and a final `[done · N turns · $cost]` line.
+  Cost/§10 accounting is unchanged: the final `type:"result"` event still carries
+  `total_cost_usd`/`usage`/`session_id`, which the existing parser reads.
+  Command/plain steps still stream byte-for-byte. (The raw pty log and the CLI
+  `taskherd attach` now carry stream-json JSONL; a rendered log/CLI viewer is a
+  follow-up.)
+
 ## 0.1.4 — 2026-07-08
 
 ### Added

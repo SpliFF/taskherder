@@ -42,7 +42,14 @@ export const BUILTIN_PROVIDERS = {
     // {repo} the documented §8 way; both vars are supplied at render time.
     mcpArgs: ['--mcp-config', '{mcpConfig}', '--strict-mcp-config'],
     maxTurnsArg: ['--max-turns', '{maxTurns}'],
-    costJson: ['--output-format', 'json'], // parsed for §10 cost logging
+    // Streaming JSONL, NOT buffered `--output-format json`: the run emits
+    // incremental events so an attached console/pane shows a LIVE transcript
+    // instead of one silent-then-a-JSON-blob dump. The final `type:"result"`
+    // event still carries total_cost_usd/usage/session_id, so §10 cost logging is
+    // unchanged (parseCost reads the last JSON object = that result event —
+    // verified live). `--verbose` AND `--include-partial-messages` are BOTH
+    // required for `-p` print mode to stream (verified against the claude CLI).
+    costJson: ['--output-format', 'stream-json', '--verbose', '--include-partial-messages'],
   },
   codex: {
     // `codex exec [flags] "<prompt>"` — the `exec` subcommand must lead, so it
@@ -178,10 +185,11 @@ export function renderInvocation(provider, {
   return { command: provider.command, args, permissionMode: pm, captureCost: !!provider.costJson };
 }
 
-// Finds the last complete top-level `{...}` JSON object in `text`. Providers in
-// cost-JSON mode (claude --output-format json) print a single result object; a
-// pty may prepend stray bytes, so we scan for the last balanced object rather
-// than JSON.parse-ing the whole capture.
+// Finds the last complete top-level `{...}` JSON object in `text`. In cost-JSON
+// mode claude emits a stream of JSONL events whose FINAL one is the `type:"result"`
+// object (total_cost_usd/usage/session_id); a pty may also prepend stray bytes,
+// so we scan for the last balanced object rather than JSON.parse-ing the whole
+// capture. (Also handles the older buffered `--output-format json` single object.)
 export function lastJsonObject(text) {
   let depth = 0;
   let start = -1;
