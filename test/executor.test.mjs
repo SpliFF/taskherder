@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { connect } from 'node:net';
-import { parseTimeout, formatDuration, runStep } from '../src/executor.mjs';
+import {
+  parseTimeout, formatDuration, runStep, extractErrorTail,
+} from '../src/executor.mjs';
 import { newLane } from '../src/tasks.mjs';
 import { runSocketPath } from '../src/paths.mjs';
 import { makeRepo, waitFor } from './helpers.mjs';
@@ -26,6 +28,32 @@ test('parseTimeout: empty/absent falls back to the 45m default', () => {
   assert.equal(parseTimeout(null), FORTY_FIVE_MIN);
   assert.equal(parseTimeout(undefined), FORTY_FIVE_MIN);
   assert.equal(parseTimeout(''), FORTY_FIVE_MIN);
+});
+
+test('extractErrorTail: keeps the operative error, drops blanks, caps lines', () => {
+  const raw = 'step 1\nstep 2\n\n\nError: You have reached your Fable 5 limit\n';
+  const tail = extractErrorTail(raw, { maxLines: 2 });
+  assert.equal(tail, 'step 2\nError: You have reached your Fable 5 limit');
+});
+
+test('extractErrorTail: strips ANSI colour and honours carriage-return repaints', () => {
+  // A spinner rewrites its line with \r; only the final paint should survive,
+  // and the SGR colour codes around the message must be stripped.
+  const raw = 'working... 10%\rworking... 100%\n[31mFATAL: boom[0m\n';
+  assert.equal(extractErrorTail(raw), 'working... 100%\nFATAL: boom');
+});
+
+test('extractErrorTail: nothing but whitespace/escapes yields null', () => {
+  assert.equal(extractErrorTail('[2J[H\n   \n'), null);
+  assert.equal(extractErrorTail(''), null);
+  assert.equal(extractErrorTail(null), null);
+});
+
+test('extractErrorTail: caps total length with a leading ellipsis', () => {
+  const raw = `${'x'.repeat(5000)}\n`;
+  const tail = extractErrorTail(raw, { maxChars: 100 });
+  assert.equal(tail.length, 100);
+  assert.ok(tail.startsWith('…'));
 });
 
 test('parseTimeout: unparseable input throws loudly (a misparsed guardrail must not be silent)', () => {

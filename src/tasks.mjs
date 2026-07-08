@@ -282,6 +282,7 @@ export async function ackLane(repo, name) {
   step.status = 'pending';
   step.attempts = 0;
   delete step.parkedReason;
+  delete step.error; // the surfaced failure excerpt clears with the retry
   lane.status = 'idle';
   await saveLane(repo, lane);
   return { kind: 'failure', lane };

@@ -133,6 +133,7 @@ main {
 
 .lane.is-running { border-color: #2d5b3b; box-shadow: 0 0 0 1px #52d27322, 0 0 24px #52d27310; }
 .lane.is-blocked { border-color: #6b5220; }
+.lane.is-failed { border-color: #6b2d28; box-shadow: 0 0 0 1px #ff6b5e18; }
 
 .lane-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .lane-name { font-weight: 700; font-size: 14px; }
@@ -142,6 +143,7 @@ main {
 .dot { font-size: 10px; vertical-align: 1px; }
 .dot.running { color: var(--run); animation: pulse 1.6s ease-in-out infinite; }
 .dot.blocked { color: var(--gate); }
+.dot.failed { color: var(--fail); }
 .dot.idle { color: var(--faint); }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
@@ -155,7 +157,32 @@ main {
   gap: 10px;
   align-items: flex-start;
 }
-.gate-reason { color: var(--gate); flex: 1; overflow-wrap: anywhere; }
+.gate-text { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 6px; }
+.gate-reason { color: var(--gate); overflow-wrap: anywhere; }
+.gate-label { font-weight: 700; letter-spacing: 0.06em; }
+
+/* A failure (crash / timeout / provider limit) — red, and it carries the actual
+   error text in .gate-detail so the console shows WHY the lane died. */
+.gate-banner.error {
+  border-color: #6b2d28;
+  border-left-color: var(--fail);
+  background: #ff6b5e12;
+}
+.gate-banner.error .gate-reason { color: var(--fail); }
+
+.gate-detail {
+  margin: 0;
+  font: 11px/1.45 var(--mono);
+  color: var(--dim);
+  background: #00000038;
+  border: 1px solid var(--line);
+  border-radius: 3px;
+  padding: 6px 8px;
+  max-height: 168px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 
 /* ── queue ────────────────────────────────────────────────────────────── */
 
@@ -205,6 +232,8 @@ main {
 .btn.danger { color: var(--fail); border-color: #6b2d28; }
 .btn.ghost { border-color: transparent; background: transparent; color: var(--dim); padding: 4px 5px; min-height: 0; }
 .btn.ghost:hover { color: var(--text); border-color: var(--line-strong); }
+.btn.accent { color: var(--run); border-color: #2d5b3b; }
+.btn.accent:hover { border-color: var(--run); box-shadow: 0 0 0 1px #52d27322; }
 
 .lane-actions { display: flex; gap: 6px; flex-wrap: wrap; }
 

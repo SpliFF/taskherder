@@ -221,6 +221,52 @@ test('serve: GET /diff returns a lane branch diff for review; missing lane is a 
   assert.equal((await api('GET', `/api/projects/${id}/diff?lane=feat`, null, null)).status, 401);
 });
 
+test('serve: RUN fires one lane in the serve process; force overrides pause', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await addStep(repo, 'main', { type: 'command', task: 'echo hi' });
+  await addStep(repo, 'main', { type: 'command', task: 'echo again' });
+
+  const { console_, api } = await startServer();
+  t.after(() => console_.close());
+  const id = repoId(repo);
+
+  const untilStep = async (index, status, timeout = 5000) => {
+    const start = Date.now();
+    // eslint-disable-next-line no-await-in-loop
+    while ((await loadLane(repo, 'main')).steps[index].status !== status) {
+      if (Date.now() - start > timeout) throw new Error(`step ${index} never became ${status}`);
+      // eslint-disable-next-line no-await-in-loop
+      await new Promise((r) => { setTimeout(r, 20); });
+    }
+  };
+
+  // RUN the lane now; the command is quick, so it starts running (or finishes)
+  // and the response reports which — never blocking the HTTP call on the step.
+  const run = await api('POST', `/api/projects/${id}/run`, { lane: 'main' });
+  assert.equal(run.status, 200);
+  assert.ok(['running', 'ran'].includes(run.body.outcome), `unexpected outcome ${run.body.outcome}`);
+  await untilStep(0, 'done');
+  assert.equal((await loadLane(repo, 'main')).cursor, 1);
+
+  // A missing lane is reported (200 + reason), never a crash.
+  const missing = await api('POST', `/api/projects/${id}/run`, { lane: 'ghost' });
+  assert.equal(missing.status, 200);
+  assert.equal(missing.body.outcome, 'not-runnable');
+  assert.match(missing.body.reason, /no such lane/);
+
+  // Paused: a plain RUN skips; force overrides for this one run.
+  await api('POST', `/api/projects/${id}/pause`, {});
+  const paused = await api('POST', `/api/projects/${id}/run`, { lane: 'main' });
+  assert.equal(paused.body.outcome, 'paused');
+  assert.equal((await loadLane(repo, 'main')).steps[1].status, 'pending', 'nothing ran while paused');
+
+  const forced = await api('POST', `/api/projects/${id}/run`, { lane: 'main', force: true });
+  assert.ok(['running', 'ran'].includes(forced.body.outcome));
+  await untilStep(1, 'done');
+  assert.ok(existsSync(pausedFile(repo)), 'force leaves the pause switch itself in place');
+});
+
 test('serve: answer a gate + edit the queue + pause through the API (the phone flow)', async (t) => {
   const { repo, cleanup } = await makeRepo();
   t.after(cleanup);

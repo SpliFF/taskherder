@@ -110,6 +110,36 @@ export function formatDuration(ms) {
   return `${ms}ms`;
 }
 
+// How much trailing pty output to keep for the failure excerpt (DESIGN §1/§6:
+// a parked failure must carry the *actual* error, e.g. a provider 429, not just
+// "exit N — see log"). Small: the operative error is at the very end.
+const TAIL_MAX_BYTES = 8 * 1024;
+// CSI sequences (colors/cursor moves), the two-char escapes, and OSC title
+// strings — the escape noise a TUI provider (claude/codex) paints around its
+// text. Hex escapes keep this source free of literal control bytes.
+const ANSI_RE = /\x1b\[[0-9;?]*[ -/]*[@-~]|\x1b[=>]|\x1b\][^\x07]*(?:\x07|\x1b\\)/g;
+const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g; // strays after ANSI strip (keep \t)
+
+// Distill a human-readable error excerpt from raw pty output: honor carriage
+// returns (a spinner rewrites its line — keep only the final paint), strip ANSI
+// escapes and stray control bytes, drop blank lines, then keep the last few
+// lines capped to a banner-sized string. Returns null when nothing survives.
+export function extractErrorTail(raw, { maxLines = 12, maxChars = 800 } = {}) {
+  if (!raw) return null;
+  const lines = raw
+    .split('\n')
+    .map((l) => l
+      .replace(/^.*\r(?!$)/, '') // last carriage-return wins (progress/spinner overwrite)
+      .replace(ANSI_RE, '')
+      .replace(CTRL_RE, '')
+      .replace(/\s+$/, ''))
+    .filter((l) => l.trim() !== '');
+  if (lines.length === 0) return null;
+  let tail = lines.slice(-maxLines).join('\n');
+  if (tail.length > maxChars) tail = `…${tail.slice(-(maxChars - 1))}`;
+  return tail;
+}
+
 function shellArgv(step, runnerKind = 'local') {
   if (step.argv) return { file: step.argv[0], args: step.argv.slice(1) };
   // A `run` string on a docker/ssh runner is interpreted by a shell that exists
@@ -338,6 +368,12 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   // Trailing output kept for cost-JSON parsing (ai steps only, DESIGN §10).
   let costCapture = invocation.captureCost ? '' : null;
 
+  // Trailing output kept for the failure excerpt (all step types) — the tail is
+  // where the operative error lands (a provider 429, a stack trace, `exit N`'s
+  // preceding message). Surfaced on the parked gate so the console shows WHY a
+  // lane died, not just "exit N — see log" (DESIGN §1: no silent failures).
+  let tailBuf = '';
+
   // Ring buffer of recent output lines for late attach (DESIGN §13).
   const ring = [];
   let ringBytes = 0;
@@ -416,6 +452,8 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
       costCapture += data;
       if (costCapture.length > COST_CAPTURE_MAX) costCapture = costCapture.slice(-COST_CAPTURE_MAX);
     }
+    tailBuf += data;
+    if (tailBuf.length > TAIL_MAX_BYTES) tailBuf = tailBuf.slice(-TAIL_MAX_BYTES);
     const line = `${JSON.stringify({ ts: new Date().toISOString(), event: 'output', lane: lane.name, step: index, id, data: Buffer.from(data, 'utf8').toString('base64') })}\n`;
     pushRing(line);
     for (const socket of clients) socket.write(line);
@@ -479,6 +517,10 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   // isolation put the step on a taskherd/<lane> branch.
   const commit = isolation === 'none' ? null : await headCommit(workdir);
 
+  // On failure, distill the operative error from the captured tail so the
+  // parked gate can show it (DESIGN §1). Null on a clean run — nothing to say.
+  const errorTail = status === 'done' ? null : extractErrorTail(tailBuf);
+
   return {
     status,
     exitCode: timedOut || signal ? null : exitCode, // 0-from-a-signal is not a real exit code
@@ -491,5 +533,6 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     tokens,
     sessionId,
     commit,
+    errorTail,
   };
 }

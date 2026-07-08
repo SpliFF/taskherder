@@ -47,11 +47,13 @@ taskherd add dev --type ai --profile work "work the plan"
 # step). Wire this into cron or launchd to herd continuously:
 taskherd run
 #   crontab:  */10 * * * *  taskherd run -C /path/to/repo
+taskherd run --lane dev  # or `-l dev`: manually fire ONE step of a specific lane
+taskherd run -l dev --force   # override a PAUSE for this one manual run
 
 taskherd status          # lanes, last result, open gates, cost
 taskherd ack ci          # answer the manual gate → the lane advances / lands
 taskherd diff dev        # review what the agent committed to taskherd/dev
-taskherd serve           # open the web console (live terminals, gates, queue)
+taskherd serve           # web console: live terminals, gates, queue, per-lane RUN
 ```
 
 The scheduler is a **one-shot**: each fire runs a single step and exits, so a

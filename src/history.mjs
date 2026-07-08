@@ -46,12 +46,29 @@ export async function statusData(repo) {
     // Lane files aren't rewritten mid-run; a live control socket is the signal
     // that this lane's step is executing right now (DESIGN §13).
     const running = existsSync(runSocketLink(repo, lane.name));
+    // Classify why a lane is blocked so the console can tell an *error* (a step
+    // that crashed/timed out) from an intentional gate (a manual sign-off, a
+    // land review, a budget cap) — the error gets a red banner, the rest amber.
+    // `gateDetail` carries the distilled failure output for the error case.
     let gate = null;
+    let gateKind = null;
+    let gateDetail = null;
     if (lane.status === 'blocked') {
       const step = lane.steps[lane.cursor];
-      gate = step
-        ? (step.type === 'manual' ? step.message : (step.parkedReason || 'failed, parked for review'))
-        : (lane.budgetBlock || 'blocked');
+      if (lane.budgetBlock) {
+        gateKind = 'budget';
+        gate = lane.budgetBlock;
+      } else if (step && step.status === 'failed') {
+        gateKind = 'failure';
+        gate = step.parkedReason || 'failed, parked for review';
+        gateDetail = step.error || null;
+      } else if (step && step.type === 'manual') {
+        gateKind = step.land ? 'land' : 'manual';
+        gate = step.message;
+      } else {
+        gateKind = 'blocked';
+        gate = (step && step.parkedReason) || 'blocked';
+      }
     }
     return {
       name: lane.name,
@@ -60,6 +77,8 @@ export async function statusData(repo) {
       status: running ? 'running' : lane.status,
       running,
       gate,
+      gateKind,
+      gateDetail,
       onEmpty: lane.onEmpty || null,
       default: lane.default || null,
       steps: (lane.steps || []).map((s) => ({
@@ -67,6 +86,7 @@ export async function statusData(repo) {
         status: s.status,
         summary: s.type === 'manual' ? s.message : (s.task || s.run || s.file || (s.argv || []).join(' ') || ''),
         ...(s.parkedReason ? { parkedReason: s.parkedReason } : {}),
+        ...(s.error ? { error: s.error } : {}),
         ...(s.land ? { land: s.land } : {}),
       })),
       last: last ? { result: lastResultLabel(last), ts: last.ts } : null,

@@ -24,7 +24,7 @@ import { WebSocket, WebSocketServer } from 'ws';
 import pty from 'node-pty';
 
 import {
-  taskherdHome, repoTasksDir, pausedFile, eventsFile, runSocketPath,
+  taskherdHome, repoTasksDir, pausedFile, eventsFile, runSocketPath, runSocketLink,
 } from './paths.mjs';
 import { loadProjects } from './registry.mjs';
 import { statusData } from './history.mjs';
@@ -33,6 +33,7 @@ import {
   resolveRunner, shellInvocation, graphicalEndpoint, loadRunners,
 } from './runners.mjs';
 import { ensureSpawnHelperExecutable } from './executor.mjs';
+import { tick } from './scheduler.mjs';
 import {
   ackLane, addStep, forkLane, removeStep, moveStep, editStep, validateLaneName, LaneValidationError,
 } from './tasks.mjs';
@@ -181,6 +182,40 @@ function sendControl(repo, lane, msg) {
 
 const CONTROL_SIGNALS = new Set(['SIGINT', 'SIGTERM', 'SIGKILL', 'SIGHUP']);
 
+const delay = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
+
+// Fire the scheduler for ONE lane from the console (the RUN button). DESIGN §3
+// sanctions the executor running "in the serve process", but a step can take
+// many minutes, so we must NOT hold the HTTP response open for it. Kick off the
+// tick and race it against the lane's control socket appearing: once the step
+// spawns we answer "running" and let it finish in the background (surfaced live
+// through events + attach, exactly like a cron fire); if the tick settles first
+// — not-runnable / paused / locked / an instant command — we return that
+// outcome so the operator gets the real reason. The lane mutex still prevents a
+// double-run, so a RUN on an already-running lane just returns 'locked'.
+async function startLaneRun(repo, lane, force) {
+  validateLaneName(lane);
+  let settled = false;
+  const runPromise = tick(repo, { lane, force });
+  // Detach it so an unexpected throw can't crash serve; tick already parks
+  // setup errors, so this only catches the truly unforeseen (DESIGN §1).
+  runPromise.catch((err) => console.error(`taskherd: serve run of lane '${lane}' failed: ${err.message}`));
+
+  const outcome = await Promise.race([
+    runPromise.then((result) => { settled = true; return { result }; }),
+    (async () => {
+      const start = Date.now();
+      while (!settled) {
+        if (existsSync(runSocketLink(repo, lane))) return { started: true };
+        if (Date.now() - start > 15_000) return { started: false };
+        await delay(25);
+      }
+      return null; // the tick settled first; its branch wins the race
+    })(),
+  ]);
+  return outcome?.result ? { ok: true, ...outcome.result } : { ok: true, outcome: 'running' };
+}
+
 // POST /api/projects/:id/<action> — every mutation goes through the same
 // shared tasks.mjs operations as the CLI and MCP (DESIGN §3).
 async function handleAction(repo, action, body) {
@@ -227,6 +262,10 @@ async function handleAction(repo, action, body) {
     case 'input':
       await sendControl(repo, requireStr(body, 'lane'), { type: 'input', data: String(body.data ?? '') });
       return { ok: true };
+    case 'run':
+      // Manual one-lane fire (§18 run, from the console). `force` overrides a
+      // PAUSE for this run only — the caller opted in (a confirm in the SPA).
+      return startLaneRun(repo, requireStr(body, 'lane'), Boolean(body.force));
     default:
       throw new LaneValidationError(`unknown action '${action}'`);
   }

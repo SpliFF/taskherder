@@ -5,6 +5,29 @@ based on [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/). Pre-1.0: minor versions may include breaking
 changes.
 
+## 0.1.2 — 2026-07-08
+
+### Added
+- **Manual per-lane runs.** `taskherd run --lane <name>` (`-l`) fires ONE step of
+  a specific lane on demand instead of the fair-picked one — for iterating on a
+  lane without waiting for the next cron fire. Every guardrail (pause, the
+  per-repo mutex, gate/budget/retry-park) is identical to a normal fire; only the
+  pick is narrowed. When the lane has nothing to run it reports why
+  (blocked / idle / missing) with an `ack` hint, never a silent no-op.
+- **`taskherd run --force` (`-f`)** overrides a `PAUSE` for a single manual run
+  (the §12 kill-switch itself is left in place); the override is logged loudly.
+- **Web console: a per-lane RUN button.** Fires the lane's next step in the serve
+  process (DESIGN §3) and streams it live like a cron fire — the response never
+  blocks on a long step. A paused herd offers a force-run confirm.
+
+### Fixed
+- **Web console: a failed step now surfaces its error.** A step that crashes,
+  times out, or hits a provider limit (e.g. a Fable/Claude 429) parks the lane
+  with a **red error banner at the top of the lane** carrying the actual message
+  (distilled from the run's output), visually distinct from an intentional amber
+  gate. Previously a failure rendered identically to a manual gate and the error
+  text was never shown — only "exit N, see log".
+
 ## 0.1.1 — 2026-07-05
 
 ### Fixed

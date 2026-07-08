@@ -9,7 +9,7 @@ import { tick } from '../src/scheduler.mjs';
 import {
   needsAttentionFile, pausedFile, lockDir, lockPidFile, laneFile,
 } from '../src/paths.mjs';
-import { readHistory } from '../src/history.mjs';
+import { readHistory, statusData } from '../src/history.mjs';
 import { makeRepo, installFakeClaude } from './helpers.mjs';
 
 const FAKE_CLAUDE = `#!/bin/sh
@@ -105,6 +105,99 @@ test('a failing command step retries once, then parks the lane as a gate', async
 
   const third = await tick(repo);
   assert.equal(third.outcome, 'idle', 'parked lane is not runnable until acked');
+});
+
+test('a parked failure surfaces the error tail as a red failure gate', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+
+  const lane = newLane('main');
+  // A step that dies with an identifiable message on its way out — the console
+  // must show WHY (the message), not just the exit code.
+  lane.steps.push({ type: 'command', run: 'echo "reached your Fable 5 limit" >&2; exit 7', status: 'pending' });
+  await saveLane(repo, lane);
+
+  await tick(repo); // fail -> retry
+  await tick(repo); // fail -> parked
+
+  const reloaded = await loadLane(repo, 'main');
+  assert.equal(reloaded.steps[0].status, 'failed');
+  assert.equal(reloaded.status, 'blocked');
+  assert.match(reloaded.steps[0].error, /reached your Fable 5 limit/, 'the operative error persisted on the step');
+
+  // What the console reads: a failure-kind gate carrying the distilled error.
+  const { lanes } = await statusData(repo);
+  const main = lanes.find((l) => l.name === 'main');
+  assert.equal(main.gateKind, 'failure');
+  assert.match(main.gate, /exit 7/);
+  assert.match(main.gateDetail, /reached your Fable 5 limit/);
+
+  // ack re-queues the step and clears the surfaced error with it.
+  await ackLane(repo, 'main');
+  const acked = await loadLane(repo, 'main');
+  assert.equal(acked.steps[0].status, 'pending');
+  assert.equal(acked.steps[0].error, undefined, 'the error clears on retry');
+});
+
+test('run --lane targets one lane even when another would fair-pick first', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+
+  // Both lanes are runnable and un-run (lastRun 0); a bare tick fair-picks
+  // 'alpha' (alphabetical tie-break). Targeting 'beta' must override that.
+  const a = newLane('alpha');
+  a.steps.push({ type: 'command', run: 'echo a', status: 'pending' });
+  await saveLane(repo, a);
+  const b = newLane('beta');
+  b.steps.push({ type: 'command', run: 'echo b', status: 'pending' });
+  await saveLane(repo, b);
+
+  const result = await tick(repo, { lane: 'beta' });
+  assert.equal(result.outcome, 'ran');
+  assert.equal(result.lane, 'beta');
+
+  assert.equal((await loadLane(repo, 'alpha')).steps[0].status, 'pending', 'the untargeted lane did not run');
+  assert.equal((await loadLane(repo, 'beta')).steps[0].status, 'done', 'the targeted lane advanced');
+});
+
+test('run --lane reports why a lane is not runnable (missing / idle / blocked)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+
+  const missing = await tick(repo, { lane: 'ghost' });
+  assert.equal(missing.outcome, 'not-runnable');
+  assert.match(missing.reason, /no such lane/);
+
+  const idle = newLane('idle-lane'); // empty queue, no recurring default
+  await saveLane(repo, idle);
+  const idleRes = await tick(repo, { lane: 'idle-lane' });
+  assert.equal(idleRes.outcome, 'not-runnable');
+  assert.match(idleRes.reason, /nothing queued/);
+
+  const gated = newLane('gated');
+  gated.steps.push({ type: 'manual', message: 'sign off', status: 'pending' });
+  await saveLane(repo, gated);
+  const gatedRes = await tick(repo, { lane: 'gated' }); // scan blocks the gate, then it is not runnable
+  assert.equal(gatedRes.outcome, 'not-runnable');
+  assert.match(gatedRes.reason, /blocked on a gate/);
+});
+
+test('run --force overrides PAUSE for a single manual run', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+
+  const lane = newLane('main');
+  lane.steps.push({ type: 'command', run: 'echo hi', status: 'pending' });
+  await saveLane(repo, lane);
+  await writeFile(pausedFile(repo), 'paused\n');
+
+  assert.equal((await tick(repo, { lane: 'main' })).outcome, 'paused', 'a paused herd skips by default');
+  assert.equal((await loadLane(repo, 'main')).steps[0].status, 'pending', 'nothing ran while paused');
+
+  const forced = await tick(repo, { lane: 'main', force: true });
+  assert.equal(forced.outcome, 'ran');
+  assert.equal((await loadLane(repo, 'main')).steps[0].status, 'done', 'force ran the step despite PAUSE');
+  assert.ok(existsSync(pausedFile(repo)), 'the pause switch itself is left in place');
 });
 
 test('mutex: concurrent ticks on the same repo, only one runs', async (t) => {

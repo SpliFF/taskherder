@@ -80,6 +80,29 @@ function scheduleRefresh() {
 
 const GLYPH = { done: '✓', failed: '✗', blocked: '◆', pending: '·', running: '▸' };
 
+// The block banner at the top of a lane. A `failure` (a step that crashed,
+// timed out, or hit a provider limit) reads as a RED error carrying the actual
+// message; an intentional gate (manual sign-off, land review, budget cap) stays
+// amber. `gateDetail` is the distilled tail of the failed run's output.
+function gateBannerHtml(lane) {
+  if (!lane.gate) return '';
+  const kind = lane.gateKind || 'manual';
+  const failed = kind === 'failure';
+  const label = { failure: '✗ FAILED', budget: '$ BUDGET', land: '◆ LAND', manual: '◆ GATE', blocked: '◆ BLOCKED' }[kind] || '◆ GATE';
+  const detail = failed && lane.gateDetail
+    ? `<pre class="gate-detail">${esc(lane.gateDetail)}</pre>` : '';
+  const btn = failed
+    ? `<button class="btn danger" title="Clear the failure and re-queue this step (it runs again on the next fire)" data-action="ack" data-lane="${esc(lane.name)}">RETRY</button>`
+    : `<button class="btn primary" title="Approve this gate — the lane continues on the next run" data-action="ack" data-lane="${esc(lane.name)}">ACK</button>`;
+  return `<div class="gate-banner ${failed ? 'error' : ''}">
+    <div class="gate-text">
+      <span class="gate-reason"><span class="gate-label">${label}</span> ${esc(lane.gate)}</span>
+      ${detail}
+    </div>
+    ${btn}
+  </div>`;
+}
+
 function laneHtml(p, lane) {
   const running = lane.running;
   const editableFrom = lane.cursor + (running ? 1 : 0);
@@ -101,23 +124,23 @@ function laneHtml(p, lane) {
     </li>`;
   }).join('');
 
-  return `<article class="lane ${running ? 'is-running' : ''} ${lane.gate ? 'is-blocked' : ''}">
+  const failed = lane.gateKind === 'failure';
+
+  return `<article class="lane ${running ? 'is-running' : ''} ${lane.gate ? 'is-blocked' : ''} ${failed ? 'is-failed' : ''}">
     <div class="lane-head">
-      <span class="dot ${running ? 'running' : (lane.gate ? 'blocked' : 'idle')}">●</span>
+      <span class="dot ${running ? 'running' : (failed ? 'failed' : (lane.gate ? 'blocked' : 'idle'))}">●</span>
       <span class="lane-name">${esc(lane.name)}</span>
       ${lane.parent ? `<span class="lane-parent">⑂ ${esc(lane.parent)}</span>` : ''}
-      <span class="lane-meta">[${lane.cursor}/${lane.steps.length}] ${esc(lane.status)}${lane.spent ? ` · $${lane.spent.toFixed(2)}` : ''}</span>
+      <span class="lane-meta">[${lane.cursor}/${lane.steps.length}] ${esc(failed ? 'failed' : lane.status)}${lane.spent ? ` · $${lane.spent.toFixed(2)}` : ''}</span>
     </div>
-    ${lane.gate ? `<div class="gate-banner">
-      <span class="gate-reason">◆ ${esc(lane.gate)}</span>
-      <button class="btn primary" title="Approve this gate — the lane continues on the next run" data-action="ack" data-lane="${esc(lane.name)}">ACK</button>
-    </div>` : ''}
+    ${gateBannerHtml(lane)}
     ${steps ? `<ul class="steps">${steps}</ul>` : ''}
     ${lane.onEmpty === 'default' && lane.default ? `<div class="lane-default">${esc(lane.default.task || lane.default.run || 'default')} <span class="step-type">(${esc(lane.default.type || 'ai')} · recurring)</span></div>` : ''}
     <div class="lane-actions">
       ${running ? `
         <button class="btn" title="Watch the running step's live terminal" data-action="attach" data-project="${esc(p.id)}" data-lane="${esc(lane.name)}">ATTACH</button>
-        <button class="btn warn" title="Send SIGINT (Ctrl-C) to the running step" data-action="interrupt" data-lane="${esc(lane.name)}">INTERRUPT</button>` : ''}
+        <button class="btn warn" title="Send SIGINT (Ctrl-C) to the running step" data-action="interrupt" data-lane="${esc(lane.name)}">INTERRUPT</button>`
+    : `<button class="btn accent" title="Run this lane's next step now (a manual one-lane fire)" data-action="run" data-lane="${esc(lane.name)}">▸ RUN</button>`}
       <button class="btn ghost" title="Review this lane's branch diff before landing (worktree/inplace lanes)" data-action="diff" data-lane="${esc(lane.name)}">DIFF</button>
       <button class="btn ghost" title="Create a new sibling lane branched from this one" data-action="fork" data-lane="${esc(lane.name)}">FORK</button>
     </div>
@@ -175,6 +198,28 @@ async function act(id, action, body, okMsg) {
   }
 }
 
+// Manually fire one lane's next step (the RUN button). The run happens in the
+// serve process and streams live like a cron fire; the response tells us how it
+// started so we can toast the real outcome. A paused herd offers a force retry.
+async function runLane(id, lane, force = false) {
+  try {
+    const res = await api(`/api/projects/${encodeURIComponent(id)}/run`, { lane, force });
+    const o = res.outcome;
+    if (o === 'running') toast('ok', `▸ ${lane}: running`);
+    else if (o === 'ran') toast('ok', `▸ ${lane}: step ${res.step} → ${res.result}`);
+    else if (o === 'not-runnable') toast('gate', `${lane}: ${res.reason}`, 7000);
+    else if (o === 'locked') toast('gate', `${lane}: a run is already in progress`);
+    else if (o === 'idle') toast('gate', `${lane}: nothing runnable`);
+    else if (o === 'paused') {
+      // eslint-disable-next-line no-alert
+      if (confirm(`The herd is paused. Force-run '${lane}' this once anyway?`)) { await runLane(id, lane, true); return; }
+    } else toast('ok', `${lane}: ${o || 'ok'}`);
+    scheduleRefresh();
+  } catch (err) {
+    if (err.message !== 'unauthorized') toast('error', err.message);
+  }
+}
+
 app.addEventListener('click', (e) => {
   const btn = e.target.closest('button[data-action]');
   if (!btn || btn.disabled) return;
@@ -182,6 +227,7 @@ app.addEventListener('click', (e) => {
   const { action, lane } = btn.dataset;
   const idx = btn.dataset.idx != null ? Number(btn.dataset.idx) : null;
   if (action === 'ack') act(id, 'ack', { lane }, `acked ${lane}`);
+  else if (action === 'run') runLane(id, lane);
   else if (action === 'pause') act(id, 'pause', {}, 'paused');
   else if (action === 'resume') act(id, 'resume', {}, 'resumed');
   else if (action === 'interrupt') act(id, 'signal', { lane, signal: 'SIGINT' }, `SIGINT → ${lane}`);
@@ -249,7 +295,10 @@ function openEventSocket(id) {
   ws.onmessage = (e) => {
     try {
       const ev = JSON.parse(e.data);
-      if (ev.event === 'gate.blocked') toast('gate', `◆ ${ev.lane}: ${ev.reason || 'blocked'}`, 8000);
+      if (ev.event === 'gate.blocked') {
+        const err = ev.kind === 'failure';
+        toast(err ? 'error' : 'gate', `${err ? '✗' : '◆'} ${ev.lane}: ${ev.reason || 'blocked'}`, 8000);
+      }
       if (ev.event === 'run.exit') toast('ok', `${ev.lane} exited (${ev.code === 0 ? 'ok' : `code ${ev.code}`})`);
     } catch { /* poke only */ }
     scheduleRefresh();

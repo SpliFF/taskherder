@@ -79,14 +79,23 @@ async function cmdInit(argv) {
   console.log(`taskherd: initialized ${repoTasksDir(repo)}`);
 }
 
+// taskherd run [-C repo | <repo>] [--lane <name>] [--force] — fire the
+// scheduler once. Bare = the cron entrypoint: fair-pick one runnable lane
+// across the repo. --lane <name> = a manual, one-lane run: advance just that
+// lane's next step (same lock/gate/budget guards). --force overrides a PAUSE
+// (the §12 kill-switch) for this one manual run. `<repo>` keeps the cron form.
 async function cmdRun(argv) {
-  const { values, positionals } = parseRepoOnly(argv);
+  const { values, positionals } = parseRepoOnly(argv, {
+    lane: { type: 'string', short: 'l' },
+    force: { type: 'boolean', short: 'f', default: false },
+  });
   const { repo } = resolveRepo(values.repo, positionals, { laneless: true });
-  const result = await tick(repo);
+  const result = await tick(repo, { lane: values.lane || null, force: values.force });
   switch (result.outcome) {
-    case 'paused': console.log('taskherd: paused, skipping'); break;
+    case 'paused': console.log('taskherd: paused, skipping (`taskherd resume`, or `run --force` for one run)'); break;
     case 'no-tasks-dir': console.log(`taskherd: no .tasks/ in ${repo} — run \`taskherd init\` first`); break;
     case 'locked': console.log('taskherd: another run in progress, skipping'); break;
+    case 'not-runnable': console.log(`taskherd: lane '${result.lane}' not runnable — ${result.reason}`); break;
     case 'idle': console.log(`taskherd: nothing runnable (${result.lanes} lane(s))`); break;
     case 'ran': console.log(`taskherd: ran ${result.lane}#${result.step} -> ${result.result}`); break;
     default: console.log(`taskherd: ${result.outcome}`);

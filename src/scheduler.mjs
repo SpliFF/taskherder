@@ -196,9 +196,39 @@ function fairPick(candidates) {
   })[0];
 }
 
-export async function tick(repo) {
-  if (existsSync(pausedFile(repo))) {
+// Why a targeted lane (`taskherd run --lane X`) had nothing to run this fire —
+// so a manual, one-lane run reports the actual cause (blocked/idle/missing)
+// instead of a bare "nothing happened". `lanes`/`unloadable` are the freshest
+// post-scan snapshot; `fallback` resolves an idle lane's onEmpty action.
+function explainLaneUnrunnable(name, lanes, unloadable, fallback) {
+  const bad = unloadable.find((u) => u.name === name);
+  if (bad) return `its lane file is unloadable: ${bad.error}`;
+  const lane = lanes.find((l) => l.name === name);
+  if (!lane) return 'no such lane';
+  if (lane.status === 'blocked') {
+    const step = lane.steps[lane.cursor];
+    if (lane.budgetBlock) return `blocked on budget (${lane.budgetBlock}) — raise the cap or \`taskherd ack ${name}\``;
+    if (step && step.status === 'failed') return `parked on a failure — \`taskherd ack ${name}\` to retry`;
+    return `blocked on a gate — \`taskherd ack ${name}\` to continue`;
+  }
+  const action = nextAction(lane, fallback);
+  if (action.kind === 'idle') return 'nothing queued to run';
+  return 'skipped this fire (most likely a daily budget cap)';
+}
+
+// A normal fire (no `lane`) fair-picks one runnable lane across the repo; a
+// targeted fire (`{ lane }`, the CLI's `run --lane X`) narrows the pick to that
+// one lane's next step. Every guardrail — pause, the per-repo mutex, gate and
+// budget checks, retry/park — is identical either way; only the pick differs.
+export async function tick(repo, { lane: targetLane = null, force = false } = {}) {
+  const paused = existsSync(pausedFile(repo));
+  if (paused && !force) {
     return { outcome: 'paused' };
+  }
+  if (paused && force) {
+    // The pause switch is a §12 kill-switch; overriding it is a deliberate
+    // manual act (a console RUN / `run --force`) and must be loud + greppable.
+    console.error(`taskherd: WARNING --force overriding PAUSE for ${targetLane ? `lane '${targetLane}'` : repo} — running while the herd is paused (DESIGN §12)`);
   }
   if (!existsSync(repoTasksDir(repo))) {
     return { outcome: 'no-tasks-dir' };
@@ -240,6 +270,20 @@ export async function tick(repo) {
       } catch (err) {
         console.error(`taskherd: configured default step is invalid, not running it: ${err.message}`);
       }
+    }
+
+    // Targeted manual run: keep only the named lane's candidate. If it isn't
+    // runnable, say why (blocked/idle/missing) rather than a generic 'idle'.
+    if (targetLane) {
+      const chosen = runnable.filter((entry) => entry.lane.name === targetLane);
+      if (chosen.length === 0) {
+        return {
+          outcome: 'not-runnable',
+          lane: targetLane,
+          reason: explainLaneUnrunnable(targetLane, attention.lanes, attention.unloadable, fallback),
+        };
+      }
+      runnable = chosen;
     }
 
     if (runnable.length === 0) {
@@ -294,9 +338,14 @@ export async function tick(repo) {
           } else {
             freshStep.status = 'failed';
             freshStep.parkedReason = describeFailure(result);
+            // The distilled tail of the run's output (a provider 429, a stack
+            // trace) — the console surfaces this so a human sees WHY it died,
+            // not just the exit code. Absent on a setup error (never spawned).
+            if (result.errorTail) freshStep.error = result.errorTail;
+            else delete freshStep.error;
             fresh.status = 'blocked';
             await appendEvent(repo, {
-              event: 'gate.blocked', lane: fresh.name, step: action.index, reason: freshStep.parkedReason,
+              event: 'gate.blocked', kind: 'failure', lane: fresh.name, step: action.index, reason: freshStep.parkedReason,
             });
           }
         }
