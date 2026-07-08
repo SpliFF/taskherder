@@ -307,8 +307,10 @@ export function parseWhen(rule) {
   return rule;
 }
 
-// Compact human string for a rule (status/ETA surfacing).
-function describeWhen(rule) {
+// Compact human string for a rule (status/ETA surfacing + the console `when`
+// chip). Exported so history.mjs can label a step's rule in one place rather
+// than re-deriving it client-side.
+export function describeWhen(rule) {
   const [key] = Object.keys(rule);
   const val = rule[key];
   if (key === 'all' || key === 'any') return `${key}(${val.map(describeWhen).join(', ')})`;

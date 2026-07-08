@@ -2,7 +2,7 @@
 import { appendFile, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { historyFile, runSocketLink } from './paths.mjs';
-import { loadAllLanesResilient, computeWaiting } from './tasks.mjs';
+import { loadAllLanesResilient, computeWaiting, describeWhen } from './tasks.mjs';
 
 export async function appendHistory(repo, record) {
   await appendFile(historyFile(repo), `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`);
@@ -97,7 +97,9 @@ export async function statusData(repo) {
         summary: s.type === 'manual' ? s.message : (s.task || s.run || s.file || (s.argv || []).join(' ') || ''),
         ...(s.id ? { id: s.id } : {}),
         ...(s.waitsFor ? { waitsFor: s.waitsFor } : {}),
-        ...(s.when ? { when: s.when } : {}),
+        // The raw `when` (for a tooltip) + a compact one-line label (§23) so the
+        // console can render a schedule chip without re-deriving the rule text.
+        ...(s.when ? { when: s.when, whenLabel: describeWhen(s.when) } : {}),
         ...(s.parkedReason ? { parkedReason: s.parkedReason } : {}),
         ...(s.error ? { error: s.error } : {}),
         ...(s.land ? { land: s.land } : {}),

@@ -167,6 +167,28 @@ test('taskherd-mcp: §16 tool surface round-trip (no tasks_run)', async (t) => {
   const webLane = await loadLane(repo, 'web');
   assert.deepEqual(webLane.steps.at(-1).waitsFor, ['grammar:U2']);
 
+  // tasks_add also carries a `when` rule tree end-to-end (§23): an agent can
+  // schedule a step to a time/date window, stored raw for hand-editing.
+  await client.callTool({
+    name: 'tasks_add',
+    arguments: {
+      lane: 'nightly', type: 'command', task: 'echo build',
+      when: { window: { after: '09:00', before: '17:00', days: 'Mon-Fri' } },
+    },
+  });
+  const nightly = await loadLane(repo, 'nightly');
+  assert.deepEqual(nightly.steps.at(-1).when, { window: { after: '09:00', before: '17:00', days: 'Mon-Fri' } });
+
+  // An unimplemented leaf (Phase 2+) is refused LOUDLY at add time, not silently
+  // skipped (DESIGN §1/§23) — surfaced to the agent as isError text.
+  const badWhen = await client.callTool({
+    name: 'tasks_add',
+    arguments: { lane: 'nightly', type: 'command', task: 'echo x', when: { exit: { run: './probe.sh', equals: 0 } } },
+  });
+  assert.equal(badWhen.isError, true);
+  assert.match(badWhen.content[0].text, /not implemented yet/);
+  assert.equal((await loadLane(repo, 'nightly')).steps.length, 1, 'the refused step is not persisted');
+
   // fork: sibling lane with parent + seed step.
   const fork = await client.callTool({
     name: 'tasks_fork',

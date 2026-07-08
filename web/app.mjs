@@ -111,10 +111,16 @@ function gateBannerHtml(lane) {
 function waitBannerHtml(lane) {
   if (!lane.waiting?.length) return '';
   const refs = lane.waiting.map((r) => `<code>${esc(r)}</code>`).join(', ');
+  // A window wait (DESIGN §23) opens on a clock — say so instead of the
+  // dep-specific "lands"; a dep wait clears when the prerequisite finishes.
+  const isWindow = lane.waiting.some((r) => /^window/.test(r));
+  const note = isWindow
+    ? 'opens on schedule — no action needed'
+    : 'clears when the dependency lands — no action needed';
   return `<div class="wait-banner">
     <span class="wait-label">⧗ WAITING</span>
     <span class="wait-refs">on ${refs}</span>
-    <span class="wait-note">clears when the dependency lands — no action needed</span>
+    <span class="wait-note">${note}</span>
   </div>`;
 }
 
@@ -133,6 +139,10 @@ function laneHtml(p, lane) {
     const idChip = s.id ? `<span class="step-id" title="step label — other lanes can wait on this (waitsFor target)">#${esc(s.id)}</span>` : '';
     const waitsChip = s.waitsFor?.length
       ? `<span class="step-waits" title="won't run until these land: ${esc(s.waitsFor.join(', '))}">⧗ ${esc(s.waitsFor.join(', '))}</span>` : '';
+    // A `when` schedule chip (DESIGN §23): advertises a time/date-window or rule
+    // gate on a queued step even before its lane is actively waiting on it.
+    const whenChip = s.whenLabel
+      ? `<span class="step-when" title="only runs when: ${esc(s.whenLabel)}">⏰ ${esc(s.whenLabel)}</span>` : '';
     const tools = (i >= editableFrom && s.status === 'pending') ? `
       <span class="step-tools">
         <button class="btn ghost" title="Move this step earlier in the queue" data-action="step-up" data-lane="${esc(lane.name)}" data-idx="${i}" ${i <= editableFrom ? 'disabled' : ''}>↑</button>
@@ -144,7 +154,7 @@ function laneHtml(p, lane) {
       <span class="step-idx">${i}</span>
       <span class="step-glyph">${glyph}</span>
       <span class="step-text">${esc(s.summary)}</span>
-      ${idChip}${waitsChip}
+      ${idChip}${waitsChip}${whenChip}
       <span class="step-type">${esc(s.type)}</span>${tools}
     </li>`;
   }).join('');

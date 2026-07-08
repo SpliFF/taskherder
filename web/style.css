@@ -230,14 +230,16 @@ main {
 .step-type { color: var(--faint); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; flex: none; }
 .step-tools { display: flex; gap: 2px; flex: none; }
 
-/* Dependency chips on a step: `#id` (a waitsFor target) and `⧗ refs` (what this
-   step waits on). Small, monospace, non-shrinking so they read as metadata. */
-.step-id, .step-waits {
+/* Dependency chips on a step: `#id` (a waitsFor target), `⧗ refs` (what this
+   step waits on) and `⏰ when` (a §23 time/date/rule schedule gate). Small,
+   monospace, non-shrinking so they read as metadata. */
+.step-id, .step-waits, .step-when {
   font-size: 10px; flex: none; border-radius: 3px; padding: 0 4px;
   border: 1px solid var(--line-strong);
 }
 .step-id { color: var(--dim); letter-spacing: 0.04em; }
 .step-waits { color: var(--wait); border-color: #2b5560; overflow-wrap: anywhere; }
+.step-when { color: var(--wait); border-color: #2b5560; overflow-wrap: anywhere; }
 
 .lane-default { color: var(--dim); font-size: 11px; padding: 4px 0; }
 .lane-default::before { content: "↻ "; color: var(--faint); }

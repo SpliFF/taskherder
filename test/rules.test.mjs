@@ -170,6 +170,10 @@ test('scheduler: a window-gated step soft-skips while closed, runs when open (DE
   assert.equal(lane1.status, 'waiting');
   assert.equal(lane1.steps[0].status, 'pending');
   assert.match(lane1.waiting[0], /window/);
+  // The snapshot advertises the step's rule for the console `when` chip (§23):
+  // raw `when` for a tooltip + a compact `whenLabel`.
+  assert.deepEqual(lane1.steps[0].when, { window: { from: '2999-01-01' } });
+  assert.equal(lane1.steps[0].whenLabel, 'window(from 2999-01-01)');
 
   // An always-open window (after 00:00 ⇒ min>=0 ⇒ always) runs immediately.
   const open = newLane('open');

@@ -246,6 +246,39 @@ test('serve: /api/projects carries the waitsFor state the console renders (§22)
   assert.equal(dep.waiting, null, 'a lane with nothing to wait on is not waiting');
 });
 
+test('serve: the add API accepts a `when` rule and the snapshot carries it (§23)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  const { console_, api } = await startServer();
+  t.after(() => console_.close());
+  const id = repoId(repo);
+
+  // The console's add form posts a raw step; a `when` rule tree flows straight
+  // through addStep→buildStep (the same builder the CLI/MCP use).
+  const added = await api('POST', `/api/projects/${id}/add`, {
+    lane: 'nightly',
+    step: { type: 'command', task: 'echo build', when: { window: { after: '09:00', before: '17:00', days: 'Mon-Fri' } } },
+  });
+  assert.equal(added.status, 200);
+  const lane = await loadLane(repo, 'nightly');
+  assert.deepEqual(lane.steps[0].when, { window: { after: '09:00', before: '17:00', days: 'Mon-Fri' } });
+
+  // /api/projects ships the raw `when` (tooltip) + the compact `whenLabel` the
+  // console renders as the ⏰ schedule chip.
+  const { body: state } = await api('GET', '/api/projects');
+  const step = state.projects.find((p) => p.id === id).lanes.find((l) => l.name === 'nightly').steps[0];
+  assert.deepEqual(step.when, { window: { after: '09:00', before: '17:00', days: 'Mon-Fri' } });
+  assert.equal(step.whenLabel, 'window(Mon-Fri 09:00-17:00)');
+
+  // A malformed / unimplemented rule is refused LOUDLY (400), never silently
+  // dropped (DESIGN §1/§23).
+  const bad = await api('POST', `/api/projects/${id}/add`, {
+    lane: 'nightly', step: { type: 'command', task: 'echo x', when: { http: { url: 'http://x' } } },
+  });
+  assert.equal(bad.status, 400);
+  assert.match(bad.body.error, /not implemented yet/);
+});
+
 test('serve: RUN fires one lane in the serve process; force overrides pause', async (t) => {
   const { repo, cleanup } = await makeRepo();
   t.after(cleanup);

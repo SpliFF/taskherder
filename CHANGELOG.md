@@ -5,6 +5,29 @@ based on [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/). Pre-1.0: minor versions may include breaking
 changes.
 
+## Unreleased
+
+### Added
+- **`when` rule engine — scheduled preconditions on a step (DESIGN §23).** A step
+  can carry an optional **`when`** boolean rule tree that gates when it may run,
+  evaluated every fire exactly like `waitsFor`: if the rule is unmet the step
+  **soft-skips** (no gate, no ack) and re-checks next fire, self-clearing the
+  instant the rule holds. Leaves: **`window`** (a time/date predicate — any of
+  `after`/`before` `HH:MM` incl. overnight wraparound, `days` weekday sets like
+  `"Mon-Fri"`, `from`/`until` absolute date bounds, `tz` `local`|`utc`) and
+  **`dep`** (identical to a `waitsFor` reference). Combinators **`all`**/**`any`**/
+  **`not`**, nestable. A `window` wait is a *scheduled* run, not a stall — `status`
+  shows the **next-open ETA** (`waiting on: window (opens Thu … 09:00)`), and the
+  scheduler never flags an off-hours lane as stalled/deadlocked. Surfaced across
+  every client: `taskherd add`/`fork` gained `--after`/`--before`/`--days`/
+  `--from`/`--until`/`--tz` (build one window) + raw `--when '<json>'` (full tree,
+  ANDed with the flags); MCP `tasks_add`/`tasks_fork` accept a `when` object; the
+  serve `add` API accepts `when`; and the **web console** shows a per-step `⏰`
+  schedule chip plus the window ETA in the waiting banner. **Fail-closed:** the
+  not-yet-implemented `exit`/`file`/`http`/`env` leaves and any malformed rule are
+  refused **loudly at add time** (CLI exit 1, MCP `isError`, API 400) — never a
+  silent skip.
+
 ## 0.1.5 — 2026-07-09
 
 ### Changed
