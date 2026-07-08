@@ -5,7 +5,7 @@ based on [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/). Pre-1.0: minor versions may include breaking
 changes.
 
-## Unreleased
+## 0.1.5 — 2026-07-09
 
 ### Changed
 - **Live AI transcripts in the console.** AI (Claude) steps now run in
