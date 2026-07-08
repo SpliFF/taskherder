@@ -10,7 +10,7 @@ import {
 import {
   loadLane, loadAllLanesResilient, saveLane, nextAction, resolveStepConfig,
   defaultFallback, maybeLand, newLane, validateStep,
-  evaluateWaits, computeWaiting, detectWaitCycles,
+  evaluateGate, computeWaiting, detectWaitCycles,
 } from './tasks.mjs';
 import { loadProjectConfig, loadUserConfig } from './config.mjs';
 import { runStep, formatDuration } from './executor.mjs';
@@ -204,7 +204,7 @@ async function gateBudgets(repo, runnable, history, nowIso) {
 // Scans all lanes, transitioning any lane whose next action is a freshly
 // reached manual gate from pending -> blocked (DESIGN §6 step 2). Returns the
 // set of lanes still eligible to run this tick.
-async function scanAndGate(repo, lanes, fallback) {
+async function scanAndGate(repo, lanes, fallback, now) {
   const runnable = [];
   const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
   for (const lane of lanes) {
@@ -212,12 +212,13 @@ async function scanAndGate(repo, lanes, fallback) {
     if (action.kind === 'idle') continue;
     if (action.kind === 'step' && action.step.status === 'blocked') continue; // already gated
     if (action.kind === 'step' && action.step.status === 'failed') continue; // parked failure
-    // Cross-lane dependency (DESIGN §22): a step whose `waitsFor` isn't satisfied
-    // is skipped SOFTLY — no gate, no ack, nothing persisted. It re-checks every
-    // fire and becomes runnable the instant the dependency lands. Evaluated
-    // before the manual-gate transition, so a gate with unmet deps doesn't even
-    // surface as an open gate until its prerequisites are met.
-    if (!evaluateWaits(action.step, lane.name, byName).satisfied) continue;
+    // Preconditions (DESIGN §22 `waitsFor` + §23 `when`): a step whose deps/rules
+    // aren't satisfied is skipped SOFTLY — no gate, no ack, nothing persisted. It
+    // re-checks every fire and becomes runnable the instant the world satisfies
+    // it (a dep lands, a time window opens). Evaluated before the manual-gate
+    // transition, so a gate with unmet preconditions doesn't even surface as an
+    // open gate until its prerequisites are met.
+    if (!evaluateGate(action.step, lane.name, byName, now).satisfied) continue;
     if (action.kind === 'step' && action.step.type === 'manual' && action.step.status === 'pending') {
       action.step.status = 'blocked';
       lane.status = 'blocked';
@@ -244,7 +245,7 @@ function fairPick(candidates) {
 // so a manual, one-lane run reports the actual cause (blocked/idle/missing)
 // instead of a bare "nothing happened". `lanes`/`unloadable` are the freshest
 // post-scan snapshot; `fallback` resolves an idle lane's onEmpty action.
-function explainLaneUnrunnable(name, lanes, unloadable, fallback) {
+function explainLaneUnrunnable(name, lanes, unloadable, fallback, now) {
   const bad = unloadable.find((u) => u.name === name);
   if (bad) return `its lane file is unloadable: ${bad.error}`;
   const lane = lanes.find((l) => l.name === name);
@@ -258,8 +259,13 @@ function explainLaneUnrunnable(name, lanes, unloadable, fallback) {
   const action = nextAction(lane, fallback);
   if (action.kind === 'idle') return 'nothing queued to run';
   const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
-  const { satisfied, unmet } = evaluateWaits(action.step, name, byName);
-  if (!satisfied) return `waiting on ${summarizeUnmet(unmet)} — runs once the dependency lands (DESIGN §22)`;
+  const { satisfied, unmet } = evaluateGate(action.step, name, byName, now);
+  if (!satisfied) {
+    const clockOnly = unmet.every((u) => u.reason === 'window');
+    return clockOnly
+      ? `waiting on ${summarizeUnmet(unmet)} — runs once the window opens (DESIGN §23)`
+      : `waiting on ${summarizeUnmet(unmet)} — runs once the dependency lands (DESIGN §22/§23)`;
+  }
   return 'skipped this fire (most likely a daily budget cap)';
 }
 
@@ -293,8 +299,9 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
     }
     const [projectConfig, userConfig] = await Promise.all([loadProjectConfig(repo), loadUserConfig()]);
     const fallback = defaultFallback(projectConfig, userConfig);
-    const gated = await scanAndGate(repo, lanes, fallback);
-    const nowIso = new Date().toISOString();
+    const now = new Date();
+    const gated = await scanAndGate(repo, lanes, fallback, now);
+    const nowIso = now.toISOString();
     const history = await readHistory(repo);
     let runnable = await gateBudgets(repo, gated, history, nowIso);
     // gateBudgets may have re-blocked lanes on disk; re-read for an accurate list.
@@ -324,10 +331,15 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
     // A stall is reported loudly + escalated to NEEDS-ATTENTION (a true cycle
     // becomes a named deadlock); a normal, still-progressing wait shows only in
     // `status`. Computed repo-wide, before any targeted-run narrowing below.
-    const waiting = computeWaiting(attention.lanes, fallback);
-    const stalled = waiting.length > 0 && runnable.length === 0;
-    if (stalled) await reportWaitStall(repo, waiting);
-    await writeNeedsAttention(repo, attention.lanes, attention.unloadable, stalled ? waiting : []);
+    const waiting = computeWaiting(attention.lanes, fallback, now);
+    // A `window` wait (DESIGN §23) is a SCHEDULED future run, not a stall — an
+    // off-hours cron fire that legitimately runs nothing must not read as a
+    // deadlock. Only dep-style waits (which may never self-clear) count toward a
+    // stall / NEEDS-ATTENTION; a window wait shows only in `status` with its ETA.
+    const depWaiting = waiting.filter((w) => w.unmet.some((u) => u.reason !== 'window'));
+    const stalled = depWaiting.length > 0 && runnable.length === 0;
+    if (stalled) await reportWaitStall(repo, depWaiting);
+    await writeNeedsAttention(repo, attention.lanes, attention.unloadable, stalled ? depWaiting : []);
 
     // Targeted manual run: keep only the named lane's candidate. If it isn't
     // runnable, say why (blocked/idle/missing) rather than a generic 'idle'.
@@ -337,7 +349,7 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
         return {
           outcome: 'not-runnable',
           lane: targetLane,
-          reason: explainLaneUnrunnable(targetLane, attention.lanes, attention.unloadable, fallback),
+          reason: explainLaneUnrunnable(targetLane, attention.lanes, attention.unloadable, fallback, now),
         };
       }
       runnable = chosen;

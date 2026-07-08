@@ -97,6 +97,7 @@ export async function statusData(repo) {
         summary: s.type === 'manual' ? s.message : (s.task || s.run || s.file || (s.argv || []).join(' ') || ''),
         ...(s.id ? { id: s.id } : {}),
         ...(s.waitsFor ? { waitsFor: s.waitsFor } : {}),
+        ...(s.when ? { when: s.when } : {}),
         ...(s.parkedReason ? { parkedReason: s.parkedReason } : {}),
         ...(s.error ? { error: s.error } : {}),
         ...(s.land ? { land: s.land } : {}),

@@ -550,6 +550,57 @@ Each ships something runnable; each builds against this complete design.
 
 ## 22. Deferred / future
 
-Cross-lane dependencies (`waitsFor`), per-lane priority/weight, the Slack binding,
-full remote-git for the ssh runner, an Electron menubar wrapper, Windows support.
+Cross-lane dependencies (`waitsFor`, shipped), per-lane priority/weight, the Slack
+binding, full remote-git for the ssh runner, an Electron menubar wrapper, Windows
+support.
+
+---
+
+## 23. Rules engine — the `when` precondition tree
+
+Generalizes the auto-clearing gate (`waitsFor`, §22) into a **nestable boolean
+rule tree** that decides whether a step may start this fire. A step's optional
+`when` field is evaluated each tick exactly like `waitsFor`: **unmet ⇒ the step is
+soft-skipped** (no gate, no `ack`, nothing persisted) and re-checked next fire,
+becoming runnable the instant the world satisfies it. This is the **soft /
+auto-clear** discipline — distinct from the one hard, ack-requiring `manual` gate
+(§14), which is **not** folded into the tree.
+
+**Shape.** One key per rule node — a leaf or a combinator:
+
+```jsonc
+"when": { "all": [                                  // all | any | not, nestable
+  { "window": { "after": "09:00", "before": "17:00", "days": "Mon-Fri" } },
+  { "not": { "dep": "build-lane:U2" } }
+] }
 ```
+
+- **Leaves (Phase 1):**
+  - `window` — a **pure** time/date predicate. Fields, all optional and ANDed:
+    `after`/`before` (`HH:MM` time-of-day; `after>before` = an overnight
+    wraparound), `days` (weekday set — `"Mon-Fri"`, `"Sat,Sun"`, ranges wrap),
+    `from`/`until` (absolute `YYYY-MM-DD` or datetime; a bare date is midnight in
+    the window's tz; `until` exclusive), `tz` (`local` default | `utc`).
+  - `dep` — a `waitsFor` reference (`"lane:id"` / `":id"` / `"lane"`); identical
+    semantics. `waitsFor` **is** sugar for a top-level `all` of `dep` leaves.
+- **Combinators:** `all` / `any` / `not`, nestable.
+- **Evaluation:** `evaluateWhen(rule, ctx) → {satisfied, unmet[]}` — pure given a
+  clock + the lane set, the same shape as `evaluateWaits`, so every waiting /
+  stall / status consumer extends for free. `evaluateGate(step, …)` ANDs `waitsFor`
+  and `when` into the single precondition the scheduler consults.
+
+**Rules.**
+1. **Soft, fail-closed.** A malformed/unknown/aspirational rule throws at write
+   time (§1) — never silently passes. An unsatisfiable window that has closed
+   (`until` passed) keeps the step waiting; it never auto-runs.
+2. **A `window` wait is a *scheduled* run, not a stall.** An off-hours cron fire
+   that legitimately runs nothing must not read as a deadlock — only `dep`-style
+   waits (which may never self-clear) count toward a stall / `NEEDS-ATTENTION`; a
+   window wait shows in `status` with its **next-open ETA**.
+3. **`manual` and `budget` stay separate** (the hard-gate and post-run cost
+   disciplines); not subsumed.
+
+**Deferred to a later phase (loudly rejected until then):** the `exit` probe
+(run a command, compare its code) — a code-execution + cost + latency surface
+that needs a timeout / cache / fail-closed / runner-reuse safety envelope — plus
+`file`/`http`/`env` leaves. See `PLAN-rules.md`.

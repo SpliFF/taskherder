@@ -95,52 +95,295 @@ export function validateStep(step) {
     }
     for (const ref of step.waitsFor) parseWaitRef(ref);
   }
+  // Optional precondition rule tree (DESIGN §23). Shape-validated here (leaves +
+  // combinators); satisfaction is a run-time question (evaluateWhen/evaluateGate).
+  if (step.when != null) parseWhen(step.when);
   return step;
 }
 
-// Evaluates a step's `waitsFor` against the whole lane set (a name→lane map).
-// `selfLane` resolves same-lane (`:id`) refs. Returns the UNMET references with a
-// classified reason so callers can surface why a lane isn't moving:
+// Evaluates ONE cross-lane dependency ref against the lane set. Returns an unmet
+// descriptor (with a classified `reason`) or `null` when satisfied. Shared by
+// `evaluateWaits` (the `waitsFor` sugar) and the `dep` leaf of the `when` rule
+// tree (evaluateWhen) — one source of truth for what "a dependency is met" means.
 //   step-pending  — target step exists, not `done` yet (the normal, will-clear case)
 //   lane-pending  — whole-lane target still has queued steps
 //   missing-step  — target lane exists but has no step with that id (not enqueued yet / typo)
 //   missing-lane  — no such lane
+export function evalDepRef(ref, selfLane, lanesByName) {
+  const { lane: refLane, stepId } = parseWaitRef(ref);
+  const targetLane = refLane || selfLane;
+  const target = lanesByName[targetLane];
+  if (!target) return { ref, targetLane, stepId, reason: 'missing-lane' };
+  if (stepId == null) {
+    if ((target.cursor || 0) < (target.steps?.length || 0)) {
+      return { ref, targetLane, stepId: null, reason: 'lane-pending' };
+    }
+    return null;
+  }
+  const targetStep = (target.steps || []).find((s) => s.id === stepId);
+  if (!targetStep) return { ref, targetLane, stepId, reason: 'missing-step' };
+  if (targetStep.status !== 'done') return { ref, targetLane, stepId, reason: 'step-pending' };
+  return null;
+}
+
+// Evaluates a step's `waitsFor` against the whole lane set (a name→lane map).
+// `selfLane` resolves same-lane (`:id`) refs. Returns the UNMET references with a
+// classified reason so callers can surface why a lane isn't moving.
 // satisfied === (unmet.length === 0). A step with no waitsFor is trivially satisfied.
 export function evaluateWaits(step, selfLane, lanesByName) {
   const refs = step?.waitsFor;
   if (!Array.isArray(refs) || refs.length === 0) return { satisfied: true, unmet: [] };
   const unmet = [];
   for (const ref of refs) {
-    const { lane: refLane, stepId } = parseWaitRef(ref);
-    const targetLane = refLane || selfLane;
-    const target = lanesByName[targetLane];
-    if (!target) { unmet.push({ ref, targetLane, stepId, reason: 'missing-lane' }); continue; }
-    if (stepId == null) {
-      if ((target.cursor || 0) < (target.steps?.length || 0)) {
-        unmet.push({ ref, targetLane, stepId: null, reason: 'lane-pending' });
-      }
-      continue;
-    }
-    const targetStep = (target.steps || []).find((s) => s.id === stepId);
-    if (!targetStep) { unmet.push({ ref, targetLane, stepId, reason: 'missing-step' }); continue; }
-    if (targetStep.status !== 'done') unmet.push({ ref, targetLane, stepId, reason: 'step-pending' });
+    const u = evalDepRef(ref, selfLane, lanesByName);
+    if (u) unmet.push(u);
   }
   return { satisfied: unmet.length === 0, unmet };
 }
 
-// Which lanes are soft-waiting on an unmet dependency right now (DESIGN §22): a
-// lane whose next action is a step with unmet `waitsFor`. Pure over a lane set —
-// shared by the scheduler (skip these this fire) and status rendering (show the
-// wait). A `blocked` lane is a real gate/failure, not a soft wait, so it's
-// excluded. Returns `[{ lane: name, index, unmet }]`.
-export function computeWaiting(lanes, fallback = {}) {
+// ── Rules engine — the `when` tree (DESIGN §23) ────────────────────────────
+// A step's optional `when` field is a nestable boolean tree of preconditions,
+// evaluated each fire like `waitsFor`: unmet ⇒ the step is SOFT-skipped (no gate,
+// no ack, nothing persisted) and re-checked next fire. `waitsFor` is sugar for a
+// top-level AND of `dep` leaves; `when` ANDs with it. Phase 1 leaves: `window`
+// (pure time/date) + `dep` (== a waitsFor ref). Combinators: all / any / not.
+// The `exit` probe (run a command, compare its code) is Phase 2 — parseWhen
+// rejects it loudly rather than silently ignoring it (DESIGN §1/§12).
+
+const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
+
+function parseHHMM(s, field) {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(s).trim());
+  if (!m) throw new LaneValidationError(`taskherd: when.window.${field} must be "HH:MM", got ${JSON.stringify(s)}`);
+  const h = Number(m[1]); const min = Number(m[2]);
+  if (h > 23 || min > 59) throw new LaneValidationError(`taskherd: when.window.${field} out of range: ${JSON.stringify(s)}`);
+  return h * 60 + min;
+}
+
+// Parses a `days` spec (string "Mon-Fri" / "Sat,Sun" / "Mon", or an array of
+// those) into a Set of weekday numbers (0=Sun..6=Sat). Ranges wrap (e.g.
+// "Fri-Mon" = Fri,Sat,Sun,Mon). Throws loudly on an unknown day name.
+function parseDays(spec) {
+  const dayNum = (name) => {
+    const i = WEEKDAYS.indexOf(String(name).trim().slice(0, 3).toLowerCase());
+    if (i === -1) throw new LaneValidationError(`taskherd: when.window.days — unknown weekday ${JSON.stringify(name)} (use Sun..Sat)`);
+    return i;
+  };
+  const parts = (Array.isArray(spec) ? spec : String(spec).split(',')).map((s) => String(s).trim()).filter(Boolean);
+  if (parts.length === 0) throw new LaneValidationError('taskherd: when.window.days is empty');
+  const out = new Set();
+  for (const part of parts) {
+    const range = part.split('-');
+    if (range.length === 2) {
+      let a = dayNum(range[0]); const b = dayNum(range[1]);
+      for (let i = 0; i < 7; i += 1) { out.add(a); if (a === b) break; a = (a + 1) % 7; }
+    } else {
+      out.add(dayNum(part));
+    }
+  }
+  return out;
+}
+
+// Absolute date/datetime bound. A bare "YYYY-MM-DD" is midnight in the window's
+// tz (so `local` isn't silently shifted by UTC parsing); a full datetime parses
+// as-is. Returns epoch ms. Throws loudly on an unparseable value.
+function parseBound(s, field, tz) {
+  const str = String(s).trim();
+  const dateOnly = /^(\d{4})-(\d{2})-(\d{2})$/.exec(str);
+  let ms;
+  if (dateOnly) {
+    const [, y, mo, d] = dateOnly.map(Number);
+    ms = tz === 'utc' ? Date.UTC(y, mo - 1, d) : new Date(y, mo - 1, d).getTime();
+  } else {
+    ms = Date.parse(str);
+  }
+  if (Number.isNaN(ms)) throw new LaneValidationError(`taskherd: when.window.${field} is not a valid date/datetime: ${JSON.stringify(s)}`);
+  return ms;
+}
+
+// Validates + normalizes a `window` leaf into a cheap struct the evaluator uses
+// (times → minutes, days → a weekday Set, bounds → epoch ms). windowSatisfied /
+// windowNextOpen operate on this normalized form.
+export function parseWindow(win) {
+  if (!win || typeof win !== 'object' || Array.isArray(win)) {
+    throw new LaneValidationError(`taskherd: when.window must be an object, got ${JSON.stringify(win)}`);
+  }
+  const tz = win.tz == null ? 'local' : String(win.tz).toLowerCase();
+  if (tz !== 'local' && tz !== 'utc') {
+    throw new LaneValidationError(`taskherd: when.window.tz must be "local" or "utc" (Phase 1), got ${JSON.stringify(win.tz)}`);
+  }
+  const norm = { tz, raw: win };
+  if (win.after != null) norm.after = parseHHMM(win.after, 'after');
+  if (win.before != null) norm.before = parseHHMM(win.before, 'before');
+  if (win.days != null) norm.days = parseDays(win.days);
+  if (win.from != null) norm.from = parseBound(win.from, 'from', tz);
+  if (win.until != null) norm.until = parseBound(win.until, 'until', tz);
+  if (norm.after == null && norm.before == null && norm.days == null && norm.from == null && norm.until == null) {
+    throw new LaneValidationError('taskherd: when.window needs at least one of after/before/days/from/until');
+  }
+  return norm;
+}
+
+// tz-aware parts of a Date (local vs utc), so the same code path serves both.
+function partsOf(d, tz) {
+  return tz === 'utc'
+    ? { y: d.getUTCFullYear(), mo: d.getUTCMonth(), d: d.getUTCDate(), wd: d.getUTCDay(), min: d.getUTCHours() * 60 + d.getUTCMinutes() }
+    : { y: d.getFullYear(), mo: d.getMonth(), d: d.getDate(), wd: d.getDay(), min: d.getHours() * 60 + d.getMinutes() };
+}
+function instantAt(y, mo, d, minutes, tz) {
+  const hh = Math.floor(minutes / 60); const mm = minutes % 60;
+  return tz === 'utc' ? new Date(Date.UTC(y, mo, d, hh, mm)) : new Date(y, mo, d, hh, mm);
+}
+
+// Is `now` inside the window? Pure. All present fields are ANDed; an after>before
+// pair is an overnight wraparound (e.g. 22:00–06:00).
+export function windowSatisfied(win, now) {
+  const p = partsOf(now, win.tz);
+  if (win.days && !win.days.has(p.wd)) return false;
+  if (win.from != null && now.getTime() < win.from) return false;
+  if (win.until != null && now.getTime() >= win.until) return false;
+  const { after: a, before: b } = win;
+  if (a != null && b != null) return a <= b ? (p.min >= a && p.min < b) : (p.min >= a || p.min < b);
+  if (a != null) return p.min >= a;
+  if (b != null) return p.min < b;
+  return true;
+}
+
+// Best-effort next wall-clock instant the window opens (for a status ETA). Every
+// closed→open transition lands on one of {`from`, a day's 00:00, a day's `after`},
+// so testing those candidates over the next 2 weeks finds the earliest. Returns
+// `{ nextOpen: Date|null, closed: bool }` — closed when `until` has passed.
+export function windowNextOpen(win, now) {
+  if (win.until != null && now.getTime() >= win.until) return { nextOpen: null, closed: true };
+  let best = null;
+  const consider = (inst) => {
+    if (inst.getTime() > now.getTime() && windowSatisfied(win, inst) && (best === null || inst.getTime() < best.getTime())) best = inst;
+  };
+  if (win.from != null) consider(new Date(win.from));
+  for (let off = 0; off <= 14; off += 1) {
+    const base = new Date(now.getTime() + off * 86400000);
+    const p = partsOf(base, win.tz);
+    consider(instantAt(p.y, p.mo, p.d, 0, win.tz));
+    if (win.after != null) consider(instantAt(p.y, p.mo, p.d, win.after, win.tz));
+  }
+  return { nextOpen: best, closed: false };
+}
+
+function fmtInstant(d, tz) {
+  const p = partsOf(d, tz);
+  const pad = (n) => String(n).padStart(2, '0');
+  const wd = WEEKDAYS[p.wd].replace(/^\w/, (c) => c.toUpperCase());
+  return `${wd} ${p.y}-${pad(p.mo + 1)}-${pad(p.d)} ${pad(Math.floor(p.min / 60))}:${pad(p.min % 60)}${tz === 'utc' ? 'Z' : ''}`;
+}
+
+// Validates a `when` rule tree (recursively), throwing loudly on any unknown or
+// not-yet-implemented rule so a bad/aspirational rule fails at write time, never
+// silently passes at run time. Returns the tree unchanged.
+export function parseWhen(rule) {
+  if (rule == null) return rule;
+  if (typeof rule !== 'object' || Array.isArray(rule)) {
+    throw new LaneValidationError(`taskherd: a \`when\` rule must be an object, got ${JSON.stringify(rule)}`);
+  }
+  const keys = Object.keys(rule);
+  if (keys.length !== 1) {
+    throw new LaneValidationError(`taskherd: a \`when\` rule must have exactly one key (all/any/not/window/dep), got {${keys.join(', ')}}`);
+  }
+  const [key] = keys;
+  const val = rule[key];
+  if (key === 'all' || key === 'any') {
+    if (!Array.isArray(val) || val.length === 0) throw new LaneValidationError(`taskherd: when.${key} must be a non-empty array of rules`);
+    val.forEach((r) => parseWhen(r));
+  } else if (key === 'not') {
+    parseWhen(val);
+  } else if (key === 'window') {
+    parseWindow(val);
+  } else if (key === 'dep') {
+    parseWaitRef(val);
+  } else if (key === 'exit' || key === 'file' || key === 'http' || key === 'env') {
+    throw new LaneValidationError(`taskherd: \`when\` rule "${key}" is not implemented yet (Phase 1 supports window/dep + all/any/not); see PLAN-rules.md`);
+  } else {
+    throw new LaneValidationError(`taskherd: unknown \`when\` rule "${key}" (expected all/any/not/window/dep)`);
+  }
+  return rule;
+}
+
+// Compact human string for a rule (status/ETA surfacing).
+function describeWhen(rule) {
+  const [key] = Object.keys(rule);
+  const val = rule[key];
+  if (key === 'all' || key === 'any') return `${key}(${val.map(describeWhen).join(', ')})`;
+  if (key === 'not') return `not(${describeWhen(val)})`;
+  if (key === 'dep') return `dep ${val}`;
+  if (key === 'window') {
+    const w = val;
+    const bits = [];
+    if (w.days) bits.push(String(Array.isArray(w.days) ? w.days.join(',') : w.days));
+    if (w.after || w.before) bits.push(`${w.after || '00:00'}-${w.before || '24:00'}`);
+    if (w.from) bits.push(`from ${w.from}`);
+    if (w.until) bits.push(`until ${w.until}`);
+    return `window(${bits.join(' ')})`;
+  }
+  return key;
+}
+
+// Evaluates a `when` rule tree against a context {selfLane, lanesByName, now}.
+// Returns `{ satisfied, unmet[] }` — the same shape as evaluateWaits, so every
+// waiting/stall/status consumer extends for free. Each unmet entry carries a
+// human `ref` and a `reason` (window unmet ⇒ reason:'window', so stall detection
+// can tell a self-clearing clock wait from a dep that may deadlock).
+export function evaluateWhen(rule, ctx) {
+  if (rule == null) return { satisfied: true, unmet: [] };
+  const [key] = Object.keys(rule);
+  const val = rule[key];
+  if (key === 'all') {
+    const unmet = [];
+    for (const r of val) unmet.push(...evaluateWhen(r, ctx).unmet);
+    return { satisfied: unmet.length === 0, unmet };
+  }
+  if (key === 'any') {
+    const subs = val.map((r) => evaluateWhen(r, ctx));
+    if (subs.some((s) => s.satisfied)) return { satisfied: true, unmet: [] };
+    return { satisfied: false, unmet: [{ reason: 'any', ref: describeWhen(rule) }] };
+  }
+  if (key === 'not') {
+    const sub = evaluateWhen(val, ctx);
+    if (sub.satisfied) return { satisfied: false, unmet: [{ reason: 'not', ref: `not(${describeWhen(val)})` }] };
+    return { satisfied: true, unmet: [] };
+  }
+  if (key === 'dep') {
+    const u = evalDepRef(val, ctx.selfLane, ctx.lanesByName);
+    return u ? { satisfied: false, unmet: [u] } : { satisfied: true, unmet: [] };
+  }
+  // window
+  const win = parseWindow(val);
+  if (windowSatisfied(win, ctx.now)) return { satisfied: true, unmet: [] };
+  const { nextOpen, closed } = windowNextOpen(win, ctx.now);
+  const ref = closed ? `window (closed)` : (nextOpen ? `window (opens ${fmtInstant(nextOpen, win.tz)})` : 'window (waiting)');
+  return { satisfied: false, unmet: [{ reason: 'window', ref, nextOpen: nextOpen ? nextOpen.toISOString() : null, closed }] };
+}
+
+// The unified precondition gate for a step: `waitsFor` (dep sugar) AND `when`
+// (the rule tree), merged into one `{ satisfied, unmet[] }`. This is what the
+// scheduler and status consult — one place that decides "may this step start?".
+export function evaluateGate(step, selfLane, lanesByName, now = new Date()) {
+  const unmet = [...evaluateWaits(step, selfLane, lanesByName).unmet];
+  if (step?.when != null) unmet.push(...evaluateWhen(step.when, { selfLane, lanesByName, now }).unmet);
+  return { satisfied: unmet.length === 0, unmet };
+}
+
+// Which lanes are soft-waiting on an unmet precondition right now (DESIGN §22/§23):
+// a lane whose next action is a step with an unmet `waitsFor`/`when`. Pure over a
+// lane set — shared by the scheduler (skip these this fire) and status rendering
+// (show the wait). A `blocked` lane is a real gate/failure, not a soft wait, so
+// it's excluded. Returns `[{ lane: name, index, unmet }]`.
+export function computeWaiting(lanes, fallback = {}, now = new Date()) {
   const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
   const waiting = [];
   for (const lane of lanes) {
     if (lane.status === 'blocked') continue;
     const action = nextAction(lane, fallback);
     if (action.kind === 'idle') continue;
-    const { satisfied, unmet } = evaluateWaits(action.step, lane.name, byName);
+    const { satisfied, unmet } = evaluateGate(action.step, lane.name, byName, now);
     if (!satisfied) waiting.push({ lane: lane.name, index: action.index, unmet });
   }
   return waiting;
@@ -440,12 +683,35 @@ export function normalizeWaitsFor(v) {
   return out.length ? out : null;
 }
 
-// The cross-lane dependency fields (DESIGN §22) are common to every step type,
-// like `status` — attach them uniformly so `add`/`block`/`fork` all support them.
+// Builds the optional `when` rule tree (DESIGN §23) from opts: a raw `when`
+// (object or JSON string) and/or the window convenience fields
+// (after/before/days/from/until/tz). When both are given they are ANDed. Returns
+// null when nothing is specified. Throws loudly on malformed JSON / rules.
+export function whenFromOpts(opts) {
+  let explicit = null;
+  if (opts.when != null) {
+    explicit = typeof opts.when === 'string' ? JSON.parse(opts.when) : opts.when;
+  }
+  const win = {};
+  for (const f of ['after', 'before', 'days', 'from', 'until', 'tz']) {
+    if (opts[f] != null) win[f] = opts[f];
+  }
+  const windowRule = Object.keys(win).length ? { window: win } : null;
+  let rule = null;
+  if (explicit && windowRule) rule = { all: [explicit, windowRule] };
+  else rule = explicit || windowRule;
+  return rule ? parseWhen(rule) : null;
+}
+
+// The cross-lane dependency fields (DESIGN §22) + the `when` rule tree (§23) are
+// common to every step type, like `status` — attach them uniformly so
+// `add`/`block`/`fork` all support them.
 function withDeps(step, opts) {
   if (opts.id) step.id = opts.id;
   const waitsFor = normalizeWaitsFor(opts.waitsFor);
   if (waitsFor) step.waitsFor = waitsFor;
+  const when = whenFromOpts(opts);
+  if (when) step.when = when;
   return step;
 }
 
