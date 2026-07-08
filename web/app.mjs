@@ -4,6 +4,7 @@
 // the running step's control socket.
 import { Terminal } from '/vendor/xterm.mjs';
 import { FitAddon } from '/vendor/addon-fit.mjs';
+import { createOutputRenderer } from '/render.mjs';
 
 const app = document.getElementById('app');
 const conn = document.getElementById('conn');
@@ -384,77 +385,9 @@ function closeReason(code) {
 // control socket (/ws/pty, attach) and a serve-owned runner shell (/ws/shell,
 // web-SSH) speak the same frame protocol — output frames out, input/resize/
 // signal in — so they share this exact wiring; only the URL + title differ.
-// Known claude stream-json event types (DESIGN §22 monitor). AI steps run in
-// `--output-format stream-json` (providers.mjs), so their pty output is a stream
-// of these JSONL events, not a TUI.
-const STREAM_JSON_TYPES = new Set(['system', 'stream_event', 'assistant', 'user', 'result', 'rate_limit_event']);
-
-// Turns a step's raw output stream into terminal writes. Command / plain steps
-// pass through byte-for-byte (full xterm fidelity); an AI step's stream-json is
-// parsed per event and painted as a readable LIVE transcript (assistant text as
-// it streams, tool calls, retries, a final cost line) instead of raw JSON. The
-// mode is sniffed once from the first event — a command that merely prints `{…}`
-// (no recognized stream-json `type`) still renders raw, so nothing is swallowed.
-function createOutputRenderer(term) {
-  let mode = null; // null (sniffing) | 'raw' | 'json'
-  let buf = '';
-  let sawText = false;
-
-  const paint = (line) => {
-    let ev;
-    try { ev = JSON.parse(line); } catch { term.write(`${line}\r\n`); return; }
-    const e = ev.event || {};
-    if (ev.type === 'stream_event' && e.type === 'content_block_delta' && e.delta?.type === 'text_delta') {
-      sawText = true;
-      term.write(e.delta.text.replace(/\n/g, '\r\n')); // assistant text, streaming in
-    } else if (ev.type === 'stream_event' && e.type === 'content_block_start' && e.content_block?.type === 'tool_use') {
-      term.write(`\r\n\x1b[36m⚙ ${e.content_block.name || 'tool'}\x1b[0m\r\n`);
-    } else if (ev.type === 'assistant' && !sawText) {
-      // Fallback if partial-message deltas aren't emitted: paint the full text blocks.
-      for (const b of ev.message?.content || []) {
-        if (b.type === 'text' && b.text) { sawText = true; term.write(b.text.replace(/\n/g, '\r\n')); }
-      }
-    } else if (ev.type === 'system' && ev.subtype === 'init') {
-      term.write(`\x1b[2m[session${ev.model ? ` · ${ev.model}` : ''}]\x1b[0m\r\n`);
-    } else if (ev.type === 'rate_limit_event' || (ev.type === 'system' && ev.subtype === 'api_retry')) {
-      term.write(`\r\n\x1b[33m[${ev.type === 'rate_limit_event' ? 'rate limit' : 'retry'}]\x1b[0m\r\n`);
-    } else if (ev.type === 'result') {
-      if (!sawText && ev.result) term.write(String(ev.result).replace(/\n/g, '\r\n'));
-      const bits = [];
-      if (ev.num_turns != null) bits.push(`${ev.num_turns} turns`);
-      if (typeof ev.total_cost_usd === 'number') bits.push(`$${ev.total_cost_usd.toFixed(4)}`);
-      term.write(`\r\n\x1b[2m[done${bits.length ? ` · ${bits.join(' · ')}` : ''}]\x1b[0m\r\n`);
-    }
-  };
-
-  const drain = () => {
-    let nl;
-    // eslint-disable-next-line no-cond-assign
-    while ((nl = buf.indexOf('\n')) !== -1) {
-      const line = buf.slice(0, nl); buf = buf.slice(nl + 1);
-      if (line.trim()) paint(line);
-    }
-  };
-
-  return {
-    feed(text) {
-      if (mode === 'raw') { term.write(text); return; }
-      buf += text;
-      if (mode === null) {
-        const lead = buf.replace(/^\s+/, '');
-        if (!lead) return; // only whitespace so far — keep sniffing
-        if (lead[0] !== '{') { mode = 'raw'; term.write(buf); buf = ''; return; }
-        const nl = buf.indexOf('\n');
-        if (nl === -1) return; // need the whole first line to classify it
-        let first; try { first = JSON.parse(buf.slice(0, nl)); } catch { first = null; }
-        if (!first || !STREAM_JSON_TYPES.has(first.type)) { mode = 'raw'; term.write(buf); buf = ''; return; }
-        mode = 'json';
-      }
-      drain();
-    },
-    flush() { if (mode === 'json' && buf.trim()) { paint(buf); buf = ''; } },
-  };
-}
+// `createOutputRenderer` (the stream-json → readable-transcript renderer) lives
+// in the shared /render.mjs so the CLI `taskherd attach` paints AI steps the
+// SAME way this console does — one implementation, no drift (DESIGN §3).
 
 function openPty(wsUrl, title) {
   closeTerminal();

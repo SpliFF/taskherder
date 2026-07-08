@@ -24,6 +24,7 @@ import { loadProfile, profileEnv, isolationWarnings } from './profiles.mjs';
 import {
   isGitRepo, ensureWorktree, ensureInplaceBranch, defaultBase, headCommit,
 } from './git.mjs';
+import { distillStreamJson } from './render.mjs';
 
 // Cap on how much trailing output we keep to scan for a provider's cost JSON.
 // The result object is small and printed last, so the tail is enough.
@@ -126,6 +127,13 @@ const CTRL_RE = /[\x00-\x08\x0b\x0c\x0e-\x1f\x7f]/g; // strays after ANSI strip 
 // lines capped to a banner-sized string. Returns null when nothing survives.
 export function extractErrorTail(raw, { maxLines = 12, maxChars = 800 } = {}) {
   if (!raw) return null;
+  // An AI step's tail is stream-json JSONL, not human text — distill the answer/
+  // error text out of it (else the parked failure shows raw `{"type":…}` lines).
+  // Returns null for command output, which falls through to the ANSI-strip path.
+  const distilled = distillStreamJson(raw);
+  if (distilled != null) {
+    return distilled.length > maxChars ? `…${distilled.slice(-(maxChars - 1))}` : distilled;
+  }
   const lines = raw
     .split('\n')
     .map((l) => l

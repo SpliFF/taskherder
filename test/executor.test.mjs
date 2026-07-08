@@ -43,6 +43,15 @@ test('extractErrorTail: strips ANSI colour and honours carriage-return repaints'
   assert.equal(extractErrorTail(raw), 'working... 100%\nFATAL: boom');
 });
 
+test('extractErrorTail: an AI stream-json tail is distilled to readable text, not raw JSONL', () => {
+  // A failed AI step's tail is stream-json (providers.mjs), truncated at the head.
+  const raw = 'block_delta","text":"…"}}}\n'
+    + '{"type":"result","subtype":"error_max_turns","result":"Ran out of turns","num_turns":40}\n';
+  const tail = extractErrorTail(raw);
+  assert.equal(tail, '[error_max_turns] Ran out of turns');
+  assert.doesNotMatch(tail, /"type":"result"/, 'the parked failure must not show raw JSON');
+});
+
 test('extractErrorTail: nothing but whitespace/escapes yields null', () => {
   assert.equal(extractErrorTail('[2J[H\n   \n'), null);
   assert.equal(extractErrorTail(''), null);

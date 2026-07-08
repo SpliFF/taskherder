@@ -26,6 +26,7 @@ import { listProfiles, loadProfile, isolationWarnings } from '../src/profiles.mj
 import { isGitRepo, gcWorktrees, laneDiff } from '../src/git.mjs';
 import { loadProjectConfig } from '../src/config.mjs';
 import { registerProject } from '../src/registry.mjs';
+import { createOutputRenderer } from '../src/render.mjs';
 
 const REPO_OPTION = { repo: { type: 'string', short: 'C' } };
 
@@ -388,7 +389,14 @@ async function cmdAttach(argv) {
       }
     };
     const onWinch = () => sendResize();
+    // Render AI steps' stream-json into a readable live transcript, exactly like
+    // the web console (shared src/render.mjs). Command/plain steps sniff to raw
+    // and pass through unchanged. A streaming UTF-8 decoder keeps a multibyte
+    // char split across output frames intact.
+    const renderer = createOutputRenderer(process.stdout);
+    const decoder = new TextDecoder();
     const cleanup = () => {
+      renderer.flush(); // paint any final event that arrived without a trailing newline
       process.removeListener('SIGWINCH', onWinch);
       process.stdin.removeAllListeners('data');
       if (process.stdin.isTTY) process.stdin.setRawMode(false);
@@ -412,7 +420,7 @@ async function cmdAttach(argv) {
         if (!line.trim()) continue;
         try {
           const msg = JSON.parse(line);
-          if (msg.event === 'output') process.stdout.write(Buffer.from(msg.data, 'base64'));
+          if (msg.event === 'output') renderer.feed(decoder.decode(Buffer.from(msg.data, 'base64'), { stream: true }));
         } catch {
           // ignore a malformed event line rather than kill the attach
         }

@@ -28,6 +28,21 @@ changes.
   refused **loudly at add time** (CLI exit 1, MCP `isError`, API 400) — never a
   silent skip.
 
+### Changed
+- **`taskherd attach` now renders AI (Claude) steps as a readable live
+  transcript**, matching the web console. 0.1.5 switched AI steps to
+  `--output-format stream-json` and taught the *console* to render it, but the
+  CLI still printed raw JSONL — attaching to a running agent showed a wall of
+  `{"type":"stream_event",…}`. The stream-json → transcript renderer is now a
+  shared module (`src/render.mjs`) used by both the console and the CLI (one
+  implementation, no drift): assistant text streams in, tool calls show as
+  `⚙ <tool>`, retries/rate-limits are flagged, and a final `[done · N turns ·
+  $cost]` line closes it. Command/plain steps still pass through byte-for-byte.
+- **A failed AI step's parked-error excerpt is distilled to readable text**
+  instead of raw stream-json — `status` and the console now show the operative
+  answer/error (e.g. `[error_max_turns] …`) rather than a `{"type":"result",…}`
+  blob.
+
 ## 0.1.5 — 2026-07-09
 
 ### Changed

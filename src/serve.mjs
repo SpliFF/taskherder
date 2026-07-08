@@ -50,6 +50,9 @@ function vendorFile(pkg, rel) {
 const STATIC_FILES = {
   '/': [path.join(WEB_DIR, 'index.html'), 'text/html; charset=utf-8'],
   '/app.mjs': [path.join(WEB_DIR, 'app.mjs'), 'text/javascript; charset=utf-8'],
+  // Shared with the CLI (bin/cli.mjs imports it from disk) — the stream-json
+  // transcript renderer, served so the SPA `import`s the same one (no drift).
+  '/render.mjs': [fileURLToPath(new URL('./render.mjs', import.meta.url)), 'text/javascript; charset=utf-8'],
   '/style.css': [path.join(WEB_DIR, 'style.css'), 'text/css; charset=utf-8'],
   '/vendor/xterm.mjs': [vendorFile('@xterm/xterm', 'lib/xterm.mjs'), 'text/javascript; charset=utf-8'],
   '/vendor/xterm.css': [vendorFile('@xterm/xterm', 'css/xterm.css'), 'text/css; charset=utf-8'],
