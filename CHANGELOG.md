@@ -28,6 +28,19 @@ changes.
   refused **loudly at add time** (CLI exit 1, MCP `isError`, API 400) — never a
   silent skip.
 
+### Added
+- **Post-run log viewer — replay a finished run's output (`taskherd logs`, a
+  console **LOG** button, serve `/logs`+`/log`).** While a step runs you can
+  `attach` to its live terminal, but once it exits the control socket is gone —
+  the persisted `.tasks/logs/<lane>-<ts>.log` had no viewer. Now: **`taskherd
+  logs <lane>`** lists a lane's past logs (newest first) and **`--last`** /
+  **`--file <name>`** replays one through the same stream-json renderer as
+  `attach` (an AI run reads back as a transcript, not raw JSONL); the console
+  grows a per-lane **LOG** button that opens the last run in the terminal panel;
+  and serve exposes read-only, token-gated **`GET /api/projects/:id/logs`** (list)
+  + **`/log`** (one file's text). Path-validated (a `file` must be a bare
+  `<lane>-*.log` name — no traversal) and capped at 2 MB with a truncation flag.
+
 ### Changed
 - **`taskherd attach` now renders AI (Claude) steps as a readable live
   transcript**, matching the web console. 0.1.5 switched AI steps to

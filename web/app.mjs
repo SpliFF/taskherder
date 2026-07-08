@@ -180,6 +180,7 @@ function laneHtml(p, lane) {
         <button class="btn warn" title="Send SIGINT (Ctrl-C) to the running step" data-action="interrupt" data-lane="${esc(lane.name)}">INTERRUPT</button>`
     : `<button class="btn accent" title="Run this lane's next step now (a manual one-lane fire)" data-action="run" data-lane="${esc(lane.name)}">▸ RUN</button>`}
       <button class="btn ghost" title="Review this lane's branch diff before landing (worktree/inplace lanes)" data-action="diff" data-lane="${esc(lane.name)}">DIFF</button>
+      <button class="btn ghost" title="Replay this lane's last run log (AI steps rendered as a transcript)" data-action="log" data-project="${esc(p.id)}" data-lane="${esc(lane.name)}">LOG</button>
       <button class="btn ghost" title="Create a new sibling lane branched from this one" data-action="fork" data-lane="${esc(lane.name)}">FORK</button>
     </div>
     <form class="add-row" data-action="add-step" data-lane="${esc(lane.name)}">
@@ -290,6 +291,8 @@ app.addEventListener('click', (e) => {
     openGui(id);
   } else if (action === 'diff') {
     openDiff(id, lane);
+  } else if (action === 'log') {
+    openLog(id, lane);
   }
 });
 
@@ -389,7 +392,10 @@ function closeReason(code) {
 // in the shared /render.mjs so the CLI `taskherd attach` paints AI steps the
 // SAME way this console does — one implementation, no drift (DESIGN §3).
 
-function openPty(wsUrl, title) {
+// Open the terminal panel with a fresh xterm (mutually exclusive with the diff /
+// gfx panels). Shared by the live pty bridge (openPty) and the static log replay
+// (openLog) — both paint through the same createOutputRenderer.
+function mountTerm(title) {
   closeTerminal();
   closeDiff();
   closeGfx();
@@ -400,7 +406,11 @@ function openPty(wsUrl, title) {
   term.loadAddon(fit);
   term.open(termHost);
   fit.fit();
+  return term;
+}
 
+function openPty(wsUrl, title) {
+  mountTerm(title);
   termWs = new WebSocket(wsUrl);
   // A streaming UTF-8 decoder (so a multibyte char split across output frames
   // isn't corrupted) feeding the raw/stream-json renderer.
@@ -435,6 +445,32 @@ function openPty(wsUrl, title) {
 }
 
 const wsProto = () => (location.protocol === 'https:' ? 'wss' : 'ws');
+
+// Replay a lane's last run log into the terminal panel — the historical twin of
+// ATTACH (once a step exits its control socket is gone, but the pty log file
+// remains). Static (no WS), rendered through the SAME createOutputRenderer, so an
+// ai step reads back as a transcript, not raw stream-json.
+async function openLog(id, lane) {
+  mountTerm(`${lane} — log…`);
+  const mine = term; // guard against the user opening another panel mid-fetch
+  let log;
+  try {
+    log = await api(`/api/projects/${encodeURIComponent(id)}/log?lane=${encodeURIComponent(lane)}`);
+  } catch (err) {
+    if (err.message !== 'unauthorized' && term === mine) term.write(`\r\n\x1b[31m✗ ${err.message}\x1b[0m\r\n`);
+    return;
+  }
+  if (term !== mine) return;
+  if (!log.exists) {
+    termTitle.textContent = `${lane} — log`;
+    term.write(`\x1b[2mno logs yet for ${lane} — run a step first\x1b[0m\r\n`);
+    return;
+  }
+  termTitle.textContent = `${lane} — ${log.file}${log.truncated ? ' (truncated)' : ''}`;
+  const renderer = createOutputRenderer(term);
+  renderer.feed(log.text);
+  renderer.flush();
+}
 
 function openTerminal(id, lane) {
   openPty(

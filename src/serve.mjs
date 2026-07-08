@@ -29,6 +29,7 @@ import {
 import { loadProjects } from './registry.mjs';
 import { statusData } from './history.mjs';
 import { laneDiff } from './git.mjs';
+import { listLaneLogs, readLaneLog, readLatestLaneLog } from './logs.mjs';
 import {
   resolveRunner, shellInvocation, graphicalEndpoint, loadRunners,
 } from './runners.mjs';
@@ -725,6 +726,30 @@ export async function createConsoleServer({
         if (!lane) throw new LaneValidationError("missing 'lane'");
         validateLaneName(lane); // no traversal into arbitrary .json / worktree paths
         sendJson(res, 200, await laneDiff(repo, lane, { base: url.searchParams.get('base') || null }));
+        return;
+      }
+
+      // Read-only: list a lane's persisted pty logs, newest first (monitor L2).
+      const logsMatch = /^\/api\/projects\/([^/]+)\/logs$/.exec(url.pathname);
+      if (logsMatch && req.method === 'GET') {
+        const repo = await resolveProject(logsMatch[1]);
+        const lane = url.searchParams.get('lane');
+        if (!lane) throw new LaneValidationError("missing 'lane'");
+        sendJson(res, 200, { logs: await listLaneLogs(repo, lane) });
+        return;
+      }
+
+      // Read-only: one log file's raw text (path-validated, capped). No `file`
+      // ⇒ the newest run's log ("just show me the last run").
+      const logMatch = /^\/api\/projects\/([^/]+)\/log$/.exec(url.pathname);
+      if (logMatch && req.method === 'GET') {
+        const repo = await resolveProject(logMatch[1]);
+        const lane = url.searchParams.get('lane');
+        if (!lane) throw new LaneValidationError("missing 'lane'");
+        const file = url.searchParams.get('file');
+        sendJson(res, 200, file
+          ? await readLaneLog(repo, lane, file)
+          : await readLatestLaneLog(repo, lane));
         return;
       }
 

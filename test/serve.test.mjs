@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import http from 'node:http';
-import { readFile, writeFile } from 'node:fs/promises';
+import { readFile, writeFile, mkdir } from 'node:fs/promises';
 import { existsSync, chmodSync } from 'node:fs';
 import path from 'node:path';
 import WebSocket, { WebSocketServer } from 'ws';
@@ -22,7 +22,7 @@ import { runStep } from '../src/executor.mjs';
 import { newLane } from '../src/tasks.mjs';
 import { createConsoleServer } from '../src/serve.mjs';
 import {
-  repoId, runSocketLink, pausedFile, projectConfigFile,
+  repoId, runSocketLink, pausedFile, projectConfigFile, logsDir,
 } from '../src/paths.mjs';
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -219,6 +219,46 @@ test('serve: GET /diff returns a lane branch diff for review; missing lane is a 
   // Missing lane param → 400. No token → 401.
   assert.equal((await api('GET', `/api/projects/${id}/diff`)).status, 400);
   assert.equal((await api('GET', `/api/projects/${id}/diff?lane=feat`, null, null)).status, 401);
+});
+
+test('serve: GET /logs lists + /log reads a lane\'s past run logs; traversal/auth guarded (monitor L2)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await registerProject(repo);
+  const dir = logsDir(repo);
+  await mkdir(dir, { recursive: true });
+  await writeFile(path.join(dir, 'web-2026-07-09T10-00-00-000Z.log'), 'first run output');
+  await new Promise((r) => { setTimeout(r, 5); });
+  await writeFile(path.join(dir, 'web-2026-07-09T11-00-00-000Z.log'), 'second run output');
+
+  const { console_, api } = await startServer();
+  t.after(() => console_.close());
+  const id = repoId(repo);
+
+  // List: newest first.
+  const { status, body: list } = await api('GET', `/api/projects/${id}/logs?lane=web`);
+  assert.equal(status, 200);
+  assert.equal(list.logs.length, 2);
+  assert.match(list.logs[0].file, /11-00-00/);
+
+  // Read a named file.
+  const named = await api('GET', `/api/projects/${id}/log?lane=web&file=web-2026-07-09T10-00-00-000Z.log`);
+  assert.equal(named.status, 200);
+  assert.equal(named.body.text, 'first run output');
+  assert.equal(named.body.exists, true);
+
+  // No file → the newest run's log.
+  assert.equal((await api('GET', `/api/projects/${id}/log?lane=web`)).body.text, 'second run output');
+
+  // A lane with no logs → empty list / exists:false, not an error.
+  assert.deepEqual((await api('GET', `/api/projects/${id}/logs?lane=quiet`)).body.logs, []);
+  assert.equal((await api('GET', `/api/projects/${id}/log?lane=quiet`)).body.exists, false);
+
+  // Path traversal / cross-lane names → 400. Missing lane → 400. No token → 401.
+  assert.equal((await api('GET', `/api/projects/${id}/log?lane=web&file=${encodeURIComponent('../../../etc/passwd')}`)).status, 400);
+  assert.equal((await api('GET', `/api/projects/${id}/log?lane=web&file=api-x.log`)).status, 400);
+  assert.equal((await api('GET', `/api/projects/${id}/logs`)).status, 400);
+  assert.equal((await api('GET', `/api/projects/${id}/logs?lane=web`, null, null)).status, 401);
 });
 
 test('serve: /api/projects carries the waitsFor state the console renders (§22)', async (t) => {

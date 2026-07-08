@@ -27,6 +27,7 @@ import { isGitRepo, gcWorktrees, laneDiff } from '../src/git.mjs';
 import { loadProjectConfig } from '../src/config.mjs';
 import { registerProject } from '../src/registry.mjs';
 import { createOutputRenderer } from '../src/render.mjs';
+import { listLaneLogs, readLaneLog, readLatestLaneLog } from '../src/logs.mjs';
 
 const REPO_OPTION = { repo: { type: 'string', short: 'C' } };
 
@@ -85,6 +86,7 @@ const COMMAND_HELP = {
   fork: { summary: 'Split a new sibling lane off an existing one', usage: 'taskherd fork [-C repo] <new-lane> --from <parent> [add opts] ["<task>"]' },
   ack: { summary: 'Answer a gate / clear a parked failure / land a branch', usage: 'taskherd ack [-C repo] <lane>' },
   diff: { summary: "Show a lane's branch diff before landing", usage: 'taskherd diff [-C repo] <lane> [--base <branch>]' },
+  logs: { summary: "List or replay a lane's past run logs (AI steps rendered readably)", usage: 'taskherd logs [-C repo] <lane> [--last | --file <name>]' },
   attach: { summary: "Attach to a running step's live terminal (Ctrl-] detaches)", usage: 'taskherd attach [-C repo] <lane>' },
   pause: { summary: 'Halt all lanes (the kill-switch)', usage: 'taskherd pause [-C repo | <repo>]' },
   resume: { summary: 'Clear the pause', usage: 'taskherd resume [-C repo | <repo>]' },
@@ -364,6 +366,46 @@ async function cmdDiff(argv) {
     process.stdout.write(d.patch.endsWith('\n') ? d.patch : `${d.patch}\n`);
   }
   if (d.truncated) console.log(`taskherd: diff truncated at ${d.bytes} bytes — inspect the full diff in the worktree`);
+}
+
+// `taskherd logs <lane>` — the post-run/historical half of `attach`: once a step
+// exits its control socket is gone, but the pty log FILE remains. No flag lists
+// the lane's logs (newest first); `--last`/`--file` replays one through the same
+// stream-json renderer attach uses, so an ai run reads back as a transcript.
+async function cmdLogs(argv) {
+  const { values, positionals } = parseRepoOnly(argv, { file: { type: 'string' }, last: { type: 'boolean' } });
+  const { repo, rest } = resolveRepo(values.repo, positionals);
+  requireTasksDir(repo);
+  const [laneName] = rest;
+  if (!laneName) usageError('logs');
+
+  // Replay one log (chosen file, or the newest with --last) through the renderer.
+  if (values.file || values.last) {
+    const log = values.file
+      ? await readLaneLog(repo, laneName, values.file)
+      : await readLatestLaneLog(repo, laneName);
+    if (!log.exists) {
+      console.log(`taskherd: no log to show for '${laneName}'${values.file ? ` (file '${values.file}')` : ''}`);
+      return;
+    }
+    console.log(`taskherd: ${log.file}${log.truncated ? ` (truncated at ${log.bytes} bytes)` : ''}`);
+    const renderer = createOutputRenderer(process.stdout);
+    renderer.feed(log.text);
+    renderer.flush();
+    if (!log.text.endsWith('\n')) process.stdout.write('\n');
+    return;
+  }
+
+  // Default: list the lane's logs, newest first.
+  const logs = await listLaneLogs(repo, laneName);
+  if (logs.length === 0) {
+    console.log(`taskherd: lane '${laneName}' has no logs yet`);
+    return;
+  }
+  console.log(`taskherd: ${logs.length} log(s) for '${laneName}' (newest first) — replay with --last or --file <name>`);
+  for (const l of logs) {
+    console.log(`  ${new Date(l.mtime).toISOString()}  ${String(l.bytes).padStart(8)}B  ${l.file}`);
+  }
 }
 
 async function cmdAttach(argv) {
@@ -865,6 +907,7 @@ const COMMANDS = {
   fork: cmdFork,
   ack: cmdAck,
   diff: cmdDiff,
+  logs: cmdLogs,
   attach: cmdAttach,
   pause: cmdPause,
   resume: cmdResume,
