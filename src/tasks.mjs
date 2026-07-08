@@ -24,7 +24,43 @@ const execFileAsync = promisify(execFile);
 
 const STEP_TYPES = ['command', 'ai', 'manual'];
 
+// A step `id` / lane name token: letters, digits, ., _, - (no ':' — that's the
+// waitsFor lane:id separator). Shared with validateLaneName's charset.
+const TOKEN = /^[A-Za-z0-9][A-Za-z0-9._-]*$/;
+
 export class LaneValidationError extends Error {}
+
+// Parses one `waitsFor` reference (DESIGN §22 cross-lane dependencies) into its
+// target. Three forms:
+//   "lane:id"  → step `id` in lane `lane`     (the cross-lane case)
+//   ":id"      → step `id` in the SAME lane   (leading colon = self)
+//   "lane"     → the whole lane's queue drained (no colon = whole-lane)
+// `lane: null` means "resolve against the waiting step's own lane". Throws on a
+// malformed ref so a bad dependency fails loudly at write time (DESIGN §1) — the
+// TARGET's existence is a runtime question (it may not be enqueued yet), checked
+// live by evaluateWaits, not here.
+export function parseWaitRef(ref) {
+  if (typeof ref !== 'string' || ref.trim() === '') {
+    throw new LaneValidationError(`taskherd: waitsFor entry must be a non-empty string, got ${JSON.stringify(ref)}`);
+  }
+  const r = ref.trim();
+  const colon = r.indexOf(':');
+  if (colon !== -1) {
+    const lanePart = r.slice(0, colon);
+    const idPart = r.slice(colon + 1);
+    if (!TOKEN.test(idPart)) {
+      throw new LaneValidationError(`taskherd: waitsFor ${JSON.stringify(ref)} — step id after ':' must be letters/digits/._- (e.g. "grammar-unification:U2")`);
+    }
+    if (lanePart !== '' && !TOKEN.test(lanePart)) {
+      throw new LaneValidationError(`taskherd: waitsFor ${JSON.stringify(ref)} — lane before ':' is not a valid lane name`);
+    }
+    return { lane: lanePart || null, stepId: idPart };
+  }
+  if (!TOKEN.test(r)) {
+    throw new LaneValidationError(`taskherd: waitsFor ${JSON.stringify(ref)} — a bare reference must be a lane name (whole-lane wait); use "lane:id" for a specific step`);
+  }
+  return { lane: r, stepId: null };
+}
 
 export function validateStep(step) {
   if (!step || typeof step !== 'object') {
@@ -46,7 +82,102 @@ export function validateStep(step) {
   if (step.type === 'manual' && !step.message) {
     throw new LaneValidationError('taskherd: manual step needs `message`');
   }
+  // Optional cross-lane dependency fields (DESIGN §22). `id` labels a step so
+  // other lanes can wait on it; `waitsFor` lists refs that must be satisfied
+  // before this step runs. Shape-validated here; satisfaction is a run-time,
+  // whole-tree question (evaluateWaits).
+  if (step.id != null && (typeof step.id !== 'string' || !TOKEN.test(step.id))) {
+    throw new LaneValidationError(`taskherd: step id ${JSON.stringify(step.id)} must be letters/digits/._- (used as a waitsFor target)`);
+  }
+  if (step.waitsFor != null) {
+    if (!Array.isArray(step.waitsFor)) {
+      throw new LaneValidationError('taskherd: step `waitsFor` must be an array of "lane:id" / "lane" references');
+    }
+    for (const ref of step.waitsFor) parseWaitRef(ref);
+  }
   return step;
+}
+
+// Evaluates a step's `waitsFor` against the whole lane set (a name→lane map).
+// `selfLane` resolves same-lane (`:id`) refs. Returns the UNMET references with a
+// classified reason so callers can surface why a lane isn't moving:
+//   step-pending  — target step exists, not `done` yet (the normal, will-clear case)
+//   lane-pending  — whole-lane target still has queued steps
+//   missing-step  — target lane exists but has no step with that id (not enqueued yet / typo)
+//   missing-lane  — no such lane
+// satisfied === (unmet.length === 0). A step with no waitsFor is trivially satisfied.
+export function evaluateWaits(step, selfLane, lanesByName) {
+  const refs = step?.waitsFor;
+  if (!Array.isArray(refs) || refs.length === 0) return { satisfied: true, unmet: [] };
+  const unmet = [];
+  for (const ref of refs) {
+    const { lane: refLane, stepId } = parseWaitRef(ref);
+    const targetLane = refLane || selfLane;
+    const target = lanesByName[targetLane];
+    if (!target) { unmet.push({ ref, targetLane, stepId, reason: 'missing-lane' }); continue; }
+    if (stepId == null) {
+      if ((target.cursor || 0) < (target.steps?.length || 0)) {
+        unmet.push({ ref, targetLane, stepId: null, reason: 'lane-pending' });
+      }
+      continue;
+    }
+    const targetStep = (target.steps || []).find((s) => s.id === stepId);
+    if (!targetStep) { unmet.push({ ref, targetLane, stepId, reason: 'missing-step' }); continue; }
+    if (targetStep.status !== 'done') unmet.push({ ref, targetLane, stepId, reason: 'step-pending' });
+  }
+  return { satisfied: unmet.length === 0, unmet };
+}
+
+// Which lanes are soft-waiting on an unmet dependency right now (DESIGN §22): a
+// lane whose next action is a step with unmet `waitsFor`. Pure over a lane set —
+// shared by the scheduler (skip these this fire) and status rendering (show the
+// wait). A `blocked` lane is a real gate/failure, not a soft wait, so it's
+// excluded. Returns `[{ lane: name, index, unmet }]`.
+export function computeWaiting(lanes, fallback = {}) {
+  const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
+  const waiting = [];
+  for (const lane of lanes) {
+    if (lane.status === 'blocked') continue;
+    const action = nextAction(lane, fallback);
+    if (action.kind === 'idle') continue;
+    const { satisfied, unmet } = evaluateWaits(action.step, lane.name, byName);
+    if (!satisfied) waiting.push({ lane: lane.name, index: action.index, unmet });
+  }
+  return waiting;
+}
+
+// Finds lanes trapped in a `waitsFor` CYCLE (A waits on B, B waits on A) — a true
+// deadlock that will never self-clear, vs. a lane merely waiting on one that can
+// still make progress. Edges only count toward a cycle when they point at
+// another WAITING lane (a wait on a runnable/idle lane will resolve on its own).
+// Returns the lane names on any cycle (empty if none). Used to escalate a stall
+// from "surface it" to "loud DEADLOCK" (DESIGN §1/§22).
+export function detectWaitCycles(waiting) {
+  const waitingNames = new Set(waiting.map((w) => w.lane));
+  const adj = new Map();
+  for (const w of waiting) {
+    const outs = new Set();
+    for (const u of w.unmet) if (waitingNames.has(u.targetLane)) outs.add(u.targetLane);
+    adj.set(w.lane, outs);
+  }
+  const onCycle = new Set();
+  const state = new Map(); // undefined=unseen, 1=on-stack, 2=done
+  const stack = [];
+  const visit = (node) => {
+    state.set(node, 1);
+    stack.push(node);
+    for (const next of adj.get(node) || []) {
+      if (state.get(next) === 1) {
+        for (const n of stack.slice(stack.indexOf(next))) onCycle.add(n);
+      } else if (!state.get(next)) {
+        visit(next);
+      }
+    }
+    stack.pop();
+    state.set(node, 2);
+  };
+  for (const node of adj.keys()) if (!state.get(node)) visit(node);
+  return [...onCycle];
 }
 
 // Axis fields default to null = inherit (step → lane → project → user config,
@@ -300,18 +431,36 @@ export function validateLaneName(name) {
   return name;
 }
 
+// Normalizes a `waitsFor` opt (array, or a comma/space-separated string from the
+// CLI) into a clean array of ref strings, or null when empty.
+export function normalizeWaitsFor(v) {
+  if (v == null) return null;
+  const arr = Array.isArray(v) ? v : String(v).split(/[,\s]+/);
+  const out = arr.map((s) => String(s).trim()).filter(Boolean);
+  return out.length ? out : null;
+}
+
+// The cross-lane dependency fields (DESIGN §22) are common to every step type,
+// like `status` — attach them uniformly so `add`/`block`/`fork` all support them.
+function withDeps(step, opts) {
+  if (opts.id) step.id = opts.id;
+  const waitsFor = normalizeWaitsFor(opts.waitsFor);
+  if (waitsFor) step.waitsFor = waitsFor;
+  return step;
+}
+
 // Canonical step builder shared by every client of the lane files (the CLI's
 // `add`, MCP `tasks_add`/`tasks_block`/`tasks_fork` — DESIGN §3: they must not
 // drift apart). Opts are camelCase; validates before returning.
 export function buildStep(opts = {}) {
   const type = opts.type || 'command';
   if (type === 'manual') {
-    return validateStep({
+    return validateStep(withDeps({
       type: 'manual',
       message: opts.message || opts.task,
       ...(opts.file ? { file: opts.file } : {}),
       status: 'pending',
-    });
+    }, opts));
   }
   if (type === 'ai') {
     const step = { type: 'ai', status: 'pending' };
@@ -333,7 +482,7 @@ export function buildStep(opts = {}) {
     }
     if (opts.budgetPerDay != null) budget = { ...(budget || {}), usdPerDay: Number(opts.budgetPerDay) };
     if (budget) step.budget = budget;
-    return validateStep(step);
+    return validateStep(withDeps(step, opts));
   }
   // A command step honors the `runner` axis too (DESIGN §11: a read-only/remote
   // command is a first-class runner target — e.g. a container build or a remote
@@ -341,7 +490,7 @@ export function buildStep(opts = {}) {
   // silently dropped the runner and ran on the host.
   const step = { type: 'command', run: opts.run ?? opts.task, status: 'pending' };
   if (opts.runner) step.runner = opts.runner;
-  return validateStep(step);
+  return validateStep(withDeps(step, opts));
 }
 
 // Lane-level axis settings a client may set alongside a step (DESIGN §7:
@@ -353,9 +502,33 @@ function applyLaneOpts(lane, laneOpts = {}) {
   if (laneOpts.onEmpty) lane.onEmpty = laneOpts.onEmpty;
 }
 
+// Resolves where a newly-added step lands in lane.steps (DESIGN §15 "reorder,
+// add"): `'end'`/undefined appends (the default), `'next'` inserts at the
+// editable frontier so it fires on the very NEXT fire — ahead of a step
+// already waiting at the cursor — and an integer inserts BEFORE that index.
+// Never returns an index inside the frozen region (see editableFrontier): a
+// step that already ran, or the live step whose result the executor writes
+// back by index. An out-of-range `at` fails loudly rather than silently
+// clamping to the end.
+function resolveInsertIndex(repo, lane, at) {
+  if (at == null || at === 'end') return lane.steps.length;
+  const frontier = editableFrontier(repo, lane);
+  if (at === 'next') return frontier;
+  const idx = Number(at);
+  if (!Number.isInteger(idx) || idx < frontier || idx > lane.steps.length) {
+    throw new LaneValidationError(
+      `taskherd: cannot insert into lane '${lane.name}' at ${JSON.stringify(at)} — `
+      + `use 'next', 'end', or an index in ${frontier}..${lane.steps.length}`,
+    );
+  }
+  return idx;
+}
+
 // Appends a step to a lane (creating the lane on first use), or — with
-// `asDefault` — sets the lane's recurring default (DESIGN §6). Shared by the
-// CLI `add`/`block` and MCP `tasks_add`/`tasks_block`.
+// `asDefault` — sets the lane's recurring default (DESIGN §6). `laneOpts.at`
+// ('next' | 'end' | index) chooses where a queued step lands so a client can
+// interpose one ahead of the pending cursor step instead of only appending
+// (DESIGN §15). Shared by the CLI `add`/`block` and MCP `tasks_add`/`tasks_block`.
 export async function addStep(repo, laneName, stepOpts, laneOpts = {}) {
   validateLaneName(laneName);
   const lane = (await laneExists(repo, laneName)) ? await loadLane(repo, laneName) : newLane(laneName);
@@ -368,9 +541,10 @@ export async function addStep(repo, laneName, stepOpts, laneOpts = {}) {
     await saveLane(repo, lane);
     return { lane, step: defaultStep, index: 'default' };
   }
-  lane.steps.push(step);
+  const at = resolveInsertIndex(repo, lane, laneOpts.at);
+  lane.steps.splice(at, 0, step);
   await saveLane(repo, lane);
-  return { lane, step, index: lane.steps.length - 1 };
+  return { lane, step, index: at };
 }
 
 // Queue editing (DESIGN §15 "reorder, add, edit, remove steps"). Only the
@@ -383,8 +557,18 @@ export function laneIsRunning(repo, laneName) {
   return existsSync(runSocketLink(repo, laneName));
 }
 
+// The first index a client may touch: everything below is frozen. Steps before
+// the cursor already ran; while the lane is live the cursor step is off-limits
+// too — the executor patches its result back BY INDEX after the run (the M1.1
+// lost-update fix), so shifting or mutating it would corrupt that write-back.
+// Shared by the edit guards and the insert-position resolver so the boundary
+// can't drift between them.
+function editableFrontier(repo, lane) {
+  return lane.cursor + (laneIsRunning(repo, lane.name) ? 1 : 0);
+}
+
 function assertEditableIndex(repo, lane, index, verb) {
-  const min = lane.cursor + (laneIsRunning(repo, lane.name) ? 1 : 0);
+  const min = editableFrontier(repo, lane);
   if (!Number.isInteger(index) || index < 0 || index >= lane.steps.length) {
     throw new LaneValidationError(`taskherd: lane '${lane.name}' has no step ${index}`);
   }

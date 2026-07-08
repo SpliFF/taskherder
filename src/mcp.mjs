@@ -81,6 +81,8 @@ const STEP_PROPS = {
   run: { type: 'string', description: 'Shell command (command steps; alias of task).' },
   message: { type: 'string', description: 'Gate message (manual steps).' },
   file: { type: 'string', description: 'file-as-prompt: a path (relative to .tasks/, e.g. desc/x.md) whose contents are the prompt / gate prose.' },
+  id: { type: 'string', description: 'Stable label for this step so OTHER steps can wait on it (a waitsFor target), e.g. "U2". Letters/digits/._- only.' },
+  waitsFor: { type: 'array', items: { type: 'string' }, description: 'Cross-lane dependencies (DESIGN §22): this step will not run until every reference is satisfied, and the wait AUTO-CLEARS (no ack). Forms: "lane:id" (a specific step in another lane — the common case), ":id" (a step in THIS lane), or "lane" (that lane\'s whole queue drained). A ref is satisfied when its target step is `done`. Use this for a real prerequisite instead of hand-holding a manual gate.' },
   provider: { type: 'string', description: 'AI provider (e.g. claude).' },
   model: { type: 'string', description: 'Model override (e.g. sonnet, opus).' },
   profile: { type: 'string', description: 'Auth profile name (per-account isolation).' },
@@ -99,6 +101,13 @@ const LANE_PROPS = {
   base: { type: 'string', description: 'Base branch the lane branch forks from / lands into.' },
   onEmpty: { type: 'string', enum: ['default', 'idle'], description: 'What an empty lane does each fire.' },
   asDefault: { type: 'boolean', description: 'Set the step as the lane\'s recurring default (runs every fire once the queue is empty) instead of appending it.' },
+};
+
+// Insert position (DESIGN §15). `next` interposes the step ahead of one already
+// waiting at the cursor — the right tool for gating/retiring the pending step,
+// which a plain append (`end`) can't do (the pending step would fire first).
+const POSITION_PROP = {
+  at: { type: 'string', description: 'Where to place the step: `next` (fires on the very NEXT fire, ahead of any step already waiting at the cursor), `end` (append — the default), or a step index. Pass as a string.' },
 };
 
 // The §16 tool surface. Descriptions are written for the agent driving them
@@ -121,26 +130,28 @@ const TOOLS = [
   },
   {
     name: 'tasks_add',
-    description: 'Append a step to a lane (creates the lane on first use), or set the lane\'s recurring default with asDefault. Enqueue an explicit step only when the next fire needs a SPECIFIC prompt/model/provider — an onEmpty-default lane already runs its default each fire with no bookkeeping.',
+    description: 'Add a step to a lane (creates the lane on first use), or set the lane\'s recurring default with asDefault. Appends by default; pass `at:"next"` to interpose it ahead of a step already waiting at the cursor. Enqueue an explicit step only when the next fire needs a SPECIFIC prompt/model/provider — an onEmpty-default lane already runs its default each fire with no bookkeeping. To make one lane wait on another\'s progress, give the prerequisite an `id` and list it in this step\'s `waitsFor` (e.g. waitsFor:["grammar-unification:U2"]) — a real dependency that auto-clears, instead of hand-holding a manual gate (DESIGN §22).',
     inputSchema: {
       type: 'object',
       properties: {
         lane: { type: 'string', description: 'Lane name (created if missing).' },
         ...STEP_PROPS,
         ...LANE_PROPS,
+        ...POSITION_PROP,
       },
       required: ['lane'],
     },
   },
   {
     name: 'tasks_block',
-    description: 'Append a blocking manual gate to a lane: the lane pauses until a human acks; sibling lanes continue. Use for open threads that need a human — a design question, missing creds, a sign-off, an external action. Defaults to the current lane (TASKHERD_LANE) when running as a scheduled step.',
+    description: 'Insert a blocking manual gate into a lane: the lane pauses until a human acks; sibling lanes continue. Use for open threads that need a human — a design question, missing creds, a sign-off, an external action. Placed at `next` by default, so it fires ahead of any step already waiting at the cursor (pass `at:"end"` to gate only after the rest of the queue drains). Defaults to the current lane (TASKHERD_LANE) when running as a scheduled step.',
     inputSchema: {
       type: 'object',
       properties: {
         lane: { type: 'string', description: 'Lane to gate (default: the lane this step runs in, from TASKHERD_LANE).' },
         message: { type: 'string', description: 'What the human must decide/do — shown in status and NEEDS-ATTENTION.md.' },
         file: { type: 'string', description: 'Optional desc/*.md file (relative to .tasks/) with the full prose.' },
+        at: { type: 'string', description: 'Where to place the gate: `next` (default — fires ahead of the pending cursor step), `end` (after the rest of the queue), or a step index. Pass as a string.' },
       },
       required: ['message'],
     },
@@ -174,10 +185,13 @@ const TOOLS = [
 
 function splitArgs(args = {}) {
   const {
-    lane, name, from, isolation, land, base, onEmpty, asDefault, ...stepOpts
+    lane, name, from, isolation, land, base, onEmpty, asDefault, at, ...stepOpts
   } = args;
   return {
-    lane, name, from, laneOpts: { isolation, land, base, onEmpty, asDefault }, stepOpts,
+    lane, name, from, laneOpts: {
+      isolation, land, base, onEmpty, asDefault, at,
+    },
+    stepOpts,
   };
 }
 
@@ -229,7 +243,14 @@ export function createTaskherdServer({ cwd = process.cwd(), env = process.env } 
       if (!lane) {
         throw new Error('taskherd: tasks_block needs a lane (none given and TASKHERD_LANE is not set)');
       }
-      const { index } = await addStep(repo, lane, { type: 'manual', message: args.message, file: args.file });
+      // Default to `next`: a block is meant to STOP the lane here, ahead of any
+      // step already waiting at the cursor — appending would let that step fire
+      // first. `at:"end"` opts back into after-the-queue gating.
+      const { index } = await addStep(
+        repo, lane,
+        { type: 'manual', message: args.message, file: args.file },
+        { at: args.at || 'next' },
+      );
       return text(`gated lane '${lane}' at step ${index} — it pauses there until a human acks; siblings continue`);
     },
     async tasks_fork(args) {

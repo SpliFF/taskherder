@@ -221,6 +221,31 @@ test('serve: GET /diff returns a lane branch diff for review; missing lane is a 
   assert.equal((await api('GET', `/api/projects/${id}/diff?lane=feat`, null, null)).status, 401);
 });
 
+test('serve: /api/projects carries the waitsFor state the console renders (§22)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  // dep exposes a labelled step; main has a step that waits on it.
+  await addStep(repo, 'dep', { type: 'command', task: 'echo u2', id: 'U2' });
+  await addStep(repo, 'main', { type: 'command', task: 'echo go', waitsFor: ['dep:U2'] });
+
+  const { console_, api } = await startServer();
+  t.after(() => console_.close());
+  const id = repoId(repo);
+
+  const { body: state } = await api('GET', '/api/projects');
+  const project = state.projects.find((p) => p.id === id);
+  const main = project.lanes.find((l) => l.name === 'main');
+  // The lane reads as `waiting` (not blocked) with the unmet refs — the console's
+  // cyan wait-banner + dot render straight off these fields.
+  assert.equal(main.status, 'waiting');
+  assert.deepEqual(main.waiting, ['dep:U2']);
+  assert.deepEqual(main.steps[0].waitsFor, ['dep:U2']);
+  // dep exposes the id chip the console shows as a waitsFor target.
+  const dep = project.lanes.find((l) => l.name === 'dep');
+  assert.equal(dep.steps[0].id, 'U2');
+  assert.equal(dep.waiting, null, 'a lane with nothing to wait on is not waiting');
+});
+
 test('serve: RUN fires one lane in the serve process; force overrides pause', async (t) => {
   const { repo, cleanup } = await makeRepo();
   t.after(cleanup);

@@ -14,6 +14,7 @@
   --run: #52d273;
   --gate: #f2b13e;
   --fail: #ff6b5e;
+  --wait: #58b5c9; /* cyan: a soft, self-clearing cross-lane wait (not a gate) */
   --ink: #0a0c0a;
   --mono: ui-monospace, "SF Mono", "Cascadia Code", "JetBrains Mono", Menlo, Consolas, monospace;
 }
@@ -134,6 +135,7 @@ main {
 .lane.is-running { border-color: #2d5b3b; box-shadow: 0 0 0 1px #52d27322, 0 0 24px #52d27310; }
 .lane.is-blocked { border-color: #6b5220; }
 .lane.is-failed { border-color: #6b2d28; box-shadow: 0 0 0 1px #ff6b5e18; }
+.lane.is-waiting { border-color: #2b5560; }
 
 .lane-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
 .lane-name { font-weight: 700; font-size: 14px; }
@@ -144,6 +146,7 @@ main {
 .dot.running { color: var(--run); animation: pulse 1.6s ease-in-out infinite; }
 .dot.blocked { color: var(--gate); }
 .dot.failed { color: var(--fail); }
+.dot.waiting { color: var(--wait); }
 .dot.idle { color: var(--faint); }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
@@ -184,6 +187,24 @@ main {
   overflow-wrap: anywhere;
 }
 
+/* A cross-lane wait (DESIGN §22): calmer than a gate — it needs no human, it
+   clears itself — so cyan, no button, just the refs it's waiting on. */
+.wait-banner {
+  border: 1px solid #2b5560;
+  border-left: 6px solid var(--wait);
+  background: #58b5c910;
+  padding: 7px 10px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 10px;
+  align-items: baseline;
+  font-size: 12px;
+}
+.wait-label { color: var(--wait); font-weight: 700; letter-spacing: 0.06em; flex: none; }
+.wait-refs { color: var(--text); overflow-wrap: anywhere; }
+.wait-refs code { color: var(--wait); }
+.wait-note { color: var(--faint); font-size: 11px; margin-left: auto; }
+
 /* ── queue ────────────────────────────────────────────────────────────── */
 
 .steps { list-style: none; margin: 0; padding: 0; border-top: 1px dashed var(--line); }
@@ -204,9 +225,19 @@ main {
 .step.blocked .step-glyph { color: var(--gate); }
 .step.pending .step-glyph { color: var(--faint); }
 .step.done .step-text { color: var(--faint); text-decoration: line-through; text-decoration-color: #ffffff30; }
+.step.waiting-here .step-glyph { color: var(--wait); }
 .step-text { flex: 1; overflow-wrap: anywhere; }
 .step-type { color: var(--faint); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; flex: none; }
 .step-tools { display: flex; gap: 2px; flex: none; }
+
+/* Dependency chips on a step: `#id` (a waitsFor target) and `⧗ refs` (what this
+   step waits on). Small, monospace, non-shrinking so they read as metadata. */
+.step-id, .step-waits {
+  font-size: 10px; flex: none; border-radius: 3px; padding: 0 4px;
+  border: 1px solid var(--line-strong);
+}
+.step-id { color: var(--dim); letter-spacing: 0.04em; }
+.step-waits { color: var(--wait); border-color: #2b5560; overflow-wrap: anywhere; }
 
 .lane-default { color: var(--dim); font-size: 11px; padding: 4px 0; }
 .lane-default::before { content: "↻ "; color: var(--faint); }

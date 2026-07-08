@@ -2,7 +2,7 @@
 import { appendFile, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import { historyFile, runSocketLink } from './paths.mjs';
-import { loadAllLanesResilient } from './tasks.mjs';
+import { loadAllLanesResilient, computeWaiting } from './tasks.mjs';
 
 export async function appendHistory(repo, record) {
   await appendFile(historyFile(repo), `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`);
@@ -31,6 +31,12 @@ function fmtUsd(n) {
 export async function statusData(repo) {
   const { lanes, unloadable } = await loadAllLanesResilient(repo);
   const history = await readHistory(repo);
+
+  // Cross-lane waits (DESIGN §22), evaluated live against the whole set: a lane
+  // whose next step is blocked on an unmet dependency reads as `waiting` here
+  // (auto-clearing — distinct from a `blocked` gate that needs an ack).
+  const waitingByLane = {};
+  for (const w of computeWaiting(lanes)) waitingByLane[w.lane] = w.unmet;
 
   // Running cost totals (DESIGN §10).
   const spentByLane = {};
@@ -70,21 +76,27 @@ export async function statusData(repo) {
         gate = (step && step.parkedReason) || 'blocked';
       }
     }
+    // A waiting lane isn't `blocked` (no ack needed) — it reads as `waiting`, with
+    // the unmet refs surfaced so a human sees WHY it isn't advancing (DESIGN §22).
+    const unmetWaits = (!running && lane.status !== 'blocked') ? waitingByLane[lane.name] : null;
     return {
       name: lane.name,
       parent: lane.parent || null,
       cursor: lane.cursor,
-      status: running ? 'running' : lane.status,
+      status: running ? 'running' : (unmetWaits ? 'waiting' : lane.status),
       running,
       gate,
       gateKind,
       gateDetail,
+      waiting: unmetWaits ? unmetWaits.map((u) => u.ref) : null,
       onEmpty: lane.onEmpty || null,
       default: lane.default || null,
       steps: (lane.steps || []).map((s) => ({
         type: s.type,
         status: s.status,
         summary: s.type === 'manual' ? s.message : (s.task || s.run || s.file || (s.argv || []).join(' ') || ''),
+        ...(s.id ? { id: s.id } : {}),
+        ...(s.waitsFor ? { waitsFor: s.waitsFor } : {}),
         ...(s.parkedReason ? { parkedReason: s.parkedReason } : {}),
         ...(s.error ? { error: s.error } : {}),
         ...(s.land ? { land: s.land } : {}),
@@ -107,6 +119,7 @@ export async function renderStatus(repo) {
     const spent = lane.spent ? `  spent: ${fmtUsd(lane.spent)}` : '';
     lines.push(`${lane.name}  [${lane.cursor}/${lane.steps.length}]  ${lane.status || 'idle'}  last: ${lane.last ? lane.last.result : 'never run'}${spent}`);
     if (lane.gate) lines.push(`  gate: ${lane.gate}`);
+    if (lane.waiting) lines.push(`  waiting on: ${lane.waiting.join(', ')}`);
   }
   for (const bad of unloadable) {
     lines.push(`${bad.name}  [unloadable]  ${bad.error}`);

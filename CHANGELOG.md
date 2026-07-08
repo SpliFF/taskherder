@@ -5,6 +5,39 @@ based on [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/). Pre-1.0: minor versions may include breaking
 changes.
 
+## 0.1.4 — 2026-07-08
+
+### Added
+- **Cross-lane task dependencies (`waitsFor`)** — DESIGN §22, previously deferred.
+  A step can carry a stable **`id`** label and a **`waitsFor`** list of references;
+  it will not run until every reference is satisfied. Reference forms:
+  `"lane:id"` (a specific step in another lane), `":id"` (a step in the same lane),
+  or `"lane"` (that lane's whole queue drained). A reference is satisfied when its
+  target step is `done`. The wait is **soft and auto-clearing** — no manual gate,
+  no ack: the lane simply holds each fire and resumes the instant the prerequisite
+  lands. This replaces hand-holding a manual interlock gate ("don't ack until the
+  other lane reaches X"). Surfaced everywhere: `taskherd add --id <label>
+  --waits-for <lane:id>` (repeatable), MCP `tasks_add`/`tasks_fork` (`id` +
+  `waitsFor`), and `taskherd status` (a `waiting` lane shows `waiting on: …`).
+  **Safety:** a stall (lanes waiting while nothing can run) is surfaced loudly in
+  `NEEDS-ATTENTION.md` + stderr + a `waitsFor.stalled` event, and a true
+  dependency cycle is reported as a `waitsFor.deadlock` — never a silent hang.
+  **Web console:** a waiting lane shows a cyan `⧗ WAITING on …` banner (no ACK —
+  it self-clears), a `waiting` status dot, and per-step `#id` / `⧗ waits` chips;
+  a stall or deadlock raises a live toast.
+- **Step insert position.** `taskherd add` / `block`, MCP `tasks_add` / `tasks_block`,
+  and the serve `add` action take an `at` directive — `next` (interpose ahead of
+  the step already waiting at the cursor, so it fires on the very next fire),
+  `end` (append — the default), or an explicit index. The insert point can never
+  fall inside the frozen region (a step that already ran, or the live step whose
+  result the executor writes back by index); an out-of-range `at` fails loudly.
+
+### Changed
+- **`block` now defaults to `at:"next"`.** A manual gate is meant to STOP the
+  lane where it is raised, so it now interposes ahead of any pending cursor step
+  instead of appending behind the whole queue (which let that step fire first —
+  the reported bug). Pass `at:"end"` for the old append-at-tail behavior.
+
 ## 0.1.3 — 2026-07-08
 
 ### Added

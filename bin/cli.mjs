@@ -79,8 +79,8 @@ const COMMAND_HELP = {
   init: { summary: 'Initialize .tasks/ in a repo (register it, scaffold config)', usage: 'taskherd init [-C repo | <repo>] [--no-global-gitignore]' },
   run: { summary: 'Fire the scheduler once — run ONE step (--lane targets one lane)', usage: 'taskherd run [-C repo | <repo>] [--lane <name>] [--force]' },
   status: { summary: 'Show lanes, last result, open gates, and cost', usage: 'taskherd status [-C repo | <repo>]' },
-  add: { summary: 'Queue a step onto a lane (command | ai | manual)', usage: 'taskherd add [-C repo] <lane> [--type command|ai|manual] [--isolation worktree|inplace|none] [--land manual-gate|pr|leave] [--base <branch>] [opts] "<task>"' },
-  block: { summary: 'Add a manual gate that blocks a lane until acked', usage: 'taskherd block [-C repo] <lane> --message "<text>" [--file <path>]' },
+  add: { summary: 'Queue a step onto a lane (command | ai | manual)', usage: 'taskherd add [-C repo] <lane> [--type command|ai|manual] [--at next|end|<index>] [--id <label>] [--waits-for <lane:id>]... [--isolation worktree|inplace|none] [--land manual-gate|pr|leave] [--base <branch>] [opts] "<task>"' },
+  block: { summary: 'Add a manual gate that blocks a lane until acked', usage: 'taskherd block [-C repo] <lane> --message "<text>" [--at next|end|<index>] [--file <path>]' },
   fork: { summary: 'Split a new sibling lane off an existing one', usage: 'taskherd fork [-C repo] <new-lane> --from <parent> [add opts] ["<task>"]' },
   ack: { summary: 'Answer a gate / clear a parked failure / land a branch', usage: 'taskherd ack [-C repo] <lane>' },
   diff: { summary: "Show a lane's branch diff before landing", usage: 'taskherd diff [-C repo] <lane> [--base <branch>]' },
@@ -184,6 +184,8 @@ function stepOptsFromFlags(values, task) {
     task: task || undefined,
     message: values.message,
     file: values.file,
+    id: values.id,
+    waitsFor: values['waits-for'],
     provider: values.provider,
     model: values.model,
     profile: values.profile,
@@ -204,6 +206,7 @@ function laneOptsFromFlags(values) {
     base: values.base,
     onEmpty: values['on-empty'],
     asDefault: values.default,
+    at: values.at,
   };
 }
 
@@ -211,6 +214,8 @@ const ADD_OPTIONS = {
   type: { type: 'string', default: 'command' },
   message: { type: 'string' },
   file: { type: 'string' },
+  id: { type: 'string' },
+  'waits-for': { type: 'string', multiple: true },
   'on-empty': { type: 'string' },
   provider: { type: 'string' },
   model: { type: 'string' },
@@ -226,6 +231,7 @@ const ADD_OPTIONS = {
   land: { type: 'string' },
   base: { type: 'string' },
   default: { type: 'boolean', default: false },
+  at: { type: 'string' },
 };
 
 async function cmdAdd(argv) {
@@ -268,8 +274,13 @@ async function cmdBlock(argv) {
   const { values, positionals } = parseRepoOnly(argv, {
     message: { type: 'string' },
     file: { type: 'string' },
+    at: { type: 'string' },
   });
-  const forward = [...positionals, '--type', 'manual', '--message', values.message || ''];
+  // A gate defaults to `next` — it stops the lane HERE, ahead of any pending
+  // step at the cursor; append (`--at end`) would let that step fire first.
+  const forward = [
+    ...positionals, '--type', 'manual', '--message', values.message || '', '--at', values.at || 'next',
+  ];
   if (values.file) forward.push('--file', values.file);
   if (values.repo) forward.push('--repo', values.repo);
   await cmdAdd(forward);

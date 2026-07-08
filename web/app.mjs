@@ -78,7 +78,9 @@ function scheduleRefresh() {
   }, 120);
 }
 
-const GLYPH = { done: '✓', failed: '✗', blocked: '◆', pending: '·', running: '▸' };
+const GLYPH = {
+  done: '✓', failed: '✗', blocked: '◆', pending: '·', running: '▸', waiting: '⧗',
+};
 
 // The block banner at the top of a lane. A `failure` (a step that crashed,
 // timed out, or hit a provider limit) reads as a RED error carrying the actual
@@ -103,12 +105,34 @@ function gateBannerHtml(lane) {
   </div>`;
 }
 
+// A lane held by an unmet cross-lane dependency (DESIGN §22 waitsFor). Unlike a
+// gate, this needs NO human action — it clears itself the instant the
+// prerequisite lands — so it reads as calm cyan info, with the refs but no ACK.
+function waitBannerHtml(lane) {
+  if (!lane.waiting?.length) return '';
+  const refs = lane.waiting.map((r) => `<code>${esc(r)}</code>`).join(', ');
+  return `<div class="wait-banner">
+    <span class="wait-label">⧗ WAITING</span>
+    <span class="wait-refs">on ${refs}</span>
+    <span class="wait-note">clears when the dependency lands — no action needed</span>
+  </div>`;
+}
+
 function laneHtml(p, lane) {
   const running = lane.running;
+  const waiting = !!lane.waiting?.length;
   const editableFrom = lane.cursor + (running ? 1 : 0);
   const steps = lane.steps.map((s, i) => {
     const active = i === lane.cursor && running;
-    const cls = active ? 'running' : s.status;
+    // The step at the cursor is the one holding a waiting lane (DESIGN §22) —
+    // point at it with the ⧗ glyph so it's clear WHICH step is blocked on a dep.
+    const waitingHere = i === lane.cursor && waiting;
+    const glyph = active ? GLYPH.running : (waitingHere ? GLYPH.waiting : (GLYPH[s.status] || '·'));
+    // Dependency chips: `#id` marks a step other lanes can wait on; `⧗ refs`
+    // marks a step that itself waits on those refs.
+    const idChip = s.id ? `<span class="step-id" title="step label — other lanes can wait on this (waitsFor target)">#${esc(s.id)}</span>` : '';
+    const waitsChip = s.waitsFor?.length
+      ? `<span class="step-waits" title="won't run until these land: ${esc(s.waitsFor.join(', '))}">⧗ ${esc(s.waitsFor.join(', '))}</span>` : '';
     const tools = (i >= editableFrom && s.status === 'pending') ? `
       <span class="step-tools">
         <button class="btn ghost" title="Move this step earlier in the queue" data-action="step-up" data-lane="${esc(lane.name)}" data-idx="${i}" ${i <= editableFrom ? 'disabled' : ''}>↑</button>
@@ -116,24 +140,27 @@ function laneHtml(p, lane) {
         <button class="btn ghost" title="Edit this step's prompt/command" data-action="step-edit" data-lane="${esc(lane.name)}" data-idx="${i}" data-type="${esc(s.type)}">✎</button>
         <button class="btn ghost" title="Remove this step from the queue" data-action="step-del" data-lane="${esc(lane.name)}" data-idx="${i}">✕</button>
       </span>` : '';
-    return `<li class="step ${esc(s.status)}">
+    return `<li class="step ${esc(s.status)}${waitingHere ? ' waiting-here' : ''}">
       <span class="step-idx">${i}</span>
-      <span class="step-glyph">${active ? GLYPH.running : (GLYPH[s.status] || '·')}</span>
+      <span class="step-glyph">${glyph}</span>
       <span class="step-text">${esc(s.summary)}</span>
+      ${idChip}${waitsChip}
       <span class="step-type">${esc(s.type)}</span>${tools}
     </li>`;
   }).join('');
 
   const failed = lane.gateKind === 'failure';
+  const dot = running ? 'running' : (failed ? 'failed' : (lane.gate ? 'blocked' : (waiting ? 'waiting' : 'idle')));
 
-  return `<article class="lane ${running ? 'is-running' : ''} ${lane.gate ? 'is-blocked' : ''} ${failed ? 'is-failed' : ''}">
+  return `<article class="lane ${running ? 'is-running' : ''} ${lane.gate ? 'is-blocked' : ''} ${failed ? 'is-failed' : ''} ${waiting ? 'is-waiting' : ''}">
     <div class="lane-head">
-      <span class="dot ${running ? 'running' : (failed ? 'failed' : (lane.gate ? 'blocked' : 'idle'))}">●</span>
+      <span class="dot ${dot}">●</span>
       <span class="lane-name">${esc(lane.name)}</span>
       ${lane.parent ? `<span class="lane-parent">⑂ ${esc(lane.parent)}</span>` : ''}
       <span class="lane-meta">[${lane.cursor}/${lane.steps.length}] ${esc(failed ? 'failed' : lane.status)}${lane.spent ? ` · $${lane.spent.toFixed(2)}` : ''}</span>
     </div>
     ${gateBannerHtml(lane)}
+    ${waitBannerHtml(lane)}
     ${steps ? `<ul class="steps">${steps}</ul>` : ''}
     ${lane.onEmpty === 'default' && lane.default ? `<div class="lane-default">${esc(lane.default.task || lane.default.run || 'default')} <span class="step-type">(${esc(lane.default.type || 'ai')} · recurring)</span></div>` : ''}
     <div class="lane-actions">
@@ -298,6 +325,15 @@ function openEventSocket(id) {
       if (ev.event === 'gate.blocked') {
         const err = ev.kind === 'failure';
         toast(err ? 'error' : 'gate', `${err ? '✗' : '◆'} ${ev.lane}: ${ev.reason || 'blocked'}`, 8000);
+      }
+      // A cross-lane wait that has stalled the whole herd (DESIGN §22) — a true
+      // dependency cycle is a red deadlock, a plain stall is amber (both need a
+      // human to land a prerequisite or break a dependency; neither self-clears).
+      if (ev.event === 'waitsFor.deadlock') {
+        toast('error', `⧗ DEADLOCK: ${(ev.cycle || []).join(' ⇄ ')} — ack or remove a dependency`, 10000);
+      }
+      if (ev.event === 'waitsFor.stalled') {
+        toast('gate', `⧗ stalled: ${(ev.waiting || []).map((w) => w.lane).join(', ')} waiting on unmet dependencies`, 8000);
       }
       if (ev.event === 'run.exit') toast('ok', `${ev.lane} exited (${ev.code === 0 ? 'ok' : `code ${ev.code}`})`);
     } catch { /* poke only */ }

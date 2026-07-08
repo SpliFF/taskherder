@@ -10,6 +10,7 @@ import {
 import {
   loadLane, loadAllLanesResilient, saveLane, nextAction, resolveStepConfig,
   defaultFallback, maybeLand, newLane, validateStep,
+  evaluateWaits, computeWaiting, detectWaitCycles,
 } from './tasks.mjs';
 import { loadProjectConfig, loadUserConfig } from './config.mjs';
 import { runStep, formatDuration } from './executor.mjs';
@@ -92,9 +93,20 @@ async function releaseLock(repo) {
   await rm(lockDir(repo), { recursive: true, force: true });
 }
 
-async function writeNeedsAttention(repo, lanes, unloadable = []) {
+// One-line summary of a waiting lane's unmet dependencies, annotating the ones
+// that point at nothing (typo / not-yet-enqueued) so a human can tell a normal
+// pending wait from a broken reference.
+function summarizeUnmet(unmet) {
+  return unmet.map((u) => {
+    if (u.reason === 'missing-lane') return `${u.ref} (no such lane)`;
+    if (u.reason === 'missing-step') return `${u.ref} (not enqueued yet)`;
+    return u.ref;
+  }).join(', ');
+}
+
+async function writeNeedsAttention(repo, lanes, unloadable = [], waiting = []) {
   const blocked = lanes.filter((l) => l.status === 'blocked');
-  if (blocked.length === 0 && unloadable.length === 0) {
+  if (blocked.length === 0 && unloadable.length === 0 && waiting.length === 0) {
     if (existsSync(needsAttentionFile(repo))) await rm(needsAttentionFile(repo), { force: true });
     return;
   }
@@ -111,7 +123,32 @@ async function writeNeedsAttention(repo, lanes, unloadable = []) {
   for (const bad of unloadable) {
     lines.push(`- **${bad.name}** (unloadable — fix or remove the lane file): ${bad.error}`);
   }
+  // Only listed here when the herd has STALLED on these waits (DESIGN §22): a
+  // normally-progressing wait shows in `status`, not as an attention item.
+  for (const w of waiting) {
+    lines.push(`- **${w.lane}** (step ${w.index}): waiting on ${summarizeUnmet(w.unmet)} — nothing can run; land the prerequisite or remove the dependency`);
+  }
   await writeFile(needsAttentionFile(repo), `${lines.join('\n')}\n`);
+}
+
+// A stall: lanes sit waiting on unmet `waitsFor` deps while nothing else can run.
+// Surface it loudly (DESIGN §1) — per-lane on stderr, a `waitsFor.stalled` event —
+// and escalate a true dependency CYCLE to a named DEADLOCK, since that can never
+// self-clear. Called only on a stalled fire, so it does not spam a healthy herd.
+async function reportWaitStall(repo, waiting) {
+  for (const w of waiting) {
+    console.error(`taskherd: lane ${w.lane} waiting on ${summarizeUnmet(w.unmet)} — nothing else can run this fire (DESIGN §22)`);
+  }
+  const cycle = detectWaitCycles(waiting);
+  if (cycle.length) {
+    console.error(`taskherd: DEADLOCK — waitsFor cycle among [${cycle.join(', ')}]; ack or remove a dependency to break it`);
+    await appendEvent(repo, { event: 'waitsFor.deadlock', cycle });
+  } else {
+    await appendEvent(repo, {
+      event: 'waitsFor.stalled',
+      waiting: waiting.map((w) => ({ lane: w.lane, unmet: w.unmet.map((u) => u.ref) })),
+    });
+  }
 }
 
 function describeFailure(result) {
@@ -169,11 +206,18 @@ async function gateBudgets(repo, runnable, history, nowIso) {
 // set of lanes still eligible to run this tick.
 async function scanAndGate(repo, lanes, fallback) {
   const runnable = [];
+  const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
   for (const lane of lanes) {
     const action = nextAction(lane, fallback);
     if (action.kind === 'idle') continue;
     if (action.kind === 'step' && action.step.status === 'blocked') continue; // already gated
     if (action.kind === 'step' && action.step.status === 'failed') continue; // parked failure
+    // Cross-lane dependency (DESIGN §22): a step whose `waitsFor` isn't satisfied
+    // is skipped SOFTLY — no gate, no ack, nothing persisted. It re-checks every
+    // fire and becomes runnable the instant the dependency lands. Evaluated
+    // before the manual-gate transition, so a gate with unmet deps doesn't even
+    // surface as an open gate until its prerequisites are met.
+    if (!evaluateWaits(action.step, lane.name, byName).satisfied) continue;
     if (action.kind === 'step' && action.step.type === 'manual' && action.step.status === 'pending') {
       action.step.status = 'blocked';
       lane.status = 'blocked';
@@ -213,6 +257,9 @@ function explainLaneUnrunnable(name, lanes, unloadable, fallback) {
   }
   const action = nextAction(lane, fallback);
   if (action.kind === 'idle') return 'nothing queued to run';
+  const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
+  const { satisfied, unmet } = evaluateWaits(action.step, name, byName);
+  if (!satisfied) return `waiting on ${summarizeUnmet(unmet)} — runs once the dependency lands (DESIGN §22)`;
   return 'skipped this fire (most likely a daily budget cap)';
 }
 
@@ -252,7 +299,6 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
     let runnable = await gateBudgets(repo, gated, history, nowIso);
     // gateBudgets may have re-blocked lanes on disk; re-read for an accurate list.
     const attention = await loadAllLanesResilient(repo);
-    await writeNeedsAttention(repo, attention.lanes, attention.unloadable);
 
     // DESIGN §6 fallback (deferred from M2): a repo with no lane files at all
     // still runs the configured default once per fire — zero-config scheduled
@@ -271,6 +317,17 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
         console.error(`taskherd: configured default step is invalid, not running it: ${err.message}`);
       }
     }
+
+    // Cross-lane wait surfacing (DESIGN §22). Now that every runnable source is
+    // accounted for (queued steps, budgets, the zero-config default), decide if
+    // the herd has STALLED: lanes waiting on unmet deps while nothing can run.
+    // A stall is reported loudly + escalated to NEEDS-ATTENTION (a true cycle
+    // becomes a named deadlock); a normal, still-progressing wait shows only in
+    // `status`. Computed repo-wide, before any targeted-run narrowing below.
+    const waiting = computeWaiting(attention.lanes, fallback);
+    const stalled = waiting.length > 0 && runnable.length === 0;
+    if (stalled) await reportWaitStall(repo, waiting);
+    await writeNeedsAttention(repo, attention.lanes, attention.unloadable, stalled ? waiting : []);
 
     // Targeted manual run: keep only the named lane's candidate. If it isn't
     // runnable, say why (blocked/idle/missing) rather than a generic 'idle'.

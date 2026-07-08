@@ -145,12 +145,27 @@ test('taskherd-mcp: §16 tool surface round-trip (no tasks_run)', async (t) => {
   assert.equal(web.default.task, '/work');
   assert.equal(web.onEmpty, 'default');
 
-  // block: no lane given → TASKHERD_LANE from the server's env.
+  // Seed the current lane with a pending step so block has something to jump.
+  await client.callTool({ name: 'tasks_add', arguments: { lane: 'self', task: 'echo pending' } });
+
+  // block: no lane given → TASKHERD_LANE from the server's env. Defaults to
+  // `at:"next"`, so the gate interposes AHEAD of the pending step (§15) — the
+  // reported bug was that it appended and let the pending step fire first.
   const block = await client.callTool({ name: 'tasks_block', arguments: { message: 'need a human decision' } });
   assert.match(block.content[0].text, /gated lane 'self'/);
   const self = await loadLane(repo, 'self');
-  assert.equal(self.steps[0].type, 'manual');
+  assert.equal(self.steps[0].type, 'manual', 'gate lands ahead of the pending step, not at the tail');
   assert.equal(self.steps[0].message, 'need a human decision');
+  assert.equal(self.steps[1].run, 'echo pending', 'the pre-existing step is pushed back behind the gate');
+
+  // tasks_add carries the cross-lane dependency fields end-to-end (§22): an agent
+  // declares `id` on a prerequisite and `waitsFor` on the dependent step.
+  await client.callTool({ name: 'tasks_add', arguments: { lane: 'grammar', type: 'command', task: 'echo u2', id: 'U2' } });
+  await client.callTool({ name: 'tasks_add', arguments: { lane: 'web', type: 'ai', task: 'strict mode', provider: 'claude', waitsFor: ['grammar:U2'] } });
+  const grammar = await loadLane(repo, 'grammar');
+  assert.equal(grammar.steps[0].id, 'U2');
+  const webLane = await loadLane(repo, 'web');
+  assert.deepEqual(webLane.steps.at(-1).waitsFor, ['grammar:U2']);
 
   // fork: sibling lane with parent + seed step.
   const fork = await client.callTool({

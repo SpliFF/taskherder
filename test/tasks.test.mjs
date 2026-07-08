@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import { writeFile, readdir } from 'node:fs/promises';
 import {
   newLane, saveLane, loadLane, nextAction, validateStep, LaneValidationError,
-  loadAllLanesResilient, buildStep, ackLane, removeStep, forkLane,
+  loadAllLanesResilient, buildStep, ackLane, removeStep, forkLane, addStep,
+  parseWaitRef, evaluateWaits, computeWaiting, detectWaitCycles,
 } from '../src/tasks.mjs';
 import { laneFile } from '../src/paths.mjs';
 import { makeRepo } from './helpers.mjs';
@@ -21,6 +22,121 @@ test('lane save/load round-trip preserves steps', async (t) => {
   assert.equal(reloaded.steps.length, 2);
   assert.equal(reloaded.steps[0].run, 'echo hi');
   assert.equal(reloaded.steps[1].message, 'sign off');
+});
+
+test('addStep positions: end appends (default), next interposes at the cursor, index inserts before (§15)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+
+  // Build a three-step queue and advance the cursor past the first (done).
+  await addStep(repo, 'main', { type: 'command', task: 'echo a' }); // step 0
+  await addStep(repo, 'main', { type: 'command', task: 'echo b' }); // step 1 (cursor)
+  await addStep(repo, 'main', { type: 'command', task: 'echo c' }); // step 2
+  let lane = await loadLane(repo, 'main');
+  lane.cursor = 1;
+  await saveLane(repo, lane);
+
+  // Default (no `at`) appends to the end.
+  const appended = await addStep(repo, 'main', { type: 'command', task: 'echo end' });
+  assert.equal(appended.index, 3, 'append lands at the tail');
+
+  // `next` interposes at the cursor so it fires ahead of the pending step (echo b).
+  const gated = await addStep(
+    repo, 'main', { type: 'manual', message: 'look first' }, { at: 'next' },
+  );
+  assert.equal(gated.index, 1, "'next' lands at the cursor, not the tail");
+  lane = await loadLane(repo, 'main');
+  assert.equal(lane.steps[1].message, 'look first');
+  assert.equal(lane.steps[2].run, 'echo b', 'the previously-pending step is pushed back one');
+
+  // An explicit index inserts before it (must be at/after the cursor).
+  const at2 = await addStep(repo, 'main', { type: 'command', task: 'echo at2' }, { at: '2' });
+  assert.equal(at2.index, 2);
+  assert.equal((await loadLane(repo, 'main')).steps[2].run, 'echo at2');
+});
+
+test('addStep rejects an out-of-range or below-the-cursor position loudly (no silent clamp; §1/§15)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await addStep(repo, 'main', { type: 'command', task: 'echo a' });
+  await addStep(repo, 'main', { type: 'command', task: 'echo b' });
+  const lane = await loadLane(repo, 'main');
+  lane.cursor = 1; // step 0 already ran — inserting at 0 would rewrite history
+  await saveLane(repo, lane);
+
+  await assert.rejects(
+    () => addStep(repo, 'main', { type: 'command', task: 'x' }, { at: '0' }),
+    (err) => err instanceof LaneValidationError && /cannot insert/.test(err.message),
+  );
+  await assert.rejects(
+    () => addStep(repo, 'main', { type: 'command', task: 'x' }, { at: '99' }),
+    /cannot insert/,
+  );
+  await assert.rejects(
+    () => addStep(repo, 'main', { type: 'command', task: 'x' }, { at: 'bogus' }),
+    /cannot insert/,
+  );
+});
+
+test('parseWaitRef: lane:id, :id (self), bare lane; rejects malformed refs (§22)', () => {
+  assert.deepEqual(parseWaitRef('grammar-unification:U2'), { lane: 'grammar-unification', stepId: 'U2' });
+  assert.deepEqual(parseWaitRef(':U2'), { lane: null, stepId: 'U2' });
+  assert.deepEqual(parseWaitRef('grammar-unification'), { lane: 'grammar-unification', stepId: null });
+  assert.throws(() => parseWaitRef('lane:'), LaneValidationError); // empty id
+  assert.throws(() => parseWaitRef('bad/lane:x'), LaneValidationError); // bad lane token
+  assert.throws(() => parseWaitRef(''), LaneValidationError);
+});
+
+test('validateStep + buildStep carry id/waitsFor and reject bad shapes (§22)', () => {
+  const step = buildStep({ type: 'command', task: 'echo hi', id: 'M-G', waitsFor: ['g:U2', 'g:C2'] });
+  assert.equal(step.id, 'M-G');
+  assert.deepEqual(step.waitsFor, ['g:U2', 'g:C2']);
+  // A comma/space string normalizes to an array.
+  assert.deepEqual(buildStep({ type: 'command', task: 'x', waitsFor: 'a:1, b:2' }).waitsFor, ['a:1', 'b:2']);
+  assert.throws(() => validateStep({ type: 'command', run: 'x', id: 'bad:id', status: 'pending' }), LaneValidationError);
+  assert.throws(() => validateStep({ type: 'command', run: 'x', waitsFor: 'notarray', status: 'pending' }), LaneValidationError);
+  assert.throws(() => validateStep({ type: 'command', run: 'x', waitsFor: ['ok', 'lane:'], status: 'pending' }), LaneValidationError);
+});
+
+test('evaluateWaits: satisfied only when the target step is done; classifies misses (§22)', () => {
+  const lanes = {
+    main: newLane('main'),
+    g: { ...newLane('g'), cursor: 1, steps: [{ type: 'command', run: 'x', id: 'U2', status: 'done' }, { type: 'command', run: 'y', id: 'C2', status: 'pending' }] },
+  };
+  const waiterDone = { type: 'ai', task: 't', waitsFor: ['g:U2'] };
+  assert.equal(evaluateWaits(waiterDone, 'main', lanes).satisfied, true);
+
+  const waiterPending = { type: 'ai', task: 't', waitsFor: ['g:C2'] };
+  const p = evaluateWaits(waiterPending, 'main', lanes);
+  assert.equal(p.satisfied, false);
+  assert.equal(p.unmet[0].reason, 'step-pending');
+
+  assert.equal(evaluateWaits({ waitsFor: ['g:NOPE'] }, 'main', lanes).unmet[0].reason, 'missing-step');
+  assert.equal(evaluateWaits({ waitsFor: ['ghost:x'] }, 'main', lanes).unmet[0].reason, 'missing-lane');
+  // Whole-lane ref: g still has a pending step (cursor 1 < 2) → not satisfied.
+  assert.equal(evaluateWaits({ waitsFor: ['g'] }, 'main', lanes).satisfied, false);
+  // A step with no waitsFor is trivially satisfied.
+  assert.equal(evaluateWaits({ type: 'command', run: 'x' }, 'main', lanes).satisfied, true);
+});
+
+test('computeWaiting + detectWaitCycles: flags waiting lanes and true deadlocks (§22)', () => {
+  // main waits on g:U2 (not done) → waiting; g is runnable, no cycle.
+  const soft = [
+    { ...newLane('main'), steps: [{ type: 'ai', task: 't', waitsFor: ['g:U2'], status: 'pending' }] },
+    { ...newLane('g'), steps: [{ type: 'command', run: 'x', id: 'U2', status: 'pending' }] },
+  ];
+  const waitingSoft = computeWaiting(soft);
+  assert.deepEqual(waitingSoft.map((w) => w.lane), ['main']);
+  assert.equal(detectWaitCycles(waitingSoft).length, 0, 'a wait on a runnable lane is not a cycle');
+
+  // a waits on b:x, b waits on a:y → both waiting, a true cycle.
+  const dead = [
+    { ...newLane('a'), steps: [{ type: 'command', run: 'x', id: 'y', waitsFor: ['b:x'], status: 'pending' }] },
+    { ...newLane('b'), steps: [{ type: 'command', run: 'x', id: 'x', waitsFor: ['a:y'], status: 'pending' }] },
+  ];
+  const waitingDead = computeWaiting(dead);
+  assert.deepEqual(waitingDead.map((w) => w.lane).sort(), ['a', 'b']);
+  assert.deepEqual(detectWaitCycles(waitingDead).sort(), ['a', 'b']);
 });
 
 test('lane mutations reject path-traversal names at every entry point (MCP/serve reach these; §12)', async (t) => {

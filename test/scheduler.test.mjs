@@ -7,7 +7,7 @@ import { existsSync } from 'node:fs';
 import { newLane, saveLane, loadLane, ackLane } from '../src/tasks.mjs';
 import { tick } from '../src/scheduler.mjs';
 import {
-  needsAttentionFile, pausedFile, lockDir, lockPidFile, laneFile,
+  needsAttentionFile, pausedFile, lockDir, lockPidFile, laneFile, eventsFile,
 } from '../src/paths.mjs';
 import { readHistory, statusData } from '../src/history.mjs';
 import { makeRepo, installFakeClaude } from './helpers.mjs';
@@ -80,6 +80,67 @@ test('fair pick: least-recently-run lane goes first, tie-break by name', async (
 
   const second = await tick(repo);
   assert.equal(second.lane, 'b', 'b has not run yet, a now has a higher lastRun');
+});
+
+test('waitsFor: a lane holds until its cross-lane dependency lands, then runs (§22)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+
+  // `main`'s only step waits on `dep:U2`; `dep` runs a labelled step U2.
+  const main = newLane('main');
+  main.steps.push({ type: 'command', run: 'echo go', waitsFor: ['dep:U2'], status: 'pending' });
+  await saveLane(repo, main);
+  const dep = newLane('dep');
+  dep.steps.push({ type: 'command', run: 'echo U2', id: 'U2', status: 'pending' });
+  await saveLane(repo, dep);
+
+  // Before anything runs: status shows main as waiting (dep:U2 not done yet), with
+  // the reason — and it holds NO persisted blocked state (a soft, auto-clearing wait).
+  const { lanes } = await statusData(repo);
+  const mainRow = lanes.find((l) => l.name === 'main');
+  assert.equal(mainRow.status, 'waiting');
+  assert.deepEqual(mainRow.waiting, ['dep:U2']);
+
+  // Fire 1: main is NOT runnable (dep:U2 not done) — the ONLY thing that runs is dep.
+  const first = await tick(repo);
+  assert.equal(first.lane, 'dep', 'main is soft-waiting, so dep is the only runnable lane');
+  assert.equal((await loadLane(repo, 'dep')).steps[0].status, 'done');
+  const mainAfter1 = await loadLane(repo, 'main');
+  assert.equal(mainAfter1.cursor, 0);
+  assert.equal(mainAfter1.status, 'idle', 'a soft wait persists NO blocked state');
+
+  // Fire 2: dep:U2 is now done → main's wait auto-clears and it runs. No ack needed.
+  const second = await tick(repo);
+  assert.equal(second.lane, 'main');
+  assert.equal(second.result, 'done');
+  assert.equal((await loadLane(repo, 'main')).cursor, 1);
+});
+
+test('waitsFor: a mutual dependency deadlock is surfaced loudly, not hung silently (§1/§22)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+
+  // a waits on b:x, b waits on a:y — neither can ever run.
+  const a = newLane('a');
+  a.steps.push({ type: 'command', run: 'echo a', id: 'y', waitsFor: ['b:x'], status: 'pending' });
+  await saveLane(repo, a);
+  const b = newLane('b');
+  b.steps.push({ type: 'command', run: 'echo b', id: 'x', waitsFor: ['a:y'], status: 'pending' });
+  await saveLane(repo, b);
+
+  const result = await tick(repo);
+  assert.equal(result.outcome, 'idle', 'nothing can run — the herd is stalled');
+
+  // Surfaced in NEEDS-ATTENTION.md (both waiting lanes) ...
+  const attention = await readFile(needsAttentionFile(repo), 'utf8');
+  assert.match(attention, /\*\*a\*\*.*waiting on b:x/);
+  assert.match(attention, /\*\*b\*\*.*waiting on a:y/);
+
+  // ... and a waitsFor.deadlock event names the cycle (loud, greppable).
+  const events = (await readFile(eventsFile(repo), 'utf8')).split('\n').filter(Boolean).map((l) => JSON.parse(l));
+  const deadlock = events.find((e) => e.event === 'waitsFor.deadlock');
+  assert.ok(deadlock, 'a waitsFor.deadlock event is emitted');
+  assert.deepEqual([...deadlock.cycle].sort(), ['a', 'b']);
 });
 
 test('a failing command step retries once, then parks the lane as a gate', async (t) => {
