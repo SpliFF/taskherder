@@ -60,7 +60,21 @@ body {
 .logo-mark { color: var(--run); }
 .logo-sub { color: var(--dim); font-weight: 400; letter-spacing: 0.1em; text-transform: lowercase; }
 
-.conn { margin-left: auto; color: var(--faint); font-size: 11px; }
+/* Opt-in auto-follow toggle: pushed to the right, sitting just left of .conn. */
+.follow {
+  margin-left: auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: var(--dim);
+  font-size: 11px;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  user-select: none;
+}
+.follow input { accent-color: var(--run); cursor: pointer; margin: 0; }
+
+.conn { color: var(--faint); font-size: 11px; }
 .conn.live { color: var(--run); text-shadow: 0 0 8px #52d27380; }
 
 /* ── layout ───────────────────────────────────────────────────────────── */

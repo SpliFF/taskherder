@@ -428,6 +428,11 @@ test('serve: the events WS streams new events.jsonl lines as they land', async (
 
   await appendEvent(repo, { event: 'gate.blocked', lane: 'main', reason: 'ping' });
   await waitFor(() => lines.some((l) => l.event === 'gate.blocked' && l.reason === 'ping'));
+
+  // The console's auto-follow (opt-in) keys off a run.start frame carrying the
+  // lane — lock that contract so the client can openTerminal(id, ev.lane).
+  await appendEvent(repo, { event: 'run.start', lane: 'main', step: 0, id: 'r1' });
+  await waitFor(() => lines.some((l) => l.event === 'run.start' && l.lane === 'main'));
   ws.close();
 });
 

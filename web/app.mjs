@@ -19,6 +19,23 @@ if (urlToken) {
 }
 const token = () => localStorage.getItem('taskherd-token') || '';
 
+// ── follow runs ─────────────────────────────────────────────────────────
+// Opt-in: when a run starts (a run.start event over the events WS), auto-open
+// its live terminal so a passive watcher doesn't have to hunt for the ATTACH
+// button — the #1 reason "I watched serve and saw nothing" (the 2026-07-08
+// monitor investigation). Persisted so a phone bookmark keeps the preference.
+// `autoFollowedTerm` marks a terminal THIS opened (vs a manual ATTACH/SHELL/LOG):
+// follow may hop it to a newer run, but never steals focus from a panel you
+// opened yourself.
+let followRuns = localStorage.getItem('taskherd-follow') === '1';
+let autoFollowedTerm = false;
+const followToggle = document.getElementById('follow-toggle');
+followToggle.checked = followRuns;
+followToggle.onchange = () => {
+  followRuns = followToggle.checked;
+  localStorage.setItem('taskherd-follow', followRuns ? '1' : '0');
+};
+
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({
     '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
@@ -350,6 +367,17 @@ function openEventSocket(id) {
         toast('gate', `⧗ stalled: ${(ev.waiting || []).map((w) => w.lane).join(', ')} waiting on unmet dependencies`, 8000);
       }
       if (ev.event === 'run.exit') toast('ok', `${ev.lane} exited (${ev.code === 0 ? 'ok' : `code ${ev.code}`})`);
+      // Auto-follow (opt-in): open the starting run's live terminal, but only
+      // when idle (no panel open) or when the open panel is one WE auto-opened —
+      // so it hops to the newest run without yanking you out of a diff/shell/log
+      // you opened yourself.
+      if (ev.event === 'run.start' && followRuns && ev.lane) {
+        const idle = panel.hidden && diffPanel.hidden && gfxPanel.hidden;
+        if (idle || autoFollowedTerm) {
+          openTerminal(id, ev.lane);
+          autoFollowedTerm = true;
+        }
+      }
     } catch { /* poke only */ }
     scheduleRefresh();
   };
@@ -372,6 +400,7 @@ let fit = null;
 function closeTerminal() {
   if (termWs) { termWs.onclose = null; termWs.close(); termWs = null; }
   if (term) { term.dispose(); term = null; fit = null; }
+  autoFollowedTerm = false; // any open path calls this ⇒ a fresh panel is never mistaken for an auto-followed one
   panel.hidden = true;
 }
 

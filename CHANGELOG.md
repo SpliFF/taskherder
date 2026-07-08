@@ -29,6 +29,14 @@ changes.
   silent skip.
 
 ### Added
+- **Console auto-follow — opt-in "follow runs" toggle.** With it on, the console
+  auto-opens a lane's live terminal the moment a run starts (off a `run.start`
+  event over the events WS), so a passive watcher no longer has to hunt for the
+  ATTACH button — the last gap from the "I watched serve and saw nothing"
+  thread. Non-intrusive: it only opens when you're idle or already watching an
+  auto-followed run (it hops to the newest), and never steals focus from a
+  diff / shell / log panel you opened yourself. The preference persists (so a
+  phone bookmark keeps it); default off.
 - **Post-run log viewer — replay a finished run's output (`taskherd logs`, a
   console **LOG** button, serve `/logs`+`/log`).** While a step runs you can
   `attach` to its live terminal, but once it exits the control socket is gone —
