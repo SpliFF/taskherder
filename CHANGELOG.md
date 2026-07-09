@@ -8,6 +8,25 @@ changes.
 ## Unreleased
 
 ### Added
+- **`when.exit` probe — gate a step on a command's exit code (DESIGN §23
+  Phase 2).** The rule tree gains its one impure leaf:
+  `{"exit":{"run":"./scripts/ready.sh"}}` makes the scheduler run the probe on
+  each fire the step is otherwise runnable, and the step starts once the exit
+  code matches (`equals` int, default 0 | `in: [codes]` | `not: code`; an `argv`
+  array form skips the shell). Safety envelope, all default-on: **fail-closed**
+  (spawn error / timeout / signal ⇒ unsatisfied, loudly — never silently
+  satisfied), a mandatory **timeout** (default 30s, SIGTERM→SIGKILL group
+  escalation), **short-circuit** (a probe only runs when the tree's outcome
+  actually depends on it — free `window`/`dep` legs and `waitsFor` decide first,
+  correct even under `any`/`not`), per-fire **memoization** plus an opt-in
+  **`cache` TTL** (reuse the last result across fires), the `runner` axis
+  (probe inside a container/remote, tty-less), optional `env`, a **`when.probe`
+  event** per real execution, and `PAUSED` suppresses probing entirely
+  (`status` never executes code to render). A probe wait is soft like a window
+  wait — it self-clears and never lands in NEEDS-ATTENTION. Surfaced everywhere
+  `when` already was: CLI `--when`, MCP `tasks_add`/`tasks_fork`, the serve
+  `add` API, and the console `⏰` chip / waiting banner. The `file`/`http`/`env`
+  leaves remain refused loudly.
 - **`when` rule engine — scheduled preconditions on a step (DESIGN §23).** A step
   can carry an optional **`when`** boolean rule tree that gates when it may run,
   evaluated every fire exactly like `waitsFor`: if the rule is unmet the step
@@ -24,9 +43,9 @@ changes.
   ANDed with the flags); MCP `tasks_add`/`tasks_fork` accept a `when` object; the
   serve `add` API accepts `when`; and the **web console** shows a per-step `⏰`
   schedule chip plus the window ETA in the waiting banner. **Fail-closed:** the
-  not-yet-implemented `exit`/`file`/`http`/`env` leaves and any malformed rule are
+  not-yet-implemented `file`/`http`/`env` leaves and any malformed rule are
   refused **loudly at add time** (CLI exit 1, MCP `isError`, API 400) — never a
-  silent skip.
+  silent skip. (The `exit` probe leaf shipped in the same release — see above.)
 
 ### Added
 - **Console auto-follow — opt-in "follow runs" toggle.** With it on, the console

@@ -125,6 +125,17 @@ test('wrapForRunner(ssh): no cwd → runs in the login dir with a loud unsynced-
   assert.ok(w.warnings.some((m) => /host worktree is NOT synced/.test(m)));
 });
 
+test('wrapForRunner: tty:false drops docker -t / ssh -tt (a §23 probe has no pty behind it)', () => {
+  const dockerTty = wrapForRunner({ kind: 'docker', container: 'web' }, { ...INNER, repo: '/repo' });
+  assert.ok(dockerTty.args.includes('-t'), 'default stays interactive for the pty seam');
+  const dockerNo = wrapForRunner({ kind: 'docker', container: 'web' }, { ...INNER, repo: '/repo', tty: false });
+  assert.ok(!dockerNo.args.includes('-t'), 'docker refuses -t without a terminal on stdin');
+  assert.ok(dockerNo.args.includes('-i'), 'stdin stays open');
+  const sshNo = wrapForRunner({ kind: 'ssh', host: 'box' }, { ...INNER, repo: '/repo', tty: false });
+  assert.ok(!sshNo.args.includes('-tt'), 'no forced remote pty for a probe');
+  assert.equal(sshNo.args[0], 'box');
+});
+
 test('wrapForRunner: an ai step on a non-local runner warns that taskherd-mcp is unreachable (§11 gap)', () => {
   const local = wrapForRunner({ kind: 'local' }, { ...INNER, isAi: true });
   assert.deepEqual(local.warnings, [], 'local ai keeps its mcp tools');

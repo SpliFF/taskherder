@@ -575,7 +575,7 @@ auto-clear** discipline — distinct from the one hard, ack-requiring `manual` g
 ] }
 ```
 
-- **Leaves (Phase 1):**
+- **Leaves:**
   - `window` — a **pure** time/date predicate. Fields, all optional and ANDed:
     `after`/`before` (`HH:MM` time-of-day; `after>before` = an overnight
     wraparound), `days` (weekday set — `"Mon-Fri"`, `"Sat,Sun"`, ranges wrap),
@@ -583,6 +583,11 @@ auto-clear** discipline — distinct from the one hard, ack-requiring `manual` g
     the window's tz; `until` exclusive), `tz` (`local` default | `utc`).
   - `dep` — a `waitsFor` reference (`"lane:id"` / `":id"` / `"lane"`); identical
     semantics. `waitsFor` **is** sugar for a top-level `all` of `dep` leaves.
+  - `exit` (Phase 2) — the one **impure** leaf: run a probe command and compare
+    its exit code. `run` (a `/bin/sh -c` string) **or** `argv` (array, no shell);
+    matcher `equals` (int, default 0) | `in: [codes]` | `not: code`; optional
+    `timeout` (default 30s), `cache` (TTL — reuse the last result across fires),
+    `runner` (the §11 axis, tty-less), `env`. Runs in the repo root.
 - **Combinators:** `all` / `any` / `not`, nestable.
 - **Evaluation:** `evaluateWhen(rule, ctx) → {satisfied, unmet[]}` — pure given a
   clock + the lane set, the same shape as `evaluateWaits`, so every waiting /
@@ -596,11 +601,23 @@ auto-clear** discipline — distinct from the one hard, ack-requiring `manual` g
 2. **A `window` wait is a *scheduled* run, not a stall.** An off-hours cron fire
    that legitimately runs nothing must not read as a deadlock — only `dep`-style
    waits (which may never self-clear) count toward a stall / `NEEDS-ATTENTION`; a
-   window wait shows in `status` with its **next-open ETA**.
+   window or probe wait shows in `status` (a window with its **next-open ETA**).
 3. **`manual` and `budget` stay separate** (the hard-gate and post-run cost
    disciplines); not subsumed.
+4. **The `exit` probe carries a §12 safety envelope.** A probe is code the
+   scheduler executes **speculatively, each fire, while the step is otherwise
+   runnable** — so: it is **fail-closed** (spawn error / timeout / signal ⇒
+   unsatisfied, loudly — never silently satisfied); its **timeout is mandatory**
+   (default 30s, SIGTERM → SIGKILL group escalation); it **short-circuits by
+   cost** (a probe runs only when the tree's outcome genuinely depends on it —
+   free `window`/`dep` legs and an unmet `waitsFor` decide first, correct even
+   under `any`/`not`); results are **memoized per fire** (two steps sharing a
+   probe spec cost one execution) and **reused across fires** only within the
+   rule's opt-in `cache` TTL; every real execution emits a **`when.probe`
+   event** (code execution leaves a trail); `PAUSED` suppresses probes; only
+   the read-write scheduler path executes them — **`status` never runs code to
+   render**. Probes must be cheap, idempotent, read-only checks — a documented
+   contract, not enforcement.
 
-**Deferred to a later phase (loudly rejected until then):** the `exit` probe
-(run a command, compare its code) — a code-execution + cost + latency surface
-that needs a timeout / cache / fail-closed / runner-reuse safety envelope — plus
-`file`/`http`/`env` leaves. See `PLAN-rules.md`.
+**Deferred to a later phase (loudly rejected until then):** the `file`/`http`/
+`env` leaves (`http` is an SSRF surface). See `PLAN-rules.md`.

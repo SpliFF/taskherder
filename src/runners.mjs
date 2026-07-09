@@ -124,8 +124,11 @@ function renderTemplate(str, vars) {
 //              dropping auth the user expected to cross.
 // `baseEnv` (default process.env) are the ambient vars for TASKHERD_* injection
 // on local; callers thread the same TASKHERD_REPO/LANE in that they set today.
+// `tty:false` drops the docker `-t` / ssh `-tt` allocation for a caller with no
+// pty behind it (the §23 `exit` probe runs under plain spawn — docker refuses
+// `-t` when stdin isn't a terminal).
 export function wrapForRunner(runner, {
-  file, args, extraEnv = {}, cwd, worktree, repo, laneName, isAi = false, taskherdEnv = {},
+  file, args, extraEnv = {}, cwd, worktree, repo, laneName, isAi = false, taskherdEnv = {}, tty = true,
 } = {}) {
   const warnings = [];
   const extraKeys = Object.keys(extraEnv);
@@ -157,7 +160,8 @@ export function wrapForRunner(runner, {
     if (runner.container) {
       // Exec into a running, user-managed container. The worktree mapping is the
       // user's responsibility; use runner.workdir if given, else the container's.
-      dargs.push('exec', '-i', '-t');
+      dargs.push('exec', '-i');
+      if (tty) dargs.push('-t');
       if (runner.workdir) dargs.push('-w', runner.workdir);
       for (const k of extraKeys) dargs.push('-e', k);
       dargs.push(runner.container);
@@ -165,7 +169,8 @@ export function wrapForRunner(runner, {
       // Ephemeral container with the worktree bind-mounted in. --rm so it doesn't
       // pile up; each fire is a fresh, isolated home/keychain (§11's strongest
       // multi-account isolation).
-      dargs.push('run', '--rm', '-i', '-t');
+      dargs.push('run', '--rm', '-i');
+      if (tty) dargs.push('-t');
       const mounts = runner.mounts && runner.mounts.length
         ? runner.mounts
         : (worktree ? [`{worktree}:${runner.workdir || '/work'}`] : []);
@@ -206,7 +211,8 @@ export function wrapForRunner(runner, {
     remoteParts.push('exec', shquote(file), ...args.map(shquote));
     const sargs = [];
     if (runner.sshArgs) sargs.push(...runner.sshArgs);
-    sargs.push('-tt', runner.host, remoteParts.join(' ')); // -tt forces a remote pty (curses/TUI, §13)
+    if (tty) sargs.push('-tt'); // forces a remote pty (curses/TUI, §13); omitted for pty-less probes
+    sargs.push(runner.host, remoteParts.join(' '));
     return {
       file: 'ssh', args: sargs, cwd: repo, env: { ...process.env }, warnings,
     };

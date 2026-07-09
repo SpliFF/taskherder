@@ -129,12 +129,15 @@ function gateBannerHtml(lane) {
 function waitBannerHtml(lane) {
   if (!lane.waiting?.length) return '';
   const refs = lane.waiting.map((r) => `<code>${esc(r)}</code>`).join(', ');
-  // A window wait (DESIGN §23) opens on a clock — say so instead of the
-  // dep-specific "lands"; a dep wait clears when the prerequisite finishes.
+  // A window wait (DESIGN §23) opens on a clock, a probe wait clears when its
+  // command starts passing — say so instead of the dep-specific "lands".
   const isWindow = lane.waiting.some((r) => /^window/.test(r));
+  const isProbe = lane.waiting.some((r) => /^exit\(/.test(r));
   const note = isWindow
     ? 'opens on schedule — no action needed'
-    : 'clears when the dependency lands — no action needed';
+    : (isProbe
+      ? 'clears when the probe passes — no action needed'
+      : 'clears when the dependency lands — no action needed');
   return `<div class="wait-banner">
     <span class="wait-label">⧗ WAITING</span>
     <span class="wait-refs">on ${refs}</span>

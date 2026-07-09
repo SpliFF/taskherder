@@ -179,15 +179,24 @@ test('taskherd-mcp: §16 tool surface round-trip (no tasks_run)', async (t) => {
   const nightly = await loadLane(repo, 'nightly');
   assert.deepEqual(nightly.steps.at(-1).when, { window: { after: '09:00', before: '17:00', days: 'Mon-Fri' } });
 
-  // An unimplemented leaf (Phase 2+) is refused LOUDLY at add time, not silently
-  // skipped (DESIGN §1/§23) — surfaced to the agent as isError text.
+  // The §23 Phase-2 `exit` probe leaf is agent-authorable too (an agent can
+  // already enqueue arbitrary `command` steps, so a probe grants no new
+  // privilege) — stored raw, validated at add time.
+  await client.callTool({
+    name: 'tasks_add',
+    arguments: { lane: 'nightly', type: 'command', task: 'echo deploy', when: { exit: { run: './scripts/ready.sh', equals: 0 } } },
+  });
+  assert.deepEqual((await loadLane(repo, 'nightly')).steps.at(-1).when, { exit: { run: './scripts/ready.sh', equals: 0 } });
+
+  // An unimplemented leaf is refused LOUDLY at add time, not silently skipped
+  // (DESIGN §1/§23) — surfaced to the agent as isError text.
   const badWhen = await client.callTool({
     name: 'tasks_add',
-    arguments: { lane: 'nightly', type: 'command', task: 'echo x', when: { exit: { run: './probe.sh', equals: 0 } } },
+    arguments: { lane: 'nightly', type: 'command', task: 'echo x', when: { http: { url: 'http://x/health' } } },
   });
   assert.equal(badWhen.isError, true);
   assert.match(badWhen.content[0].text, /not implemented yet/);
-  assert.equal((await loadLane(repo, 'nightly')).steps.length, 1, 'the refused step is not persisted');
+  assert.equal((await loadLane(repo, 'nightly')).steps.length, 2, 'the refused step is not persisted');
 
   // fork: sibling lane with parent + seed step.
   const fork = await client.callTool({

@@ -10,8 +10,9 @@ import {
 import {
   loadLane, loadAllLanesResilient, saveLane, nextAction, resolveStepConfig,
   defaultFallback, maybeLand, newLane, validateStep,
-  evaluateGate, computeWaiting, detectWaitCycles,
+  evaluateGate, resolveWhenProbes, computeWaiting, detectWaitCycles,
 } from './tasks.mjs';
+import { createProbeSession } from './probes.mjs';
 import { loadProjectConfig, loadUserConfig } from './config.mjs';
 import { runStep, formatDuration } from './executor.mjs';
 import { appendEvent } from './events.mjs';
@@ -204,7 +205,7 @@ async function gateBudgets(repo, runnable, history, nowIso) {
 // Scans all lanes, transitioning any lane whose next action is a freshly
 // reached manual gate from pending -> blocked (DESIGN §6 step 2). Returns the
 // set of lanes still eligible to run this tick.
-async function scanAndGate(repo, lanes, fallback, now) {
+async function scanAndGate(repo, lanes, fallback, now, probeSession) {
   const runnable = [];
   const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
   for (const lane of lanes) {
@@ -218,7 +219,15 @@ async function scanAndGate(repo, lanes, fallback, now) {
     // it (a dep lands, a time window opens). Evaluated before the manual-gate
     // transition, so a gate with unmet preconditions doesn't even surface as an
     // open gate until its prerequisites are met.
-    if (!evaluateGate(action.step, lane.name, byName, now).satisfied) continue;
+    // Any §23 `exit` probes the gate's outcome actually depends on run first —
+    // memoized per fire in probeSession.probes, skipped entirely when waitsFor
+    // or a free window/dep leg already decides the gate (short-circuit-by-cost).
+    await resolveWhenProbes(
+      action.step,
+      { selfLane: lane.name, lanesByName: byName, now, probes: probeSession.probes },
+      (rule) => probeSession.run(rule, { lane: lane.name }),
+    );
+    if (!evaluateGate(action.step, lane.name, byName, now, probeSession.probes).satisfied) continue;
     if (action.kind === 'step' && action.step.type === 'manual' && action.step.status === 'pending') {
       action.step.status = 'blocked';
       lane.status = 'blocked';
@@ -245,7 +254,7 @@ function fairPick(candidates) {
 // so a manual, one-lane run reports the actual cause (blocked/idle/missing)
 // instead of a bare "nothing happened". `lanes`/`unloadable` are the freshest
 // post-scan snapshot; `fallback` resolves an idle lane's onEmpty action.
-function explainLaneUnrunnable(name, lanes, unloadable, fallback, now) {
+function explainLaneUnrunnable(name, lanes, unloadable, fallback, now, probes = null) {
   const bad = unloadable.find((u) => u.name === name);
   if (bad) return `its lane file is unloadable: ${bad.error}`;
   const lane = lanes.find((l) => l.name === name);
@@ -259,12 +268,15 @@ function explainLaneUnrunnable(name, lanes, unloadable, fallback, now) {
   const action = nextAction(lane, fallback);
   if (action.kind === 'idle') return 'nothing queued to run';
   const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
-  const { satisfied, unmet } = evaluateGate(action.step, name, byName, now);
+  const { satisfied, unmet } = evaluateGate(action.step, name, byName, now, probes);
   if (!satisfied) {
-    const clockOnly = unmet.every((u) => u.reason === 'window');
-    return clockOnly
-      ? `waiting on ${summarizeUnmet(unmet)} — runs once the window opens (DESIGN §23)`
-      : `waiting on ${summarizeUnmet(unmet)} — runs once the dependency lands (DESIGN §22/§23)`;
+    if (unmet.every((u) => u.reason === 'window')) {
+      return `waiting on ${summarizeUnmet(unmet)} — runs once the window opens (DESIGN §23)`;
+    }
+    if (unmet.every((u) => u.reason === 'window' || u.reason === 'probe')) {
+      return `waiting on ${summarizeUnmet(unmet)} — runs once the probe passes (DESIGN §23)`;
+    }
+    return `waiting on ${summarizeUnmet(unmet)} — runs once the dependency lands (DESIGN §22/§23)`;
   }
   return 'skipped this fire (most likely a daily budget cap)';
 }
@@ -300,7 +312,12 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
     const [projectConfig, userConfig] = await Promise.all([loadProjectConfig(repo), loadUserConfig()]);
     const fallback = defaultFallback(projectConfig, userConfig);
     const now = new Date();
-    const gated = await scanAndGate(repo, lanes, fallback, now);
+    // §23 `exit` probes run inside this tick only — one session per fire, results
+    // memoized across lanes, last results persisted (and TTL-reused) via flush().
+    // PAUSED returned above, so a paused repo is never probed.
+    const probeSession = await createProbeSession(repo);
+    const gated = await scanAndGate(repo, lanes, fallback, now, probeSession);
+    await probeSession.flush();
     const nowIso = now.toISOString();
     const history = await readHistory(repo);
     let runnable = await gateBudgets(repo, gated, history, nowIso);
@@ -331,12 +348,15 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
     // A stall is reported loudly + escalated to NEEDS-ATTENTION (a true cycle
     // becomes a named deadlock); a normal, still-progressing wait shows only in
     // `status`. Computed repo-wide, before any targeted-run narrowing below.
-    const waiting = computeWaiting(attention.lanes, fallback, now);
+    const waiting = computeWaiting(attention.lanes, fallback, now, probeSession.probes);
     // A `window` wait (DESIGN §23) is a SCHEDULED future run, not a stall — an
     // off-hours cron fire that legitimately runs nothing must not read as a
-    // deadlock. Only dep-style waits (which may never self-clear) count toward a
-    // stall / NEEDS-ATTENTION; a window wait shows only in `status` with its ETA.
-    const depWaiting = waiting.filter((w) => w.unmet.some((u) => u.reason !== 'window'));
+    // deadlock. A `probe` wait is likewise a poll of the outside world that the
+    // next fire re-checks (v1 = pure soft; escalation after N failing fires is a
+    // recorded open question). Only dep-style waits (which may never self-clear)
+    // count toward a stall / NEEDS-ATTENTION; window/probe waits show only in
+    // `status`.
+    const depWaiting = waiting.filter((w) => w.unmet.some((u) => u.reason !== 'window' && u.reason !== 'probe'));
     const stalled = depWaiting.length > 0 && runnable.length === 0;
     if (stalled) await reportWaitStall(repo, depWaiting);
     await writeNeedsAttention(repo, attention.lanes, attention.unloadable, stalled ? depWaiting : []);
@@ -349,7 +369,7 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
         return {
           outcome: 'not-runnable',
           lane: targetLane,
-          reason: explainLaneUnrunnable(targetLane, attention.lanes, attention.unloadable, fallback, now),
+          reason: explainLaneUnrunnable(targetLane, attention.lanes, attention.unloadable, fallback, now, probeSession.probes),
         };
       }
       runnable = chosen;

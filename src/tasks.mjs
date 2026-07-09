@@ -145,10 +145,13 @@ export function evaluateWaits(step, selfLane, lanesByName) {
 // A step's optional `when` field is a nestable boolean tree of preconditions,
 // evaluated each fire like `waitsFor`: unmet ⇒ the step is SOFT-skipped (no gate,
 // no ack, nothing persisted) and re-checked next fire. `waitsFor` is sugar for a
-// top-level AND of `dep` leaves; `when` ANDs with it. Phase 1 leaves: `window`
-// (pure time/date) + `dep` (== a waitsFor ref). Combinators: all / any / not.
-// The `exit` probe (run a command, compare its code) is Phase 2 — parseWhen
-// rejects it loudly rather than silently ignoring it (DESIGN §1/§12).
+// top-level AND of `dep` leaves; `when` ANDs with it. Leaves: `window` (pure
+// time/date), `dep` (== a waitsFor ref), and the Phase-2 `exit` probe (run a
+// command, compare its code — the one IMPURE leaf; execution lives in probes.mjs
+// behind the ctx.probes seam so this tree-walk stays pure and unit-testable).
+// Combinators: all / any / not. The `file`/`http`/`env` leaves are still
+// deferred — parseWhen rejects them loudly rather than silently ignoring them
+// (DESIGN §1/§12).
 
 const WEEKDAYS = ['sun', 'mon', 'tue', 'wed', 'thu', 'fri', 'sat'];
 
@@ -276,6 +279,90 @@ function fmtInstant(d, tz) {
   return `${wd} ${p.y}-${pad(p.mo + 1)}-${pad(p.d)} ${pad(Math.floor(p.min / 60))}:${pad(p.min % 60)}${tz === 'utc' ? 'Z' : ''}`;
 }
 
+// Duration for the `exit` probe's timeout/cache fields. Bare number (JSON number
+// or unit-less string) = SECONDS, same convention as a step timeout; unparseable
+// values throw loudly — a silently-misparsed probe timeout is a silently-disabled
+// guardrail (DESIGN §12). Exported for probes.mjs (one parser, no drift).
+export function parseDurationMs(v, field) {
+  if (typeof v === 'number') {
+    if (!Number.isFinite(v) || v < 0) throw new LaneValidationError(`taskherd: when.exit.${field} must be a non-negative number of seconds, got ${JSON.stringify(v)}`);
+    return v * 1000;
+  }
+  const m = /^(\d+)(ms|s|m|h)?$/.exec(String(v).trim());
+  if (!m) {
+    throw new LaneValidationError(`taskherd: when.exit.${field} — cannot parse duration ${JSON.stringify(v)} (use e.g. "30s", "5m", "500ms", or a bare number of seconds)`);
+  }
+  return Number(m[1]) * { ms: 1, s: 1000, m: 60_000, h: 3_600_000 }[m[2] || 's'];
+}
+
+// Validates an `exit` probe leaf (DESIGN §23 Phase 2): run a command each fire
+// the step is otherwise runnable and compare its exit code. The SHAPE is checked
+// here at write time; execution (with its timeout/cache/fail-closed envelope)
+// lives in probes.mjs. Throws loudly on anything malformed — a probe is
+// speculative code execution and must never be mis-read silently (§12).
+const EXIT_RULE_FIELDS = new Set(['run', 'argv', 'equals', 'in', 'not', 'timeout', 'cache', 'runner', 'env']);
+export function parseExitRule(val) {
+  if (!val || typeof val !== 'object' || Array.isArray(val)) {
+    throw new LaneValidationError(`taskherd: when.exit must be an object, got ${JSON.stringify(val)}`);
+  }
+  for (const k of Object.keys(val)) {
+    if (!EXIT_RULE_FIELDS.has(k)) throw new LaneValidationError(`taskherd: when.exit — unknown field ${JSON.stringify(k)} (expected run|argv, equals|in|not, timeout, cache, runner, env)`);
+  }
+  const hasRun = val.run != null; const hasArgv = val.argv != null;
+  if (hasRun === hasArgv) {
+    throw new LaneValidationError('taskherd: when.exit needs exactly one of `run` (a shell string) or `argv` (an argument array)');
+  }
+  if (hasRun && (typeof val.run !== 'string' || !val.run.trim())) {
+    throw new LaneValidationError('taskherd: when.exit.run must be a non-empty shell string');
+  }
+  if (hasArgv && (!Array.isArray(val.argv) || val.argv.length === 0 || val.argv.some((a) => typeof a !== 'string' || a === ''))) {
+    throw new LaneValidationError('taskherd: when.exit.argv must be a non-empty array of strings');
+  }
+  const matchers = ['equals', 'in', 'not'].filter((k) => val[k] != null);
+  if (matchers.length > 1) {
+    throw new LaneValidationError(`taskherd: when.exit — use only one of equals/in/not, got {${matchers.join(', ')}}`);
+  }
+  if (val.equals != null && !Number.isInteger(val.equals)) throw new LaneValidationError(`taskherd: when.exit.equals must be an integer exit code, got ${JSON.stringify(val.equals)}`);
+  if (val.not != null && !Number.isInteger(val.not)) throw new LaneValidationError(`taskherd: when.exit.not must be an integer exit code, got ${JSON.stringify(val.not)}`);
+  if (val.in != null && (!Array.isArray(val.in) || val.in.length === 0 || val.in.some((c) => !Number.isInteger(c)))) {
+    throw new LaneValidationError(`taskherd: when.exit.in must be a non-empty array of integer exit codes, got ${JSON.stringify(val.in)}`);
+  }
+  if (val.timeout != null) parseDurationMs(val.timeout, 'timeout');
+  if (val.cache != null) parseDurationMs(val.cache, 'cache');
+  if (val.runner != null && (typeof val.runner !== 'string' || !val.runner.trim())) {
+    throw new LaneValidationError(`taskherd: when.exit.runner must be a runner name/spec string (DESIGN §11), got ${JSON.stringify(val.runner)}`);
+  }
+  if (val.env != null) {
+    if (typeof val.env !== 'object' || Array.isArray(val.env)) throw new LaneValidationError('taskherd: when.exit.env must be an object of VAR: "value" strings');
+    for (const [k, v] of Object.entries(val.env)) {
+      if (typeof v !== 'string') throw new LaneValidationError(`taskherd: when.exit.env.${k} must be a string, got ${JSON.stringify(v)}`);
+    }
+  }
+  return val;
+}
+
+// Does a finished probe's exit code satisfy the rule's matcher? `equals` defaults
+// to 0 (the universal "ready" convention). A null code (spawn error / timeout /
+// killed by a signal) NEVER matches — fail-closed, per DESIGN §23.
+export function exitCodeMatches(rule, code) {
+  if (code == null || !Number.isInteger(code)) return false;
+  if (rule.in != null) return rule.in.includes(code);
+  if (rule.not != null) return code !== rule.not;
+  return code === (rule.equals ?? 0);
+}
+
+// Canonical identity of a probe spec — the memo/cache key. Two steps declaring
+// the same probe share one execution per fire (and one cache entry), regardless
+// of key order in the JSON they were written with.
+export function probeKey(val) {
+  const stable = (v) => {
+    if (Array.isArray(v)) return v.map(stable);
+    if (v && typeof v === 'object') return Object.fromEntries(Object.keys(v).sort().map((k) => [k, stable(v[k])]));
+    return v;
+  };
+  return JSON.stringify(stable(val));
+}
+
 // Validates a `when` rule tree (recursively), throwing loudly on any unknown or
 // not-yet-implemented rule so a bad/aspirational rule fails at write time, never
 // silently passes at run time. Returns the tree unchanged.
@@ -299,10 +386,12 @@ export function parseWhen(rule) {
     parseWindow(val);
   } else if (key === 'dep') {
     parseWaitRef(val);
-  } else if (key === 'exit' || key === 'file' || key === 'http' || key === 'env') {
-    throw new LaneValidationError(`taskherd: \`when\` rule "${key}" is not implemented yet (Phase 1 supports window/dep + all/any/not); see PLAN-rules.md`);
+  } else if (key === 'exit') {
+    parseExitRule(val);
+  } else if (key === 'file' || key === 'http' || key === 'env') {
+    throw new LaneValidationError(`taskherd: \`when\` rule "${key}" is not implemented yet (supported: window/dep/exit + all/any/not); see PLAN-rules.md`);
   } else {
-    throw new LaneValidationError(`taskherd: unknown \`when\` rule "${key}" (expected all/any/not/window/dep)`);
+    throw new LaneValidationError(`taskherd: unknown \`when\` rule "${key}" (expected all/any/not/window/dep/exit)`);
   }
   return rule;
 }
@@ -316,6 +405,10 @@ export function describeWhen(rule) {
   if (key === 'all' || key === 'any') return `${key}(${val.map(describeWhen).join(', ')})`;
   if (key === 'not') return `not(${describeWhen(val)})`;
   if (key === 'dep') return `dep ${val}`;
+  if (key === 'exit') {
+    const cmd = val.run != null ? String(val.run) : (Array.isArray(val.argv) ? val.argv.join(' ') : '');
+    return `exit(${cmd.length > 48 ? `${cmd.slice(0, 47)}…` : cmd})`;
+  }
   if (key === 'window') {
     const w = val;
     const bits = [];
@@ -328,11 +421,15 @@ export function describeWhen(rule) {
   return key;
 }
 
-// Evaluates a `when` rule tree against a context {selfLane, lanesByName, now}.
-// Returns `{ satisfied, unmet[] }` — the same shape as evaluateWaits, so every
-// waiting/stall/status consumer extends for free. Each unmet entry carries a
-// human `ref` and a `reason` (window unmet ⇒ reason:'window', so stall detection
-// can tell a self-clearing clock wait from a dep that may deadlock).
+// Evaluates a `when` rule tree against a context {selfLane, lanesByName, now,
+// probes?}. Returns `{ satisfied, unmet[] }` — the same shape as evaluateWaits,
+// so every waiting/stall/status consumer extends for free. Each unmet entry
+// carries a human `ref` and a `reason` (window unmet ⇒ 'window', probe unmet ⇒
+// 'probe' — both self-clearing world conditions, distinct from a dep that may
+// deadlock). `ctx.probes` is a Map of probeKey → this fire's probe results
+// (populated by resolveWhenProbes); WITHOUT it an `exit` leaf is unmet —
+// fail-closed, and exactly what a read-only surface like `status` wants (it
+// must never execute a probe just to render).
 export function evaluateWhen(rule, ctx) {
   if (rule == null) return { satisfied: true, unmet: [] };
   const [key] = Object.keys(rule);
@@ -356,6 +453,14 @@ export function evaluateWhen(rule, ctx) {
     const u = evalDepRef(val, ctx.selfLane, ctx.lanesByName);
     return u ? { satisfied: false, unmet: [u] } : { satisfied: true, unmet: [] };
   }
+  if (key === 'exit') {
+    const label = describeWhen(rule);
+    const r = ctx.probes?.get(probeKey(val));
+    if (!r) return { satisfied: false, unmet: [{ reason: 'probe', ref: `${label} (probed at fire time)` }] };
+    if (exitCodeMatches(val, r.code)) return { satisfied: true, unmet: [] };
+    const why = r.timedOut ? 'timed out' : (r.error ? `error: ${r.error}` : `exit ${r.code}`);
+    return { satisfied: false, unmet: [{ reason: 'probe', ref: `${label} (${why})` }] };
+  }
   // window
   const win = parseWindow(val);
   if (windowSatisfied(win, ctx.now)) return { satisfied: true, unmet: [] };
@@ -364,12 +469,86 @@ export function evaluateWhen(rule, ctx) {
   return { satisfied: false, unmet: [{ reason: 'window', ref, nextOpen: nextOpen ? nextOpen.toISOString() : null, closed }] };
 }
 
+// All `exit` leaves of a rule tree, in tree order (the order probes run in when
+// the outcome needs them).
+function collectExitLeaves(rule, out = []) {
+  if (rule == null) return out;
+  const [key] = Object.keys(rule);
+  const val = rule[key];
+  if (key === 'all' || key === 'any') val.forEach((r) => collectExitLeaves(r, out));
+  else if (key === 'not') collectExitLeaves(val, out);
+  else if (key === 'exit') out.push(val);
+  return out;
+}
+
+// Three-valued evaluation: true | false | null, where null = "the outcome still
+// depends on a probe that has not run". This is what makes short-circuit-by-cost
+// CORRECT under `not`/`any` (not just under a top-level `all`): a probe is only
+// executed while the tree is genuinely undecided, and an unnecessary probe —
+// one whose result cannot change the verdict — never runs (DESIGN §23).
+function whenDecided(rule, ctx) {
+  if (rule == null) return true;
+  const [key] = Object.keys(rule);
+  const val = rule[key];
+  if (key === 'all') {
+    let unknown = false;
+    for (const r of val) {
+      const d = whenDecided(r, ctx);
+      if (d === false) return false;
+      if (d === null) unknown = true;
+    }
+    return unknown ? null : true;
+  }
+  if (key === 'any') {
+    let unknown = false;
+    for (const r of val) {
+      const d = whenDecided(r, ctx);
+      if (d === true) return true;
+      if (d === null) unknown = true;
+    }
+    return unknown ? null : false;
+  }
+  if (key === 'not') {
+    const d = whenDecided(val, ctx);
+    return d === null ? null : !d;
+  }
+  if (key === 'exit') {
+    const r = ctx.probes?.get(probeKey(val));
+    return r ? exitCodeMatches(val, r.code) : null;
+  }
+  return evaluateWhen(rule, ctx).satisfied; // window/dep: always definite
+}
+
+// Runs the `exit` probes a step's gate actually NEEDS this fire, memoized into
+// `ctx.probes` (a per-tick Map shared across lanes, so two steps declaring the
+// same probe cost one execution). Speculation is minimized twice over: nothing
+// runs when `waitsFor` is already unmet (the gate is an AND — the probe can't
+// open it), and within `when` a probe runs only while the tree is undecided
+// (whenDecided). `runProbe(exitVal, {lane})` is the impure seam — it MUST
+// resolve (never throw), returning `{code, timedOut, error, ...}`; a failed
+// probe is an unsatisfied rule, not a crashed tick (fail-closed, §23).
+export async function resolveWhenProbes(step, ctx, runProbe) {
+  if (step?.when == null || typeof runProbe !== 'function') return;
+  if (!evaluateWaits(step, ctx.selfLane, ctx.lanesByName).satisfied) return;
+  const leaves = collectExitLeaves(step.when);
+  if (leaves.length === 0) return;
+  if (!ctx.probes) ctx.probes = new Map();
+  for (const val of leaves) {
+    if (whenDecided(step.when, ctx) !== null) break;
+    const key = probeKey(val);
+    if (ctx.probes.has(key)) continue;
+    ctx.probes.set(key, await runProbe(val, { lane: ctx.selfLane }));
+  }
+}
+
 // The unified precondition gate for a step: `waitsFor` (dep sugar) AND `when`
 // (the rule tree), merged into one `{ satisfied, unmet[] }`. This is what the
 // scheduler and status consult — one place that decides "may this step start?".
-export function evaluateGate(step, selfLane, lanesByName, now = new Date()) {
+// `probes` is this fire's probe-result Map (see resolveWhenProbes); read-only
+// callers omit it and an `exit` leaf reads as waiting, never executed.
+export function evaluateGate(step, selfLane, lanesByName, now = new Date(), probes = null) {
   const unmet = [...evaluateWaits(step, selfLane, lanesByName).unmet];
-  if (step?.when != null) unmet.push(...evaluateWhen(step.when, { selfLane, lanesByName, now }).unmet);
+  if (step?.when != null) unmet.push(...evaluateWhen(step.when, { selfLane, lanesByName, now, probes }).unmet);
   return { satisfied: unmet.length === 0, unmet };
 }
 
@@ -378,14 +557,14 @@ export function evaluateGate(step, selfLane, lanesByName, now = new Date()) {
 // lane set — shared by the scheduler (skip these this fire) and status rendering
 // (show the wait). A `blocked` lane is a real gate/failure, not a soft wait, so
 // it's excluded. Returns `[{ lane: name, index, unmet }]`.
-export function computeWaiting(lanes, fallback = {}, now = new Date()) {
+export function computeWaiting(lanes, fallback = {}, now = new Date(), probes = null) {
   const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
   const waiting = [];
   for (const lane of lanes) {
     if (lane.status === 'blocked') continue;
     const action = nextAction(lane, fallback);
     if (action.kind === 'idle') continue;
-    const { satisfied, unmet } = evaluateGate(action.step, lane.name, byName, now);
+    const { satisfied, unmet } = evaluateGate(action.step, lane.name, byName, now, probes);
     if (!satisfied) waiting.push({ lane: lane.name, index: action.index, unmet });
   }
   return waiting;
