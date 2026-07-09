@@ -127,11 +127,16 @@ function renderTemplate(str, vars) {
 // `tty:false` drops the docker `-t` / ssh `-tt` allocation for a caller with no
 // pty behind it (the §23 `exit` probe runs under plain spawn — docker refuses
 // `-t` when stdin isn't a terminal).
+// `portBase` (§25 rule 2) is the lane's deterministic TASKHERD_PORT_BASE — it
+// crosses EVERY runner kind (unlike taskherdEnv's host paths, a port number is
+// meaningful anywhere): local/docker via env, ssh inlined on the remote command.
 export function wrapForRunner(runner, {
   file, args, extraEnv = {}, cwd, worktree, repo, laneName, isAi = false, taskherdEnv = {}, tty = true,
+  portBase = null,
 } = {}) {
   const warnings = [];
   const extraKeys = Object.keys(extraEnv);
+  const portEnv = portBase != null ? { TASKHERD_PORT_BASE: String(portBase) } : {};
 
   // The §11 mcp-in-runner gap: a scheduled ai step under a non-local runner can't
   // reach the host-registered taskherd-mcp (host node + bin/mcp.mjs aren't in the
@@ -149,21 +154,26 @@ export function wrapForRunner(runner, {
       file,
       args,
       cwd,
-      env: { ...process.env, ...extraEnv, ...taskherdEnv },
+      env: {
+        ...process.env, ...extraEnv, ...taskherdEnv, ...portEnv,
+      },
       warnings,
     };
   }
 
   if (runner.kind === 'docker') {
     const dargs = [];
-    let ttyEnv = { ...process.env, ...extraEnv }; // -e KEY reads values from here
+    // -e KEY reads values from here; TASKHERD_PORT_BASE crosses by name like
+    // the profile env (the value never lands on the recorded argv).
+    const ttyEnv = { ...process.env, ...extraEnv, ...portEnv };
+    const envNames = [...extraKeys, ...Object.keys(portEnv)];
     if (runner.container) {
       // Exec into a running, user-managed container. The worktree mapping is the
       // user's responsibility; use runner.workdir if given, else the container's.
       dargs.push('exec', '-i');
       if (tty) dargs.push('-t');
       if (runner.workdir) dargs.push('-w', runner.workdir);
-      for (const k of extraKeys) dargs.push('-e', k);
+      for (const k of envNames) dargs.push('-e', k);
       dargs.push(runner.container);
     } else if (runner.image) {
       // Ephemeral container with the worktree bind-mounted in. --rm so it doesn't
@@ -176,7 +186,7 @@ export function wrapForRunner(runner, {
         : (worktree ? [`{worktree}:${runner.workdir || '/work'}`] : []);
       for (const m of mounts) dargs.push('-v', renderTemplate(m, { worktree, repo, lane: laneName }));
       if (runner.workdir) dargs.push('-w', runner.workdir);
-      for (const k of extraKeys) dargs.push('-e', k);
+      for (const k of envNames) dargs.push('-e', k);
       if (runner.dockerArgs) dargs.push(...runner.dockerArgs);
       dargs.push(runner.image);
     } else {
@@ -208,6 +218,9 @@ export function wrapForRunner(runner, {
     }
     const remoteParts = [];
     if (remoteCwd) remoteParts.push(`cd ${shquote(remoteCwd)} &&`);
+    // A port number is safe to inline (we computed it); `VAR=n exec cmd` sets
+    // it in the remote process env without touching the remote shell config.
+    if (portBase != null) remoteParts.push(`TASKHERD_PORT_BASE=${Number(portBase)}`);
     remoteParts.push('exec', shquote(file), ...args.map(shquote));
     const sargs = [];
     if (runner.sshArgs) sargs.push(...runner.sshArgs);

@@ -126,6 +126,18 @@ export function worktreeDir(repo, laneName) {
   return path.join(wtRepoDir(repo), laneName);
 }
 
+// Deterministic per-lane port block (DESIGN §25 rule 2): parallel lanes can't
+// share the dev server's hardcoded port, so every step env exports
+// TASKHERD_PORT_BASE and well-behaved test servers pick ports by convention:
+// each lane owns the 50-port block [base, base+50) with base in
+// [20000, 30000) — 200 blocks keyed by a stable hash of the lane name.
+// Convention, not enforcement: undeclared port conflicts are what `mutex`
+// tags are for.
+export function lanePortBase(laneName) {
+  const hash = createHash('sha1').update(String(laneName)).digest();
+  return 20000 + (hash.readUInt32BE(0) % 200) * 50;
+}
+
 export function lockDir(repo) {
   return path.join(repoTasksDir(repo), '.lock');
 }

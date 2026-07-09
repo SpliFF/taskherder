@@ -102,6 +102,8 @@ const LANE_PROPS = {
   base: { type: 'string', description: 'Base branch the lane branch forks from / lands into.' },
   onEmpty: { type: 'string', enum: ['default', 'idle'], description: 'What an empty lane does each fire.' },
   asDefault: { type: 'boolean', description: 'Set the step as the lane\'s recurring default (runs every fire once the queue is empty) instead of appending it.' },
+  parallel: { type: 'boolean', description: 'Parallel lanes (DESIGN §25): false pins this lane to the SERIAL slot — it only runs when nothing else is running and blocks admission while it runs. Only meaningful when the repo config sets parallel.max > 1.' },
+  mutex: { type: 'array', items: { type: 'string' }, description: 'Shared-resource tags (DESIGN §25): two lanes sharing a tag never run concurrently (e.g. ["live-server", "db"]). Declare a tag for every resource isolation cannot prove disjoint — a port, one external DB, a rate-limited account. Only enforced when parallel.max > 1.' },
 };
 
 // Insert position (DESIGN §15). `next` interposes the step ahead of one already
@@ -159,7 +161,7 @@ const TOOLS = [
   },
   {
     name: 'tasks_fork',
-    description: 'Fork a sibling lane off a parent: a NEW independent lane (own branch/worktree) for an independent workstream discovered mid-task. Give it an initial step (task/type/...) or a recurring default (asDefault). `from` defaults to the current lane (TASKHERD_LANE).',
+    description: 'Fork a sibling lane off a parent: a NEW independent lane (own branch/worktree) for an independent workstream discovered mid-task. Give it an initial step (task/type/...) or a recurring default (asDefault). `from` defaults to the current lane (TASKHERD_LANE). Fork-time contract when the repo runs parallel lanes (DESIGN §25): fork only INDEPENDENT, DISJOINT file scopes into isolated lanes; declare any shared resource (a port, one DB, a rate-limited account) as a `mutex` tag on both lanes; work whose file scope OVERLAPS the parent stays in the parent lane — serial by construction, no analysis needed.',
     inputSchema: {
       type: 'object',
       properties: {
@@ -198,11 +200,11 @@ const TOOLS = [
 
 function splitArgs(args = {}) {
   const {
-    lane, name, from, isolation, land, base, onEmpty, asDefault, at, ...stepOpts
+    lane, name, from, isolation, land, base, onEmpty, asDefault, at, parallel, mutex, ...stepOpts
   } = args;
   return {
     lane, name, from, laneOpts: {
-      isolation, land, base, onEmpty, asDefault, at,
+      isolation, land, base, onEmpty, asDefault, at, parallel, mutex,
     },
     stepOpts,
   };

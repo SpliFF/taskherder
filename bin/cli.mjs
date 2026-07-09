@@ -82,7 +82,7 @@ const COMMAND_HELP = {
   init: { summary: 'Initialize .tasks/ in a repo (register it, scaffold config)', usage: 'taskherd init [-C repo | <repo>] [--no-global-gitignore]' },
   run: { summary: 'Fire the scheduler once — run ONE step (--lane targets one lane)', usage: 'taskherd run [-C repo | <repo>] [--lane <name>] [--force]' },
   status: { summary: 'Show lanes, last result, open gates, and cost', usage: 'taskherd status [-C repo | <repo>]' },
-  add: { summary: 'Queue a step onto a lane (command | ai | manual)', usage: 'taskherd add [-C repo] <lane> [--type command|ai|manual] [--at next|end|<index>] [--id <label>] [--waits-for <lane:id>]... [--after HH:MM] [--before HH:MM] [--days Mon-Fri] [--from YYYY-MM-DD] [--until YYYY-MM-DD] [--tz local|utc] [--when \'<json rule>\'] [--isolation worktree|inplace|none] [--land manual-gate|pr|leave] [--base <branch>] [opts] "<task>"' },
+  add: { summary: 'Queue a step onto a lane (command | ai | manual)', usage: 'taskherd add [-C repo] <lane> [--type command|ai|manual] [--at next|end|<index>] [--id <label>] [--waits-for <lane:id>]... [--after HH:MM] [--before HH:MM] [--days Mon-Fri] [--from YYYY-MM-DD] [--until YYYY-MM-DD] [--tz local|utc] [--when \'<json rule>\'] [--isolation worktree|inplace|none] [--land manual-gate|pr|leave] [--base <branch>] [--no-parallel] [--mutex <tag>]... [opts] "<task>"' },
   block: { summary: 'Add a manual gate that blocks a lane until acked', usage: 'taskherd block [-C repo] <lane> --message "<text>" [--at next|end|<index>] [--file <path>]' },
   fork: { summary: 'Split a new sibling lane off an existing one', usage: 'taskherd fork [-C repo] <new-lane> --from <parent> [add opts] ["<task>"]' },
   ack: { summary: 'Answer a gate / clear a parked failure / land a branch', usage: 'taskherd ack [-C repo] <lane>' },
@@ -166,7 +166,16 @@ async function cmdRun(argv) {
     case 'no-tasks-dir': console.log(`taskherd: no .tasks/ in ${repo} — run \`taskherd init\` first`); break;
     case 'locked': console.log('taskherd: another run in progress, skipping'); break;
     case 'not-runnable': console.log(`taskherd: lane '${result.lane}' not runnable — ${result.reason}`); break;
-    case 'idle': console.log(`taskherd: nothing runnable (${result.lanes} lane(s))`); break;
+    case 'idle': console.log(`taskherd: nothing runnable (${result.lanes} lane(s)${result.running?.length ? `; running: ${result.running.join(', ')}` : ''})`); break;
+    case 'held': {
+      // §25 rule 3: a soft wait, not an error — every runnable lane was held
+      // back by admission control this fire; the next fire re-checks.
+      console.log(`taskherd: nothing admitted (running: ${(result.running || []).join(', ') || 'none'})`);
+      for (const h of result.holds || []) console.log(`  ${h.lane}: ${h.reason}`);
+      if (result.reason) console.log(`  ${result.reason}`);
+      break;
+    }
+    case 'busy': console.log(`taskherd: runs still live from parallel fires (${(result.running || []).join(', ')}) — serial fire skipped`); break;
     case 'ran': console.log(`taskherd: ran ${result.lane}#${result.step} -> ${result.result}`); break;
     default: console.log(`taskherd: ${result.outcome}`);
   }
@@ -218,6 +227,10 @@ function laneOptsFromFlags(values) {
     onEmpty: values['on-empty'],
     asDefault: values.default,
     at: values.at,
+    // §25 lane-level parallel fields: --no-parallel pins the lane to the
+    // serial slot; --mutex declares shared-resource tags (repeat or comma-sep).
+    parallel: values['no-parallel'] ? false : undefined,
+    mutex: values.mutex && values.mutex.length ? values.mutex : undefined,
   };
 }
 
@@ -250,6 +263,8 @@ const ADD_OPTIONS = {
   base: { type: 'string' },
   default: { type: 'boolean', default: false },
   at: { type: 'string' },
+  'no-parallel': { type: 'boolean', default: false },
+  mutex: { type: 'string', multiple: true },
 };
 
 async function cmdAdd(argv) {

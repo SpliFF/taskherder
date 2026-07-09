@@ -14,6 +14,11 @@ import {
 } from './tasks.mjs';
 import { createProbeSession } from './probes.mjs';
 import { loadProjectConfig, loadUserConfig } from './config.mjs';
+import {
+  parallelMax, readRunningSet, writeRunManifest, removeRunManifest,
+  startManifestHeartbeat, candidateFacts, admissible, describeHold,
+} from './admission.mjs';
+import { isGitRepo } from './git.mjs';
 import { runStep, formatDuration } from './executor.mjs';
 import { appendEvent } from './events.mjs';
 import { appendHistory, readHistory } from './history.mjs';
@@ -65,7 +70,23 @@ async function acquireLock(repo) {
   } catch (err) {
     if (err.code !== 'EEXIST') throw err;
   }
-  const age = Date.now() - (await stat(dir)).mtimeMs;
+  let mtimeMs;
+  try {
+    ({ mtimeMs } = await stat(dir));
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+    // The holder released between our mkdir EEXIST and this stat — routine
+    // under §25's brief admission locks. One more attempt, else report locked.
+    try {
+      await mkdir(dir);
+      await writeFile(lockPidFile(repo), `${process.pid}\n`);
+      return true;
+    } catch (err2) {
+      if (err2.code !== 'EEXIST') throw err2;
+      return false;
+    }
+  }
+  const age = Date.now() - mtimeMs;
   if (age > STALE_LOCK_MIN * 60_000 && !(await lockPidAlive(repo))) {
     await rm(dir, { recursive: true, force: true });
     try {
@@ -204,11 +225,15 @@ async function gateBudgets(repo, runnable, history, nowIso) {
 
 // Scans all lanes, transitioning any lane whose next action is a freshly
 // reached manual gate from pending -> blocked (DESIGN §6 step 2). Returns the
-// set of lanes still eligible to run this tick.
-async function scanAndGate(repo, lanes, fallback, now, probeSession) {
+// set of lanes still eligible to run this tick. `exclude` names lanes with a
+// LIVE run manifest (§25): their cursor step is executing right now, so they
+// must not be re-considered (or budget-re-blocked mid-run) by this fire —
+// they still sit in `byName` so other lanes' dep refs resolve against them.
+async function scanAndGate(repo, lanes, fallback, now, probeSession, exclude = null) {
   const runnable = [];
   const byName = Object.fromEntries(lanes.map((l) => [l.name, l]));
   for (const lane of lanes) {
+    if (exclude && exclude.has(lane.name)) continue;
     const action = nextAction(lane, fallback);
     if (action.kind === 'idle') continue;
     if (action.kind === 'step' && action.step.status === 'blocked') continue; // already gated
@@ -242,12 +267,19 @@ async function scanAndGate(repo, lanes, fallback, now, probeSession) {
   return runnable;
 }
 
-function fairPick(candidates) {
+// Least-recently-run first; the admission walk (§25) needs the whole order —
+// it admits the FIRST candidate the predicate lets through, so fairness and
+// admission can't drift apart.
+function fairOrder(candidates) {
   return [...candidates].sort((a, b) => {
     const byLastRun = (a.lane.lastRun || 0) - (b.lane.lastRun || 0);
     if (byLastRun !== 0) return byLastRun;
     return a.lane.name.localeCompare(b.lane.name);
-  })[0];
+  });
+}
+
+function fairPick(candidates) {
+  return fairOrder(candidates)[0];
 }
 
 // Why a targeted lane (`taskherd run --lane X`) had nothing to run this fire —
@@ -298,25 +330,68 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
   if (!existsSync(repoTasksDir(repo))) {
     return { outcome: 'no-tasks-dir' };
   }
+
+  // The parallel mode decision (DESIGN §25) needs the project config, so load
+  // it before the lock — a pure read. A malformed `parallel` block fails
+  // CLOSED to serial, loudly (§25 rule 1), never silently concurrent.
+  const [projectConfig, userConfig] = await Promise.all([loadProjectConfig(repo), loadUserConfig()]);
+  let maxParallel = 1;
+  try {
+    maxParallel = parallelMax(projectConfig);
+  } catch (err) {
+    console.error(`${err.message} — failing closed to serial`);
+  }
+  const parallelMode = maxParallel > 1;
+
   if (!(await acquireLock(repo))) {
     return { outcome: 'locked' };
   }
+  // In parallel mode the §6 mutex changes role (§25): from a whole-run lock to
+  // a brief ADMISSION lock — held for read-running-set → evaluate → write the
+  // admitted manifest, then released while this fire supervises its step.
+  // Serial mode keeps the whole-run lock, byte-identical to today.
   const heartbeat = startHeartbeat(repo);
+  let lockHeld = true;
+  const release = async () => {
+    if (!lockHeld) return;
+    lockHeld = false;
+    clearInterval(heartbeat);
+    await releaseLock(repo);
+  };
+  let manifestLane = null; // the run manifest THIS fire wrote (parallel mode)
+  let manifestBeat = null;
 
   try {
+    // The running set (§25): live per-run manifests from concurrent fires.
+    // Stale leftovers (old heartbeat + dead pid) are reaped like a stale lock;
+    // unreadable/misshapen files fail admission closed further down.
+    const { running, invalid, reaped } = await readRunningSet(repo);
+    for (const r of reaped) {
+      console.error(`taskherd: reaped stale run manifest for lane ${r.lane} (pid ${r.pid} dead, heartbeat old) — its supervising fire likely crashed (DESIGN §25)`);
+    }
+    if (!parallelMode && (running.length || invalid.length)) {
+      // parallel.max was just lowered/removed while runs are still live — a
+      // whole-run-locked fire alongside them could double-run a lane. Wait.
+      const who = [...running.map((m) => m.lane), ...invalid.map((b) => b.file)].join(', ');
+      console.error(`taskherd: serial fire skipped — live/unreadable run manifests (${who}) in .tasks/run/; waiting for those runs to finish (DESIGN §25)`);
+      return { outcome: 'busy', running: running.map((m) => m.lane) };
+    }
+    const liveNames = new Set(running.map((m) => m.lane));
+
     const { lanes, unloadable } = await loadAllLanesResilient(repo);
     for (const bad of unloadable) {
       // Loud + greppable; a single bad lane file must not brick every tick (DESIGN §1).
       console.error(`taskherd: lane ${bad.name} unloadable: ${bad.error}`);
     }
-    const [projectConfig, userConfig] = await Promise.all([loadProjectConfig(repo), loadUserConfig()]);
     const fallback = defaultFallback(projectConfig, userConfig);
     const now = new Date();
     // §23 `exit` probes run inside this tick only — one session per fire, results
     // memoized across lanes, last results persisted (and TTL-reused) via flush().
     // PAUSED returned above, so a paused repo is never probed.
     const probeSession = await createProbeSession(repo);
-    const gated = await scanAndGate(repo, lanes, fallback, now, probeSession);
+    // Live lanes are excluded up front: their cursor step is mid-run, so this
+    // fire must neither re-run nor budget-re-block them (§25).
+    const gated = await scanAndGate(repo, lanes, fallback, now, probeSession, liveNames);
     await probeSession.flush();
     const nowIso = now.toISOString();
     const history = await readHistory(repo);
@@ -362,8 +437,11 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
     await writeNeedsAttention(repo, attention.lanes, attention.unloadable, stalled ? depWaiting : []);
 
     // Targeted manual run: keep only the named lane's candidate. If it isn't
-    // runnable, say why (blocked/idle/missing) rather than a generic 'idle'.
+    // runnable, say why (running/blocked/idle/missing) rather than a generic 'idle'.
     if (targetLane) {
+      if (liveNames.has(targetLane)) {
+        return { outcome: 'not-runnable', lane: targetLane, reason: 'already running (live run manifest, DESIGN §25)' };
+      }
       const chosen = runnable.filter((entry) => entry.lane.name === targetLane);
       if (chosen.length === 0) {
         return {
@@ -376,15 +454,76 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
     }
 
     if (runnable.length === 0) {
-      return { outcome: 'idle', lanes: lanes.length, unloadable: unloadable.length };
+      return {
+        outcome: 'idle', lanes: lanes.length, unloadable: unloadable.length, ...(liveNames.size ? { running: [...liveNames] } : {}),
+      };
     }
 
-    const { lane, action, synthetic } = fairPick(runnable);
+    // Pick. Serial: fair-pick, unchanged. Parallel: walk the same fair order
+    // and admit the FIRST candidate the §25 predicate lets through alongside
+    // the running set — a held-back lane is a SOFT wait (§25 rule 3): status
+    // surfaces its blocker; nothing is persisted, nothing lands in
+    // NEEDS-ATTENTION, and the next fire re-checks.
+    let picked = null;
+    if (parallelMode) {
+      if (invalid.length) {
+        for (const bad of invalid) {
+          console.error(`taskherd: .tasks/run/${bad.file} is unreadable as a run manifest (${bad.error}) — failing closed: no admission this fire (DESIGN §25)`);
+        }
+        return { outcome: 'held', reason: 'unreadable run manifest(s) in .tasks/run/ — remove the stray file(s)' };
+      }
+      const gitRepo = await isGitRepo(repo);
+      const holds = [];
+      for (const entry of fairOrder(runnable)) {
+        // A lane never runs concurrently with itself (steps are serial by
+        // construction). scanAndGate already excluded live lanes; this also
+        // covers the synthetic zero-config default, which is built after it.
+        if (liveNames.has(entry.lane.name)) continue;
+        const facts = await candidateFacts(repo, entry.lane, entry.action.step, projectConfig, userConfig, { gitRepo });
+        const verdict = admissible(facts, running, maxParallel);
+        if (verdict.ok) {
+          picked = { ...entry, facts };
+          break;
+        }
+        holds.push({ lane: entry.lane.name, reason: describeHold(verdict) });
+      }
+      if (!picked) {
+        if (targetLane) {
+          const hold = holds.find((h) => h.lane === targetLane);
+          return { outcome: 'not-runnable', lane: targetLane, reason: hold ? hold.reason : 'held back by admission control (DESIGN §25)' };
+        }
+        return { outcome: 'held', holds, running: [...liveNames] };
+      }
+    } else {
+      picked = fairPick(runnable);
+    }
+
+    const { lane, action, synthetic } = picked;
     const state = await readState(repo);
     state.tick = (state.tick || 0) + 1;
+    // Persisted here — under the lock in BOTH modes — so overlapping parallel
+    // fires never lose a tick bump to a concurrent read-modify-write.
+    await writeState(repo, state);
 
     const step = action.step;
     const resolvedConfig = await resolveStepConfig(repo, lane, step);
+
+    if (parallelMode) {
+      // §25 admission step 4: write the admitted manifest (the slot is now
+      // taken), release the lock, then supervise the step outside it. The
+      // manifest heartbeat keeps a long run from ever reading as stale.
+      await writeRunManifest(repo, {
+        lane: lane.name,
+        isolation: picked.facts.isolation,
+        runnerKind: picked.facts.runnerKind,
+        parallel: picked.facts.parallel,
+        mutex: picked.facts.mutex,
+      });
+      manifestLane = lane.name;
+      await release();
+      manifestBeat = startManifestHeartbeat(repo, lane.name);
+    }
+
     let result;
     try {
       result = await runStep(repo, lane, step, action.index, resolvedConfig);
@@ -472,7 +611,6 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
       fresh.lastRun = state.tick;
       await saveLane(repo, fresh);
     }
-    await writeState(repo, state);
 
     const after = await loadAllLanesResilient(repo);
     await writeNeedsAttention(repo, after.lanes, after.unloadable);
@@ -499,7 +637,14 @@ export async function tick(repo, { lane: targetLane = null, force = false } = {}
       outcome: 'ran', lane: lane.name, step: action.index, result: result.status, cost: result.cost ?? null,
     };
   } finally {
-    clearInterval(heartbeat);
-    await releaseLock(repo);
+    if (manifestBeat) clearInterval(manifestBeat);
+    if (manifestLane) {
+      // The manifest must not outlive its run — a leftover would hold back
+      // admission until the stale reaper ages it out. Removal failure is loud.
+      await removeRunManifest(repo, manifestLane).catch((err) => {
+        console.error(`taskherd: could not remove run manifest for lane ${manifestLane}: ${err.message}`);
+      });
+    }
+    await release();
   }
 }

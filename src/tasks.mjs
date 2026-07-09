@@ -619,6 +619,11 @@ export function newLane(name, overrides = {}) {
     profile: null,
     runner: null,
     provider: null,
+    // Parallel-lane fields (DESIGN §25): `parallel: false` makes this lane
+    // always take the serial slot; `mutex` tags declare shared resources two
+    // lanes must never hold concurrently. null = parallel-eligible, no tags.
+    parallel: null,
+    mutex: null,
     cursor: 0,
     lastRun: 0,
     status: 'idle',
@@ -956,13 +961,39 @@ export function buildStep(opts = {}) {
   return validateStep(withDeps(step, opts));
 }
 
+// Normalizes a `mutex` opt (array, or a comma/space-separated CLI string) into
+// a validated tag array, or null when empty. Tags share the lane-name charset —
+// they land in run manifests and status lines, never a path, but a loud
+// write-time failure beats a silently unmatched tag (DESIGN §1/§25).
+export function normalizeMutex(v) {
+  if (v == null) return null;
+  const arr = Array.isArray(v) ? v : String(v).split(/[,\s]+/);
+  const out = arr.map((s) => String(s).trim()).filter(Boolean);
+  for (const tag of out) {
+    if (!TOKEN.test(tag)) {
+      throw new LaneValidationError(`taskherd: invalid mutex tag ${JSON.stringify(tag)} (letters, digits, ., _, - only)`);
+    }
+  }
+  return out.length ? out : null;
+}
+
 // Lane-level axis settings a client may set alongside a step (DESIGN §7:
-// isolation/land/base are per-lane, not per-step).
+// isolation/land/base are per-lane, not per-step; §25: parallel/mutex too).
 function applyLaneOpts(lane, laneOpts = {}) {
   if (laneOpts.isolation) lane.isolation = laneOpts.isolation;
   if (laneOpts.land) lane.land = laneOpts.land;
   if (laneOpts.base) lane.base = laneOpts.base;
   if (laneOpts.onEmpty) lane.onEmpty = laneOpts.onEmpty;
+  // `parallel: false` is the meaningful value (§25 — this lane takes the serial
+  // slot); anything else explicit resets to eligible. Accepts the string forms
+  // a CLI/HTTP client sends. A non-boolean-ish value fails loudly.
+  if (laneOpts.parallel != null) {
+    const p = laneOpts.parallel;
+    if (p === false || p === 'false') lane.parallel = false;
+    else if (p === true || p === 'true') lane.parallel = null;
+    else throw new LaneValidationError(`taskherd: lane \`parallel\` must be true or false, got ${JSON.stringify(p)} (DESIGN §25)`);
+  }
+  if (laneOpts.mutex != null) lane.mutex = normalizeMutex(laneOpts.mutex);
 }
 
 // Resolves where a newly-added step lands in lane.steps (DESIGN §15 "reorder,
@@ -1170,6 +1201,8 @@ export async function initTasksDir(repo, { globalGitignore = true } = {}) {
       // Seed manifest for fresh lane worktrees (DESIGN §24), e.g.
       // {"link": [".env"], "copy": ["PLAN*.md"], "generate": ["npm ci"]}.
       bootstrap: null,
+      // Parallel lanes (DESIGN §25), e.g. {"max": 2}. null/absent = serial.
+      parallel: null,
     };
     await writeFile(cfgFile, `${JSON.stringify(defaultConfig, null, 2)}\n`);
   }

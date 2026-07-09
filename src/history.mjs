@@ -3,7 +3,14 @@ import { appendFile, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { historyFile, runSocketLink, notesFile } from './paths.mjs';
-import { loadAllLanesResilient, computeWaiting, describeWhen } from './tasks.mjs';
+import {
+  loadAllLanesResilient, computeWaiting, describeWhen, nextAction, defaultFallback,
+} from './tasks.mjs';
+import { loadProjectConfig, loadUserConfig } from './config.mjs';
+import {
+  parallelMax, readRunningSet, candidateFacts, admissible, describeHold, isIsolated,
+} from './admission.mjs';
+import { isGitRepo, laneDiff } from './git.mjs';
 
 export async function appendHistory(repo, record) {
   await appendFile(historyFile(repo), `${JSON.stringify({ ts: new Date().toISOString(), ...record })}\n`);
@@ -38,6 +45,63 @@ export async function statusData(repo) {
   // (auto-clearing — distinct from a `blocked` gate that needs an ack).
   const waitingByLane = {};
   for (const w of computeWaiting(lanes)) waitingByLane[w.lane] = w.unmet;
+
+  // Parallel-lane surfacing (DESIGN §25), only when the repo opted in: which
+  // runnable lanes are HELD BACK by admission control (rule 3 — a soft wait,
+  // "serialized: waiting on …", never NEEDS-ATTENTION), plus the overlap
+  // advisory (rule 4 — live/runnable isolated lanes whose branch diffs touch
+  // the same paths; advisory only, never blocks). Read-only: manifests are
+  // never reaped from here, and nothing here executes code.
+  const projectConfig = await loadProjectConfig(repo);
+  let maxParallel = 1;
+  try {
+    maxParallel = parallelMax(projectConfig);
+  } catch {
+    // loud at tick time (the scheduler fails closed to serial); status just renders
+  }
+  const heldByLane = {};
+  const overlaps = [];
+  let parallel = null;
+  if (maxParallel > 1) {
+    const userConfig = await loadUserConfig();
+    const { running } = await readRunningSet(repo, { reap: false });
+    const liveNames = new Set(running.map((m) => m.lane));
+    const gitRepo = await isGitRepo(repo);
+    const fallback = defaultFallback(projectConfig, userConfig);
+    const factsList = [];
+    for (const lane of lanes) {
+      if (lane.status === 'blocked' || liveNames.has(lane.name) || waitingByLane[lane.name]) continue;
+      const action = nextAction(lane, fallback);
+      if (action.kind === 'idle') continue;
+      const facts = await candidateFacts(repo, lane, action.step, projectConfig, userConfig, { gitRepo });
+      factsList.push(facts);
+      const verdict = admissible(facts, running, maxParallel);
+      if (!verdict.ok) heldByLane[lane.name] = describeHold(verdict);
+    }
+    if (gitRepo) {
+      const diffTargets = new Set([
+        ...running.filter((m) => isIsolated(m)).map((m) => m.lane),
+        ...factsList.filter((f) => isIsolated(f)).map((f) => f.lane),
+      ]);
+      const fileSets = {};
+      for (const name of diffTargets) {
+        try {
+          const d = await laneDiff(repo, name);
+          if (d.exists && d.files.length) fileSets[name] = new Set(d.files.map((f) => f.path));
+        } catch {
+          // advisory only — a diff failure must never take status down
+        }
+      }
+      const names = Object.keys(fileSets).sort();
+      for (let i = 0; i < names.length; i += 1) {
+        for (let j = i + 1; j < names.length; j += 1) {
+          const shared = [...fileSets[names[i]]].filter((p) => fileSets[names[j]].has(p));
+          if (shared.length) overlaps.push({ lanes: [names[i], names[j]], files: shared.slice(0, 10), count: shared.length });
+        }
+      }
+    }
+    parallel = { max: maxParallel, running: [...liveNames] };
+  }
 
   // Running cost totals (DESIGN §10).
   const spentByLane = {};
@@ -111,27 +175,42 @@ export async function statusData(repo) {
       // worktree lane appended are one glance away, not tribal knowledge.
       notes: existsSync(notesFile(repo, lane.name))
         ? path.relative(path.resolve(repo), notesFile(repo, lane.name)) : null,
+      // §25 rule 3: runnable but held back by admission control — a soft wait
+      // naming its blocker, distinct from `waiting` (deps) and `blocked` (ack).
+      serialized: heldByLane[lane.name] || null,
     };
   });
-  return { lanes: out, unloadable, totalSpent };
+  return {
+    lanes: out, unloadable, totalSpent, parallel, overlaps,
+  };
 }
 
 export async function renderStatus(repo) {
-  const { lanes, unloadable, totalSpent } = await statusData(repo);
+  const {
+    lanes, unloadable, totalSpent, parallel, overlaps,
+  } = await statusData(repo);
   if (lanes.length === 0 && unloadable.length === 0) {
     return 'no lanes yet — `taskherd add <lane> "<task>"` to create one';
   }
 
   const lines = [];
+  if (parallel) {
+    lines.push(`parallel: max ${parallel.max}, running ${parallel.running.length}${parallel.running.length ? ` (${parallel.running.join(', ')})` : ''}`);
+  }
   for (const lane of lanes) {
     const spent = lane.spent ? `  spent: ${fmtUsd(lane.spent)}` : '';
     lines.push(`${lane.name}  [${lane.cursor}/${lane.steps.length}]  ${lane.status || 'idle'}  last: ${lane.last ? lane.last.result : 'never run'}${spent}`);
     if (lane.gate) lines.push(`  gate: ${lane.gate}`);
     if (lane.waiting) lines.push(`  waiting on: ${lane.waiting.join(', ')}`);
+    if (lane.serialized) lines.push(`  ${lane.serialized}`);
     if (lane.notes) lines.push(`  notes: ${lane.notes}`);
   }
   for (const bad of unloadable) {
     lines.push(`${bad.name}  [unloadable]  ${bad.error}`);
+  }
+  // §25 rule 4 — advisory only: steer scopes apart before the work is done.
+  for (const o of overlaps || []) {
+    lines.push(`⚠ overlap: ${o.lanes.join(' + ')} both touch ${o.files.join(', ')}${o.count > o.files.length ? ` (+${o.count - o.files.length} more)` : ''}`);
   }
   if (totalSpent > 0) lines.push(`total spent: ${fmtUsd(totalSpent)}`);
   return lines.join('\n');

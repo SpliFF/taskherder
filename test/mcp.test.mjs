@@ -208,6 +208,18 @@ test('taskherd-mcp: §16 tool surface round-trip (no tasks_run)', async (t) => {
   assert.match(badWhen.content[0].text, /not implemented yet/);
   assert.equal((await loadLane(repo, 'nightly')).steps.length, 2, 'the refused step is not persisted');
 
+  // The §25 lane-level parallel fields ride tasks_add's laneOpts end-to-end:
+  // an agent can pin a lane to the serial slot and declare mutex tags.
+  await client.callTool({
+    name: 'tasks_add',
+    arguments: {
+      lane: 'deploy', type: 'command', task: 'echo ship', parallel: false, mutex: ['live-server', 'db'],
+    },
+  });
+  const deploy = await loadLane(repo, 'deploy');
+  assert.equal(deploy.parallel, false);
+  assert.deepEqual(deploy.mutex, ['live-server', 'db']);
+
   // fork: sibling lane with parent + seed step.
   const fork = await client.callTool({
     name: 'tasks_fork',

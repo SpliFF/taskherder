@@ -109,6 +109,36 @@ tools automatically via a per-run merged `--mcp-config`, so the `/task`
 finalization loop works inside isolated worktree runs too — a scheduled run can
 enqueue its own next step, gate on a human, or fork a sibling lane.
 
+## Parallel lanes
+
+Off by default — the scheduler is fully serial until the repo opts in
+(`.tasks/config.json`):
+
+```jsonc
+"parallel": { "max": 2 }        // absent ⇒ serial (one step per fire, whole-run lock)
+```
+
+The **lane** is the unit of parallelism (steps within a lane stay serial).
+Each one-shot fire still runs one step; concurrency comes from **overlapping
+fires** (cron cadence paces the ramp-up). Admission control only lets a lane
+start alongside live runs when that is provably safe:
+
+- **Isolated lanes only** — `worktree` isolation, or an off-host
+  `docker:`/`ssh:` runner. `inplace`/`none` lanes run **exclusively** (they
+  share your live checkout).
+- **`"parallel": false`** on a lane pins it to the serial slot; **`"mutex":
+  ["live-server"]`** tags declare shared resources — two lanes sharing a tag
+  never run concurrently (`taskherd add --no-parallel` / `--mutex <tag>`).
+- A held-back lane shows `serialized: waiting on …` in `status`/console — a
+  soft wait that clears itself; anything unreadable about the running state
+  **fails closed to serial, loudly**.
+- Every step env gets **`TASKHERD_PORT_BASE`** — a deterministic per-lane
+  50-port block in `[20000, 30000)` (stable hash of the lane name). Have dev/
+  test servers bind `TASKHERD_PORT_BASE`, `+1`, … so concurrent lanes never
+  fight over a port; for anything ports can't cover, declare a `mutex` tag.
+- `status`/console warn when two live/runnable lanes' branch diffs touch the
+  same files (a land conflict in the making) — advisory only.
+
 ## Safety
 
 Built for **unattended** use: git isolation, spend budgets, timeouts with

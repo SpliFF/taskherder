@@ -145,6 +145,19 @@ function waitBannerHtml(lane) {
   </div>`;
 }
 
+// A runnable lane held back by admission control (DESIGN §25 rule 3):
+// "serialized: waiting on <blocker>". Like a dep/window wait it needs no human
+// action — it starts the moment the slot frees — so it reads as the same calm
+// cyan info banner, never an alert.
+function serializedBannerHtml(lane) {
+  if (!lane.serialized) return '';
+  return `<div class="wait-banner">
+    <span class="wait-label">⧗ SERIALIZED</span>
+    <span class="wait-refs">${esc(lane.serialized.replace(/^serialized: /, ''))}</span>
+    <span class="wait-note">runs when the slot frees — no action needed</span>
+  </div>`;
+}
+
 function laneHtml(p, lane) {
   const running = lane.running;
   const waiting = !!lane.waiting?.length;
@@ -192,6 +205,7 @@ function laneHtml(p, lane) {
     </div>
     ${gateBannerHtml(lane)}
     ${waitBannerHtml(lane)}
+    ${serializedBannerHtml(lane)}
     ${steps ? `<ul class="steps">${steps}</ul>` : ''}
     ${lane.onEmpty === 'default' && lane.default ? `<div class="lane-default">${esc(lane.default.task || lane.default.run || 'default')} <span class="step-type">(${esc(lane.default.type || 'ai')} · recurring)</span></div>` : ''}
     <div class="lane-actions">
@@ -231,11 +245,13 @@ function render() {
         <h2>${esc(p.name)}</h2>
         <span class="project-path">${esc(p.path)}</span>
         <span class="project-spend">${p.totalSpent ? `Σ $${p.totalSpent.toFixed(2)}` : ''}</span>
+        ${p.parallel ? `<span class="run-count ${p.parallel.running.length ? 'live' : ''}" title="parallel lanes (DESIGN §25): ${p.parallel.running.length} running, max ${p.parallel.max}${p.parallel.running.length ? ` — ${esc(p.parallel.running.join(', '))}` : ''}">▸ ${p.parallel.running.length}/${p.parallel.max}</span>` : ''}
         ${allowShell ? `<button class="btn ghost" data-action="shell" title="open a shell on this host (web-SSH)">SHELL</button>` : ''}
         ${allowGfx && gfxRunners.length ? `<button class="btn ghost" data-action="gui" title="stream a runner's GUI (Xpra/noVNC)">GUI</button>` : ''}
         <button class="btn ${p.paused ? 'primary' : 'warn'}" title="${p.paused ? 'Resume the herd — lanes can run again' : 'Pause the herd — no lanes run until resumed'}" data-action="${p.paused ? 'resume' : 'pause'}">${p.paused ? 'RESUME' : 'PAUSE'}</button>
       </div>
       ${p.paused ? '<div class="paused-banner">⏸ PAUSED — no lanes will run until resumed</div>' : ''}
+      ${(p.overlaps || []).map((o) => `<div class="overlap-banner">⚠ scope overlap: <strong>${esc(o.lanes.join(' + '))}</strong> both touch ${esc(o.files.join(', '))}${o.count > o.files.length ? ` (+${o.count - o.files.length} more)` : ''} — land conflicts likely (DESIGN §25)</div>`).join('')}
       ${p.error ? `<p class="missing">✗ ${esc(p.error)}</p>` : ''}
       <div class="lanes">${lanes}${unloadable}</div>
     </section>`;

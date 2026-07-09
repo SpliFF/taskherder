@@ -317,6 +317,20 @@ test('serve: the add API accepts a `when` rule and the snapshot carries it (§23
   });
   assert.equal(bad.status, 400);
   assert.match(bad.body.error, /not implemented yet/);
+
+  // §25 lane fields flow through the console's laneOpts too (one applyLaneOpts
+  // for every client); a bad mutex tag is a 400, not a silent drop.
+  const par = await api('POST', `/api/projects/${id}/add`, {
+    lane: 'nightly', step: { type: 'command', task: 'echo y' }, laneOpts: { parallel: false, mutex: ['live-server'] },
+  });
+  assert.equal(par.status, 200);
+  const nightly = await loadLane(repo, 'nightly');
+  assert.equal(nightly.parallel, false);
+  assert.deepEqual(nightly.mutex, ['live-server']);
+  const badTag = await api('POST', `/api/projects/${id}/add`, {
+    lane: 'nightly', step: { type: 'command', task: 'echo z' }, laneOpts: { mutex: ['bad/tag'] },
+  });
+  assert.equal(badTag.status, 400);
 });
 
 test('serve: RUN fires one lane in the serve process; force overrides pause', async (t) => {

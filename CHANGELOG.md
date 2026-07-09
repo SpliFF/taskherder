@@ -8,6 +8,40 @@ changes.
 ## Unreleased
 
 ### Added
+- **Parallel lanes — admission control (DESIGN §25).** Off by default; a repo
+  opts in with `"parallel": {"max": N}` in `.tasks/config.json`. The **lane**
+  is the unit of parallelism (steps within a lane stay serial); each one-shot
+  fire still runs one step, and concurrency arises from **overlapping fires**.
+  The §6 mutex becomes a brief **admission lock**: read the running set
+  (per-run manifests at `.tasks/run/<lane>.json`, staleness-checked like the
+  lock — mtime heartbeat + `kill(pid,0)`), evaluate, write the admitted
+  manifest, release, supervise. A pure admission predicate only lets a lane
+  start alongside live runs when that is provably safe: **isolated lanes
+  only** (`worktree`, or off-host `docker:`/`ssh:` runners); `inplace`/`none`
+  lanes run **exclusively**; lane-level **`"parallel": false`** pins a lane to
+  the serial slot and **`"mutex": [tags]`** keeps lanes sharing a tag from
+  ever overlapping (CLI `--no-parallel` / `--mutex`, MCP `tasks_add`/
+  `tasks_fork`, serve `add`). Anything unreadable or ambiguous about the
+  running set **fails closed to serial, loudly** — including a serial-mode
+  fire that finds live manifests (`busy`). A held-back lane is a soft wait:
+  `status`/console show `serialized: waiting on <blocker>` (never
+  NEEDS-ATTENTION); the console header gains a running-count badge and
+  `status` a `parallel: max N, running M` line. **`TASKHERD_PORT_BASE`** is
+  exported into every step env (a deterministic per-lane 50-port block in
+  `[20000, 30000)`, crossing local/docker/ssh runners) so concurrent lanes'
+  test servers pick disjoint ports by convention. `status`/console also warn
+  when two live/runnable isolated lanes' branch diffs touch the same files —
+  the §25 rule-4 **overlap advisory** (advisory only). The `/task` skill
+  carries the fork-time contract: disjoint scopes → isolated lanes, shared
+  resources → `mutex` tags, overlapping scopes stay in one lane.
+### Fixed
+- **`acquireLock` stat race.** Two fires contending for `.tasks/.lock` could
+  crash the loser with ENOENT when the holder released between the `mkdir`
+  EEXIST and the staleness `stat` — routine once §25's brief admission locks
+  made contention hot. The loser now retries the acquire once, else reports
+  `locked`.
+
+### Added
 - **Worktree bootstrap — the seed manifest (DESIGN §24).** A fresh lane
   worktree checks out tracked files only, so the gitignored state real work
   needs (`.env`, installed deps, `PLAN*.md` working memory) was missing and

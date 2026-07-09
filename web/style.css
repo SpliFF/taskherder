@@ -126,6 +126,22 @@ main {
   letter-spacing: 0.08em;
 }
 
+/* §25 running-count badge: N live of parallel.max — dim when idle, run-green
+   once anything is live so a glance shows the herd is working. */
+.run-count { color: var(--dim); font-size: 11px; white-space: nowrap; }
+.run-count.live { color: var(--run); }
+
+/* §25 rule 4 overlap advisory: amber like a gate (it predicts a land
+   conflict) but purely informational — no button, nothing to ack. */
+.overlap-banner {
+  border: 1px dashed var(--gate);
+  border-left: 6px solid var(--gate);
+  color: var(--gate);
+  padding: 6px 12px;
+  margin-top: 10px;
+  font-size: 12px;
+}
+
 .missing { color: var(--fail); padding: 8px 2px; }
 
 /* ── lanes ────────────────────────────────────────────────────────────── */

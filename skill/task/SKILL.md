@@ -42,6 +42,14 @@ Start with `tasks_status` to see the lane tree as it is now.
   cadence, or different risk profile) → `tasks_fork` a sibling lane off yours,
   seeded with an initial step or default. Do not fork what is really just your
   own next step.
+- **Fork-time contract when the repo runs parallel lanes** (DESIGN §25 —
+  `tasks_status` shows a `parallel:` line when it does): fork only
+  **independent, disjoint file scopes** into isolated lanes; declare every
+  shared resource isolation can't prove disjoint (a port, one external DB, a
+  rate-limited account) as a `mutex` tag on *both* lanes; work whose file
+  scope **overlaps** yours stays in **your** lane — serial by construction, no
+  analysis needed. Servers you start should bind at `TASKHERD_PORT_BASE` (a
+  per-lane 50-port block) so concurrent lanes never fight over a port.
 - **Durable field notes from a worktree → `tasks_note`**, never a copied
   working-memory file. If your cwd is a worktree, any `PLAN*.md` there is a
   read-only snapshot seeded by the bootstrap manifest (DESIGN §24) — edits to

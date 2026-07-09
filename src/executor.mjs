@@ -15,7 +15,7 @@ import { createRequire } from 'node:module';
 import path from 'node:path';
 import pty from 'node-pty';
 import {
-  logsDir, runtimeDir, runSocketPath, runSocketLink, repoTasksDir, runDir,
+  logsDir, runtimeDir, runSocketPath, runSocketLink, repoTasksDir, runDir, lanePortBase,
 } from './paths.mjs';
 import { appendEvent } from './events.mjs';
 import { resolveProvider, renderInvocation, parseCost } from './providers.mjs';
@@ -370,6 +370,9 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     // Only the local runner forwards the taskherd escape-hatch vars — host paths
     // are meaningless inside a container / on a remote host.
     taskherdEnv: { TASKHERD_REPO: path.resolve(repo), TASKHERD_LANE: lane.name },
+    // §25 rule 2: every step env gets the lane's deterministic port block so
+    // parallel lanes' test servers can pick disjoint ports by convention.
+    portBase: lanePortBase(lane.name),
   });
   for (const w of spawnSpec.warnings) console.error(w);
   const { file, args } = spawnSpec;
