@@ -10,7 +10,7 @@ import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
 import {
   repoTasksDir, laneFile, projectConfigFile, logsDir, descDir, runDir,
-  taskherdHome, runSocketLink,
+  taskherdHome, runSocketLink, notesDir, notesFile,
 } from './paths.mjs';
 import { loadProjectConfig, loadUserConfig, resolveConfig } from './config.mjs';
 import { registerProject } from './registry.mjs';
@@ -843,6 +843,22 @@ export async function ackLane(repo, name) {
   return { kind: 'failure', lane };
 }
 
+// Lane notes (DESIGN §24) — the durable write path for shared working memory.
+// Append-only: a worktree's copied PLAN*.md snapshot is never synced back, so
+// per-lane findings go to .tasks/notes/<lane>.md (in the MAIN repo, reached
+// via TASKHERD_REPO from any tree) and a human — or a designated serial lane —
+// integrates them into the shared plan. One entry per call, timestamped.
+export async function noteLane(repo, laneName, text) {
+  validateLaneName(laneName);
+  if (typeof text !== 'string' || !text.trim()) {
+    throw new LaneValidationError('taskherd: a lane note needs non-empty text');
+  }
+  await mkdir(notesDir(repo), { recursive: true });
+  const file = notesFile(repo, laneName);
+  await appendFile(file, `## ${new Date().toISOString()}\n\n${text.trim()}\n\n`);
+  return file;
+}
+
 // Lane names become file paths (`.tasks/<name>.json`) and branch names
 // (`taskherd/<name>`), and MCP clients pass them straight from an agent — a
 // separator or a leading dot must fail loudly, never escape .tasks/.
@@ -1151,6 +1167,9 @@ export async function initTasksDir(repo, { globalGitignore = true } = {}) {
       budget: null,
       timeout: '45m',
       maxTurns: null,
+      // Seed manifest for fresh lane worktrees (DESIGN §24), e.g.
+      // {"link": [".env"], "copy": ["PLAN*.md"], "generate": ["npm ci"]}.
+      bootstrap: null,
     };
     await writeFile(cfgFile, `${JSON.stringify(defaultConfig, null, 2)}\n`);
   }

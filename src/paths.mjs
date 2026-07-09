@@ -61,6 +61,17 @@ export function runDir(repo) {
   return path.join(repoTasksDir(repo), 'run');
 }
 
+// Lane notes (DESIGN §24): the durable write path for shared working memory
+// from a worktree — copied working-memory files are snapshots and never sync
+// back, so per-lane findings append here instead.
+export function notesDir(repo) {
+  return path.join(repoTasksDir(repo), 'notes');
+}
+
+export function notesFile(repo, laneName) {
+  return path.join(notesDir(repo), `${laneName}.md`);
+}
+
 function currentUid() {
   if (typeof process.getuid === 'function') return process.getuid();
   try {

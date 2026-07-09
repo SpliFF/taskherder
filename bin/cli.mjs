@@ -16,7 +16,7 @@ import {
   repoTasksDir, pausedFile, runSocketPath, profileDir, profileFile,
 } from '../src/paths.mjs';
 import {
-  initTasksDir, ackLane, addStep, forkLane,
+  initTasksDir, ackLane, addStep, forkLane, loadAllLanesResilient,
 } from '../src/tasks.mjs';
 import { tick } from '../src/scheduler.mjs';
 import { renderStatus, readHistory } from '../src/history.mjs';
@@ -24,7 +24,8 @@ import { loadProviders } from '../src/providers.mjs';
 import { loadRunners, graphicalEndpoint } from '../src/runners.mjs';
 import { listProfiles, loadProfile, isolationWarnings } from '../src/profiles.mjs';
 import { isGitRepo, gcWorktrees, laneDiff } from '../src/git.mjs';
-import { loadProjectConfig } from '../src/config.mjs';
+import { loadProjectConfig, loadUserConfig, resolveConfig } from '../src/config.mjs';
+import { parseBootstrap } from '../src/bootstrap.mjs';
 import { registerProject } from '../src/registry.mjs';
 import { createOutputRenderer } from '../src/render.mjs';
 import { listLaneLogs, readLaneLog, readLatestLaneLog } from '../src/logs.mjs';
@@ -96,7 +97,7 @@ const COMMAND_HELP = {
   cost: { summary: 'Show spend per lane', usage: 'taskherd cost [-C repo | <repo>]' },
   serve: { summary: 'Start the web console (HTTP + WebSocket)', usage: 'taskherd serve [-C repo | <repo>] [-p port] [--host <addr>] [--allow-shell] [--allow-gfx]' },
   install: { summary: 'Register the taskherd MCP server + link the /task skill', usage: 'taskherd install' },
-  doctor: { summary: 'Check providers, runners, profiles, integrations', usage: 'taskherd doctor' },
+  doctor: { summary: 'Check providers, runners, profiles, integrations', usage: 'taskherd doctor [-C repo | <repo>]' },
 };
 
 function version() {
@@ -780,7 +781,9 @@ async function cmdInstall() {
 }
 
 // taskherd doctor — check providers, profiles, MCP, node-pty (DESIGN §18).
-async function cmdDoctor() {
+async function cmdDoctor(argv = []) {
+  const { values, positionals } = parseRepoOnly(argv);
+  const { repo } = resolveRepo(values.repo, positionals, { laneless: true });
   let problems = 0;
   console.log('taskherd doctor');
 
@@ -891,6 +894,46 @@ async function cmdDoctor() {
     } catch {
       problems += 1;
       console.log('  ✗ web console deps missing (ws / @xterm/xterm) — run `npm install`; `taskherd serve` will not start');
+    }
+  }
+
+  // Project-level checks (only when a .tasks/ repo is in scope — doctor stays
+  // useful as a pure user-level check outside one).
+  if (existsSync(repoTasksDir(repo))) {
+    console.log(`project (${repo}):`);
+    const projectConfig = await loadProjectConfig(repo);
+    const userConfig = await loadUserConfig();
+    const gitRepo = await isGitRepo(repo);
+    const { lanes } = await loadAllLanesResilient(repo);
+    // §24: a lane that runs in a pool worktree without a seed manifest gets a
+    // tree with tracked files only — tests fail on missing .env/deps in ways
+    // the checkout can't explain. Advisory (·), not a problem: many repos
+    // genuinely need no seeding.
+    const worktreeLanes = lanes.filter((lane) => {
+      const cfg = resolveConfig(null, lane, projectConfig, userConfig);
+      const isolation = cfg.isolation ?? (gitRepo ? 'worktree' : 'none');
+      return isolation === 'worktree';
+    });
+    const unseeded = worktreeLanes.filter((lane) => {
+      const cfg = resolveConfig(null, lane, projectConfig, userConfig);
+      return cfg.bootstrap == null;
+    });
+    if (worktreeLanes.length === 0) {
+      console.log('  · no worktree lanes — bootstrap manifest not needed');
+    } else if (unseeded.length > 0) {
+      console.log(`  · ${unseeded.length} worktree lane(s) with no bootstrap manifest (${unseeded.map((l) => l.name).join(', ')}) — fresh worktrees get tracked files ONLY; if lanes need gitignored state (.env, installed deps, PLAN*.md), add "bootstrap": {"link"/"copy"/"generate"} to .tasks/config.json (DESIGN §24)`);
+    }
+    // A malformed manifest parks every worktree lane at seed time — surface it
+    // here instead of at 3am.
+    for (const [scope, cfg] of [['project', projectConfig], ['user', userConfig], ...lanes.map((l) => [`lane ${l.name}`, l])]) {
+      if (cfg.bootstrap == null) continue;
+      try {
+        parseBootstrap(cfg.bootstrap);
+        console.log(`  ✓ bootstrap manifest (${scope}) is well-formed`);
+      } catch (err) {
+        problems += 1;
+        console.log(`  ✗ bootstrap manifest (${scope}): ${err.message}`);
+      }
     }
   }
 

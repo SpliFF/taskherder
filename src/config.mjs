@@ -5,8 +5,13 @@ import { userConfigFile, projectConfigFile } from './paths.mjs';
 
 const INHERITED_KEYS = [
   'provider', 'profile', 'runner', 'isolation', 'land', 'base',
-  'model', 'budget', 'timeout', 'maxTurns',
+  'model', 'budget', 'timeout', 'maxTurns', 'bootstrap',
 ];
+
+// Object keys where a more specific level REPLACES the whole block instead of
+// merging into it: a bootstrap manifest (§24) is one coherent seeding recipe —
+// merging verbs from two levels would half-apply both.
+const NO_MERGE_KEYS = new Set(['bootstrap']);
 
 async function readJsonOrEmpty(file) {
   try {
@@ -33,7 +38,7 @@ export function resolveConfig(step, lane, projectConfig, userConfig) {
     const layers = [step?.[key], lane?.[key], projectConfig?.[key], userConfig?.[key]];
     const found = layers.find((v) => v !== undefined && v !== null);
     if (found === undefined) continue;
-    if (typeof found === 'object' && !Array.isArray(found)) {
+    if (typeof found === 'object' && !Array.isArray(found) && !NO_MERGE_KEYS.has(key)) {
       resolved[key] = Object.assign(
         {},
         userConfig?.[key],

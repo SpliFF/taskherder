@@ -8,6 +8,33 @@ changes.
 ## Unreleased
 
 ### Added
+- **Worktree bootstrap — the seed manifest (DESIGN §24).** A fresh lane
+  worktree checks out tracked files only, so the gitignored state real work
+  needs (`.env`, installed deps, `PLAN*.md` working memory) was missing and
+  tests failed in ways the checkout couldn't explain. A repo (or lane) can now
+  declare a **`bootstrap`** block in `.tasks/config.json` — `link` (symlink →
+  the main checkout: shared, live), `copy` (snapshot at seed time, `*`/`?`
+  globs in the final segment, reflink-cheap via APFS `cp -c` / `cp
+  --reflink=auto`, plain-copy fallback; diverges by design, never synced
+  back), `generate` (commands run serially in the fresh tree) — executed when
+  the pool worktree is created. Fail-closed: a malformed manifest or a failed
+  `generate` parks the lane as a setup error on the first failure (a
+  half-seeded tree finishes seeding on the retried fire, never runs silently);
+  missing `link`/`copy` sources are one loud warning each; `.tasks/` is never
+  seedable. After seeding (manifest or not), the **ignored-file advisory**
+  lists top-level gitignored entries the tree lacks in one actionable warning.
+  `taskherd doctor` gained `-C <repo>` and a project section flagging worktree
+  lanes with no manifest and validating a configured one.
+- **Lane notes — `tasks_note` + `.tasks/notes/<lane>.md` (DESIGN §24).** The
+  durable write path for shared working memory: a worktree's copied `PLAN*.md`
+  snapshot never syncs back, so per-lane findings append (timestamped,
+  append-only) to the main repo's `.tasks/notes/<lane>.md` via the new MCP
+  tool `tasks_note` (or as a plain file); a human — or a designated serial
+  lane — integrates notes into the shared plan. `status` surfaces a lane's
+  notes path when present; the `/task` skill now routes worktree field notes
+  through `tasks_note`.
+
+### Added
 - **`when.exit` probe — gate a step on a command's exit code (DESIGN §23
   Phase 2).** The rule tree gains its one impure leaf:
   `{"exit":{"run":"./scripts/ready.sh"}}` makes the scheduler run the probe on

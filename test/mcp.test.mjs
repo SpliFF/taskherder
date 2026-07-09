@@ -132,7 +132,7 @@ test('taskherd-mcp: §16 tool surface round-trip (no tasks_run)', async (t) => {
 
   const { tools } = await client.listTools();
   const names = tools.map((tool) => tool.name).sort();
-  assert.deepEqual(names, ['tasks_ack', 'tasks_add', 'tasks_block', 'tasks_fork', 'tasks_init', 'tasks_status']);
+  assert.deepEqual(names, ['tasks_ack', 'tasks_add', 'tasks_block', 'tasks_fork', 'tasks_init', 'tasks_note', 'tasks_status']);
   assert.ok(!names.includes('tasks_run'), 'deliberately no tasks_run — an agent must not spawn itself');
 
   // add: creates the lane + a recurring default.
@@ -157,6 +157,16 @@ test('taskherd-mcp: §16 tool surface round-trip (no tasks_run)', async (t) => {
   assert.equal(self.steps[0].type, 'manual', 'gate lands ahead of the pending step, not at the tail');
   assert.equal(self.steps[0].message, 'need a human decision');
   assert.equal(self.steps[1].run, 'echo pending', 'the pre-existing step is pushed back behind the gate');
+
+  // tasks_note (§24): durable field notes from a worktree land append-only in
+  // the MAIN repo's .tasks/notes/<lane>.md; lane defaults from TASKHERD_LANE.
+  const note = await client.callTool({ name: 'tasks_note', arguments: { text: 'auth test is flaky under parallel runs' } });
+  assert.match(note.content[0].text, /notes\/self\.md/);
+  const notes = await readFile(path.join(repo, '.tasks', 'notes', 'self.md'), 'utf8');
+  assert.match(notes, /auth test is flaky under parallel runs/);
+  assert.match(notes, /^## \d{4}-/m, 'timestamped entry header');
+  const badNote = await client.callTool({ name: 'tasks_note', arguments: { text: '   ' } });
+  assert.equal(badNote.isError, true, 'empty note text surfaces as a loud tool error');
 
   // tasks_add carries the cross-lane dependency fields end-to-end (§22): an agent
   // declares `id` on a prerequisite and `waitsFor` on the dependent step.

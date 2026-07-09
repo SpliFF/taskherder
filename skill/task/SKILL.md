@@ -42,6 +42,12 @@ Start with `tasks_status` to see the lane tree as it is now.
   cadence, or different risk profile) → `tasks_fork` a sibling lane off yours,
   seeded with an initial step or default. Do not fork what is really just your
   own next step.
+- **Durable field notes from a worktree → `tasks_note`**, never a copied
+  working-memory file. If your cwd is a worktree, any `PLAN*.md` there is a
+  read-only snapshot seeded by the bootstrap manifest (DESIGN §24) — edits to
+  it are **never synced back** and will be silently lost. `tasks_note` appends
+  to `.tasks/notes/<lane>.md` in the main repo; a human (or a designated
+  serial lane) integrates notes into the shared plan.
 - **Pick axes per task nature** when enqueuing (§17): architecture/design work
   → a strong model, `inplace` if it needs the live checkout; scoped mechanical
   work → a cheaper model, `worktree`; a different account → that `profile`; a
@@ -58,7 +64,8 @@ yourself; the next cron fire picks up what you enqueued.
 ## 3. Hand off
 
 End with the handoff block, in your final message and (if the project keeps
-one) the plan file:
+one) the plan file — via `tasks_note` when your cwd is a worktree, since a
+copied plan snapshot never syncs back:
 
 - **Landed:** what shipped this fire (commits on `taskherd/<lane>`).
 - **Tests:** suite result, before → after.

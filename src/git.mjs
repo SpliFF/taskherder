@@ -7,6 +7,9 @@ import { mkdir, readdir } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
 import { worktreeDir, wtRepoDir, laneFile } from './paths.mjs';
+import {
+  parseBootstrap, seedWorktree, ignoredAdvisory, markSeeding, clearSeeding, isSeedingPending,
+} from './bootstrap.mjs';
 
 const execFileAsync = promisify(execFile);
 
@@ -122,10 +125,25 @@ async function ensureBranch(repo, branch, base) {
 // forked from base. The pool: an existing valid worktree is reused across
 // fires; a registration whose directory was deleted by hand is pruned and the
 // worktree re-added. A directory that exists but isn't a worktree is a loud
-// error, never silently reused.
-export async function ensureWorktree(repo, laneName, base) {
+// error, never silently reused. A fresh tree is seeded from the bootstrap
+// manifest (§24) and gets the ignored-file advisory.
+export async function ensureWorktree(repo, laneName, base, { bootstrap = null } = {}) {
+  // Validate BEFORE any git op (fail-closed): a malformed manifest must park
+  // the lane on every fire — not create an unseeded pool tree that later
+  // fires would silently reuse.
+  const manifest = parseBootstrap(bootstrap);
   const dir = worktreeDir(repo, laneName);
-  if (existsSync(path.join(dir, '.git'))) return dir; // pool hit
+  if (existsSync(path.join(dir, '.git'))) {
+    // Pool hit. Seeding belongs to creation (§24 rule 2), but a tree whose
+    // creation-time seeding failed mid-way (a parked `generate`) must finish
+    // before a step runs there — never run half-seeded silently (§24 rule 1).
+    if (manifest && (await isSeedingPending(dir))) {
+      await seedWorktree(repo, dir, manifest);
+      await clearSeeding(dir);
+      await ignoredAdvisory(repo, dir);
+    }
+    return dir;
+  }
   if (existsSync(dir)) {
     throw new Error(
       `taskherd: ${dir} exists but is not a git worktree — remove it and re-run`,
@@ -135,6 +153,12 @@ export async function ensureWorktree(repo, laneName, base) {
   await git(repo, 'worktree', 'prune');
   await mkdir(path.dirname(dir), { recursive: true });
   await git(repo, 'worktree', 'add', dir, laneBranch(laneName));
+  if (manifest) {
+    await markSeeding(dir); // cleared only after the whole manifest applied
+    await seedWorktree(repo, dir, manifest);
+    await clearSeeding(dir);
+  }
+  await ignoredAdvisory(repo, dir);
   return dir;
 }
 

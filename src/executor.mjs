@@ -203,7 +203,10 @@ async function resolveWorkdir(repo, lane, resolvedConfig) {
   }
   const base = resolvedConfig.base || await defaultBase(repo);
   if (isolation === 'worktree') {
-    return { isolation, workdir: await ensureWorktree(repo, lane.name, base) };
+    // The bootstrap manifest (§24) rides the same §5 inheritance as the axes —
+    // a fresh pool worktree is seeded before the step's pty ever spawns, so a
+    // failed `generate` parks the lane as a setup error.
+    return { isolation, workdir: await ensureWorktree(repo, lane.name, base, { bootstrap: resolvedConfig.bootstrap }) };
   }
   if (isolation === 'inplace') {
     await ensureInplaceBranch(repo, lane.name, base);

@@ -1,7 +1,8 @@
 // history.jsonl audit trail + the `status` renderer (DESIGN.md §5, §13).
 import { appendFile, readFile } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
-import { historyFile, runSocketLink } from './paths.mjs';
+import path from 'node:path';
+import { historyFile, runSocketLink, notesFile } from './paths.mjs';
 import { loadAllLanesResilient, computeWaiting, describeWhen } from './tasks.mjs';
 
 export async function appendHistory(repo, record) {
@@ -106,6 +107,10 @@ export async function statusData(repo) {
       })),
       last: last ? { result: lastResultLabel(last), ts: last.ts } : null,
       spent: spentByLane[lane.name] || 0,
+      // Lane notes (§24): surfaced when present so the durable field notes a
+      // worktree lane appended are one glance away, not tribal knowledge.
+      notes: existsSync(notesFile(repo, lane.name))
+        ? path.relative(path.resolve(repo), notesFile(repo, lane.name)) : null,
     };
   });
   return { lanes: out, unloadable, totalSpent };
@@ -123,6 +128,7 @@ export async function renderStatus(repo) {
     lines.push(`${lane.name}  [${lane.cursor}/${lane.steps.length}]  ${lane.status || 'idle'}  last: ${lane.last ? lane.last.result : 'never run'}${spent}`);
     if (lane.gate) lines.push(`  gate: ${lane.gate}`);
     if (lane.waiting) lines.push(`  waiting on: ${lane.waiting.join(', ')}`);
+    if (lane.notes) lines.push(`  notes: ${lane.notes}`);
   }
   for (const bad of unloadable) {
     lines.push(`${bad.name}  [unloadable]  ${bad.error}`);

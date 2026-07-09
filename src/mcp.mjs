@@ -12,7 +12,7 @@ import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { ListToolsRequestSchema, CallToolRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 import { repoTasksDir } from './paths.mjs';
 import {
-  initTasksDir, addStep, forkLane, ackLane,
+  initTasksDir, addStep, forkLane, ackLane, noteLane,
 } from './tasks.mjs';
 import { renderStatus } from './history.mjs';
 
@@ -172,6 +172,18 @@ const TOOLS = [
     },
   },
   {
+    name: 'tasks_note',
+    description: 'Append durable field notes to this lane\'s notes file (.tasks/notes/<lane>.md in the MAIN repo — append-only, timestamped). Use this for findings that must outlive the run when your cwd is a worktree: copied working-memory files (a PLAN.md snapshot seeded by the bootstrap manifest, DESIGN §24) are read-only snapshots — edits there are NEVER synced back and will be lost. A human (or a designated serial lane) integrates notes into the shared plan. Defaults to the current lane (TASKHERD_LANE).',
+    inputSchema: {
+      type: 'object',
+      properties: {
+        lane: { type: 'string', description: 'Lane the note belongs to (default: the lane this step runs in, from TASKHERD_LANE).' },
+        text: { type: 'string', description: 'The note (markdown). Appended under a timestamp header.' },
+      },
+      required: ['text'],
+    },
+  },
+  {
     name: 'tasks_ack',
     description: 'Clear the gate at a lane\'s cursor: approve a land gate (merges the lane branch), pass a manual gate, or reset a parked failure for retry. Only use when the human decision the gate represents has actually been made.',
     inputSchema: {
@@ -268,6 +280,15 @@ export function createTaskherdServer({ cwd = process.cwd(), env = process.env } 
       const seeded = lane.default ? 'with a recurring default'
         : (lane.steps.length ? `with ${lane.steps.length} initial step(s)` : 'empty');
       return text(`forked lane '${name}' from '${from}' (${seeded})`);
+    },
+    async tasks_note(args) {
+      const repo = await requireRepo();
+      const lane = args.lane || env.TASKHERD_LANE;
+      if (!lane) {
+        throw new Error('taskherd: tasks_note needs a lane (none given and TASKHERD_LANE is not set)');
+      }
+      const file = await noteLane(repo, lane, args.text);
+      return text(`noted → ${path.relative(repo, file)} (append-only; a human/serial lane integrates it into the shared plan)`);
     },
     async tasks_ack(args) {
       const repo = await requireRepo();
