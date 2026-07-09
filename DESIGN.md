@@ -100,10 +100,12 @@ CLI-only era, so the web console is a pure add-on later.
   config.json            project defaults (provider, profile, runner, isolation, land, budget)
   <lane>.json            one lane per file (main.json, bar-ui.json, …)
   desc/*.md              prose for manual gates / complex-task prompts (file-as-prompt)
+  notes/<lane>.md        per-lane field notes (`tasks_note` — §24)
   logs/<lane>-<ts>.log   per-run transcript (pty capture)
   events.jsonl           append-only event stream (start/output/gate/exit/cost)
   history.jsonl          one line per completed run (audit: exit, cost, tokens, commit)
   run/<id>.sock          control socket of a live step (removed on exit)
+  run/<lane>.json        live-run manifest: pid, isolation, runner, mutex tags (§25)
   NEEDS-ATTENTION.md      human-readable list of open manual gates
   PAUSED                  presence = all lanes halted (kill-switch)
   .lock                  per-repo run mutex (atomic mkdir)
@@ -199,6 +201,8 @@ failed | blocked`.
 ## 6. Scheduler
 
 Fired per tick by cron/launchd (or the serve process). **One step per fire.**
+*(With parallel lanes enabled, a fire may **admit alongside** live isolated
+runs instead of skipping — §25; the one-step-per-fire grain is unchanged.)*
 
 1. **Mutex** — atomic `mkdir .tasks/.lock`; a second fire while one runs logs a
    skip and exits (fires are minutes apart; stale lock cleared after `STALE_MIN`).
@@ -232,7 +236,8 @@ Isolation is **per-lane** (default from `config.json`):
 - **`worktree`** *(default for code lanes)* — a git worktree at
   `~/.taskherd/wt/<repo-id>/<lane>/` on branch `taskherd/<lane>`, forked from
   `base` (default = the repo's default-branch tip). Full isolation; the user's
-  checkout is never touched; unlocks true concurrency later.
+  checkout is never touched; unlocks true concurrency (§25). Seeded with
+  gitignored state per the bootstrap manifest (§24).
 - **`inplace`** — runs in the main checkout on `taskherd/<lane>`. For lanes that
   need the **live/shared runtime** (a running server, a built binary, fixed ports,
   a shared DB — e.g. springrts `/work`). Serialized by the mutex.
@@ -440,7 +445,7 @@ GUI tasks — most naturally inside the docker runner.
 
 Exposes the mutation/inspection surface to any Claude session (and the `/task`
 skill): **`tasks_init` · `tasks_status` · `tasks_add` · `tasks_block` (gate) ·
-`tasks_fork` · `tasks_ack`**. Deliberately **no `tasks_run`** — scheduling is
+`tasks_fork` · `tasks_ack` · `tasks_note` (§24)**. Deliberately **no `tasks_run`** — scheduling is
 cron/serve's job; an agent must not spawn itself. Registered in the **user-global**
 MCP config; targets the repo at its launch cwd.
 
@@ -458,6 +463,10 @@ otherwise it just emits the handoff block and degrades gracefully):
   an external action) → `tasks_block` a **manual gate** → *this* lane pauses,
   siblings continue.
 - **Independent workstreams** discovered → `tasks_fork` a sibling lane.
+- **Parallel-safe lane construction (§25)** — fork only independent, disjoint
+  file scopes into isolated lanes; declare shared resources as `mutex` tags;
+  overlapping scopes stay in one lane (serial by construction). Durable field
+  notes go to `tasks_note`, never a copied working-memory file (§24).
 - **Per-task allocation** — choose `provider` / `model` / `profile` / `runner` /
   `isolation` by task nature (architecture → opus/inplace; scoped mechanical →
   sonnet/worktree; a remote build → an ssh runner; work-repo → the `work` profile).
@@ -621,3 +630,148 @@ auto-clear** discipline — distinct from the one hard, ack-requiring `manual` g
 
 **Deferred to a later phase (loudly rejected until then):** the `file`/`http`/
 `env` leaves (`http` is an SSRF surface). See `PLAN-rules.md`.
+
+---
+
+## 24. Worktree bootstrap — the seed manifest
+
+A fresh worktree checks out **tracked files only** — the gitignored state real
+work needs (`.env`, dependency dirs, working-memory files like `PLAN.md`) is
+absent, so tests and agents fail in ways the checkout can't explain. The **seed
+manifest** declares what a lane's tree needs; taskherd executes it when it
+creates a pool worktree (the container phase's per-lane clones, §25, seed the
+same way).
+
+```jsonc
+// .tasks/config.json (project level; lane-level `bootstrap` overrides per §5)
+"bootstrap": {
+  "link":     [".env", "certs/"],   // symlink → the main checkout: shared, live, read-mostly
+  "copy":     ["PLAN*.md"],         // snapshot at seed time: divergeable, never synced back
+  "generate": ["npm ci"]            // commands run once per fresh tree, cwd = the tree
+}
+```
+
+**The verb encodes the sharing decision:**
+
+- **`link`** — a symlink to the main checkout, for read-mostly config that must
+  stay in sync (`.env`). A lane that *writes* through a link writes the shared
+  file — that is the point, and the risk; use `copy` when divergence is fine.
+- **`copy`** — a snapshot (globs allowed), taken with copy-on-write reflinks
+  where the filesystem supports them (APFS `clonefile` via `cp -c`,
+  `cp --reflink=auto` on XFS/btrfs) so even a dependency dir is cheap. A copy
+  **diverges by design** and is never synced back — durable lane output belongs
+  in lane notes (below), never in a copied file.
+- **`generate`** — commands run in the fresh tree (dependency installs with
+  native addons, codegen). Run serially, in order, after `link`/`copy`.
+
+**Rules.**
+
+1. **Fail loud (§1).** A `link`/`copy` source missing from the main checkout ⇒
+   one loud warning (the file may legitimately not exist on this machine). A
+   failed `generate` command ⇒ a **setup error**: the step parks on first
+   failure (the M2 discipline) — never a silent half-seeded tree.
+2. **Seed on creation.** The manifest runs when the pool worktree is created;
+   `gc` + recreate re-seeds. (Hash-keyed re-generation — "re-run `npm ci` when
+   `package-lock.json` changes" — is deferred.)
+3. **`.tasks/` is never seeded.** The main repo's `.tasks/` is the single
+   source of coordination truth, reached from any tree via `TASKHERD_REPO`
+   (§16). A worktree carrying its own `.tasks/` would fork that state.
+4. **The ignored-file advisory.** After seeding, top-level gitignored entries
+   present in the main checkout but absent from the tree are listed in one loud
+   warning pointing at the manifest — a missing `.env` becomes an actionable
+   message instead of a mystery test failure. Advisory only; never blocks.
+
+**Lane notes — the write path for shared working memory.** Gitignored
+working-memory files (`PLAN.md`-style) are a semantic serialization point:
+parallel lanes editing one shared plan clobber each other in ways git never
+sees, and a worktree's copied snapshot silently loses its edits. So copies are
+read-only by convention, and durable per-lane findings go to
+**`.tasks/notes/<lane>.md`** via the MCP tool **`tasks_note`** (append-only;
+also writable as a plain file). A human — or a designated serial lane —
+integrates notes into the shared plan: the same discipline git applies to
+branches. Parallel work, one merge point.
+
+---
+
+## 25. Parallel lanes — admission control
+
+**The lane is the unit of parallelism.** Steps within a lane stay strictly
+serial (the cursor); independent **lanes** may run concurrently when that is
+provably safe. Off by default; when disabled (or `max ≤ 1`) the scheduler
+behaves exactly as §6 describes today.
+
+```jsonc
+// .tasks/config.json
+"parallel": { "max": 2 }        // absent ⇒ fully serial (today's behavior)
+
+// lane file — optional
+"parallel": false,              // this lane always takes the serial slot
+"mutex": ["live-server"]        // lanes sharing a tag never run concurrently
+```
+
+**The master gate is isolation (§7).** Only a lane whose steps run isolated —
+`worktree` isolation, or a `docker:`/`ssh:` runner (off-host) — is a parallel
+candidate. `inplace`/`none` lanes are **exclusive**: they start only when
+nothing else is running, and nothing is admitted while one runs (they share the
+live checkout, ports, and databases — exactly what isolation can't prove
+disjoint).
+
+**Admission — the §6 mutex changes role.** From a whole-run lock to a brief
+**admission lock**:
+
+1. Acquire `.tasks/.lock`; read the **running set** from per-run manifests
+   (`run/<lane>.json`, written at spawn: pid · isolation · runner · `mutex`
+   tags), staleness-checked like the lock itself (mtime heartbeat + pid).
+2. Compute runnable lanes exactly as today — gates, budgets, `waitsFor`/`when`
+   (§23) first. **Admission never overrides a gate.**
+3. In fair-pick order, admit the first candidate that is isolated, shares no
+   `mutex` tag with the running set, respects `parallel:false` and the
+   exclusivity rule, and fits under `max`.
+4. Write the admitted manifest, **release the lock**, then supervise the step
+   to completion (the one-shot process owns its pty, §13).
+
+**Each fire still runs one step** — §6's grain is unchanged. What changes is
+that a fire may admit *alongside* live runs instead of skipping; concurrency
+arises from **overlapping one-shot fires** (cron cadence paces the ramp-up;
+`serve` may tick faster).
+
+**Rules.**
+
+1. **Fail closed to serial.** If the running set can't be read, or a manifest
+   is stale or ambiguous, **serialize** (skip admission this fire), loudly —
+   never silently run concurrently (§1/§12).
+2. **Resource conflicts isolation can't see are declared, not inferred.** Two
+   worktree lanes can still fight over a port, one external DB, one
+   rate-limited account. `mutex` tags are the escape hatch; undeclared shared
+   resources are the lane author's responsibility — a documented contract
+   (like §23's probe contract), not enforcement. The executor exports a
+   deterministic per-lane **`TASKHERD_PORT_BASE`** so well-behaved test
+   servers can pick disjoint ports by convention.
+3. **Held-back is a soft wait.** A runnable lane blocked by admission shows in
+   `status` with its blocker ("serialized: waiting on build-lane") — like a
+   §23 window wait it never lands in NEEDS-ATTENTION.
+4. **The overlap advisory.** Land conflicts still surface at land time (§7),
+   but `status`/console warn when two live or runnable isolated lanes' branch
+   diffs touch the same paths (`laneDiff` file lists) — steering scopes apart
+   *before* the work is done. Advisory only; never blocks.
+5. **Budgets multiply.** N parallel ai lanes burn caps N× faster. Per-lane
+   budgets (§10) still enforce; a per-profile concurrency cap is deferred with
+   the container phase.
+6. **The `/task` skill navigates this at fork time (§17).** `tasks_status`
+   exposes each lane's isolation / runner / `mutex` tags and live state so a
+   forking agent can decide. The skill's contract: fork **independent,
+   disjoint file scopes** into isolated lanes; declare shared resources as
+   `mutex` tags; scopes that overlap stay in **one** lane — serial by
+   construction, no analysis needed.
+
+**Prerequisite:** §24 — parallel worktree lanes are only useful once their
+trees can actually run the project.
+
+**Deferred (loudly rejected until designed):** the full per-step `parallel`
+rule tree (PLAN-parallel.md's original shape — the lane-level fields above
+cover the decided scope); admit-N-per-fire; per-profile/per-host concurrency
+caps; **container lanes** — a long-lived container per lane plus a `clone`
+isolation value (a linked worktree's `.git` is a *file* holding a
+host-absolute `gitdir:` path, so worktrees do not survive bind-mounting into
+containers; the per-lane clone is the primitive that fixes it) — and the
+**mcp-in-runner shim** (§16 tools inside a container) container lanes require.
