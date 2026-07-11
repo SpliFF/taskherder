@@ -28,7 +28,7 @@ import {
 } from './paths.mjs';
 import { loadProjects } from './registry.mjs';
 import { statusData } from './history.mjs';
-import { laneDiff } from './git.mjs';
+import { laneDiff, syncCloneBranch } from './git.mjs';
 import { listLaneLogs, readLaneLog, readLatestLaneLog } from './logs.mjs';
 import {
   resolveRunner, shellInvocation, graphicalEndpoint, loadRunners,
@@ -725,6 +725,7 @@ export async function createConsoleServer({
         const lane = url.searchParams.get('lane');
         if (!lane) throw new LaneValidationError("missing 'lane'");
         validateLaneName(lane); // no traversal into arbitrary .json / worktree paths
+        await syncCloneBranch(repo, lane); // §26: pull a clone lane's commits into main first (no-op otherwise)
         sendJson(res, 200, await laneDiff(repo, lane, { base: url.searchParams.get('base') || null }));
         return;
       }

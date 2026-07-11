@@ -6,7 +6,7 @@
 // back), `generate` (commands run serially in the fresh tree). Deliberately
 // imports nothing from tasks.mjs/git.mjs — git.mjs calls into here.
 import {
-  mkdir, readdir, readFile, writeFile, rm, symlink, cp,
+  mkdir, readdir, readFile, writeFile, rm, symlink, cp, stat,
 } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
@@ -181,19 +181,23 @@ export async function seedWorktree(repo, wt, manifest, { log = console.error, cp
   return { linked, copied, generated, warnings };
 }
 
-// Seeding-state marker. It lives in the worktree's git ADMIN dir (a linked
-// worktree's `.git` is a file pointing there), NOT in the tree itself — an
-// untracked marker file would dirty `git status` (breaking isClean/gc) and
-// survive into commits. The admin dir is cleaned up by `git worktree
-// remove/prune`, so gc + recreate re-seeds for free (§24 rule 2).
-async function worktreeAdminDir(wt) {
-  const gitFile = path.join(wt, '.git');
-  const text = await readFile(gitFile, 'utf8');
+// Seeding-state marker. It lives in the tree's git ADMIN dir, NOT in the tree
+// itself — an untracked marker file would dirty `git status` (breaking
+// isClean/gc) and survive into commits. For a linked worktree (§24) `.git` is a
+// file pointing at the admin dir under the main repo; for a `clone` (§26) `.git`
+// IS a real directory. Either way the admin dir is cleaned up when the tree is
+// removed (`git worktree remove/prune`, or gc's `rm -rf` for a clone), so gc +
+// recreate re-seeds for free (§24 rule 2 / §26).
+async function treeAdminDir(tree) {
+  const gitPath = path.join(tree, '.git');
+  const st = await stat(gitPath);
+  if (st.isDirectory()) return gitPath; // a clone — the real .git directory
+  const text = await readFile(gitPath, 'utf8');
   const m = /^gitdir:\s*(.+?)\s*$/m.exec(text);
   if (!m) {
-    throw new Error(`taskherd: ${gitFile} is not a linked-worktree pointer — cannot track seeding state`);
+    throw new Error(`taskherd: ${gitPath} is not a linked-worktree pointer or a git directory — cannot track seeding state`);
   }
-  return path.resolve(wt, m[1]);
+  return path.resolve(tree, m[1]);
 }
 
 function seedingMarker(adminDir) {
@@ -201,11 +205,11 @@ function seedingMarker(adminDir) {
 }
 
 export async function markSeeding(wt) {
-  await writeFile(seedingMarker(await worktreeAdminDir(wt)), `${new Date().toISOString()}\n`);
+  await writeFile(seedingMarker(await treeAdminDir(wt)), `${new Date().toISOString()}\n`);
 }
 
 export async function clearSeeding(wt) {
-  await rm(seedingMarker(await worktreeAdminDir(wt)), { force: true });
+  await rm(seedingMarker(await treeAdminDir(wt)), { force: true });
 }
 
 // True when a creation-time seeding started but never completed (a failed
@@ -214,7 +218,7 @@ export async function clearSeeding(wt) {
 // rule 1). Absent marker = seeded or pre-manifest legacy tree: not re-seeded
 // (seeding belongs to creation; a changed manifest applies on gc + recreate).
 export async function isSeedingPending(wt) {
-  return existsSync(seedingMarker(await worktreeAdminDir(wt)));
+  return existsSync(seedingMarker(await treeAdminDir(wt)));
 }
 
 // §24 rule 4 — the ignored-file advisory: after seeding, top-level gitignored

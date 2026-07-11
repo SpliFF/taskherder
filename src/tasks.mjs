@@ -16,8 +16,9 @@ import { loadProjectConfig, loadUserConfig, resolveConfig } from './config.mjs';
 import { registerProject } from './registry.mjs';
 import {
   isGitRepo, laneBranch, branchExists, branchBase, defaultBase, aheadCount,
-  landMerge, pushAndOpenPr,
+  landMerge, pushAndOpenPr, syncCloneBranch,
 } from './git.mjs';
+import { LIFECYCLES, MCP_TRANSPORTS } from './containers.mjs';
 import { appendEvent } from './events.mjs';
 
 const execFileAsync = promisify(execFile);
@@ -744,7 +745,12 @@ export async function maybeLand(repo, lane) {
     const fallback = defaultFallback(projectConfig, userConfig);
     const onEmpty = lane.onEmpty ?? fallback.onEmpty ?? 'idle';
     if (onEmpty === 'default' && (lane.default ?? fallback.default)) return null;
-    if (!(await isGitRepo(repo)) || !(await branchExists(repo, branch))) return null;
+    if (!(await isGitRepo(repo))) return null;
+    // For a clone lane (§26) the branch's commits live in the clone's own object
+    // store — fetch them into the main repo before the ahead/branch checks read
+    // it. Tolerant no-op for worktree/inplace lanes (no clone dir).
+    await syncCloneBranch(repo, lane.name);
+    if (!(await branchExists(repo, branch))) return null;
     const cfg = resolveConfig(null, lane, projectConfig, userConfig);
     const land = cfg.land || 'manual-gate';
     if (land === 'leave') return null;
@@ -824,6 +830,9 @@ export async function ackLane(repo, name) {
     const land = step.land?.branch ? step.land : null;
     let merged = null;
     if (land) {
+      // A clone lane's freshest commits may have arrived since the gate was
+      // created — re-sync before merging (tolerant no-op for non-clone lanes).
+      await syncCloneBranch(repo, name);
       merged = await landMerge(repo, land.branch, land.base); // throws on conflict; gate stays
       await appendEvent(repo, {
         event: 'land.merged', lane: name, branch: land.branch, base: land.base, commit: merged,
@@ -994,6 +1003,21 @@ function applyLaneOpts(lane, laneOpts = {}) {
     else throw new LaneValidationError(`taskherd: lane \`parallel\` must be true or false, got ${JSON.stringify(p)} (DESIGN §25)`);
   }
   if (laneOpts.mutex != null) lane.mutex = normalizeMutex(laneOpts.mutex);
+  // Container-lane attributes (DESIGN §26): validate the VALUE loudly at write
+  // time (fail-closed like mutex); the coherence/gating matrix (worktree+image,
+  // persistent gated, etc.) is enforced at run time by the executor.
+  if (laneOpts.lifecycle != null) {
+    if (!LIFECYCLES.includes(laneOpts.lifecycle)) {
+      throw new LaneValidationError(`taskherd: unknown lifecycle ${JSON.stringify(laneOpts.lifecycle)} (expected ${LIFECYCLES.join(' | ')}) (DESIGN §26)`);
+    }
+    lane.lifecycle = laneOpts.lifecycle;
+  }
+  if (laneOpts.mcpTransport != null) {
+    if (!MCP_TRANSPORTS.includes(laneOpts.mcpTransport)) {
+      throw new LaneValidationError(`taskherd: unknown mcpTransport ${JSON.stringify(laneOpts.mcpTransport)} (expected ${MCP_TRANSPORTS.join(' | ')}) (DESIGN §26)`);
+    }
+    lane.mcpTransport = laneOpts.mcpTransport;
+  }
 }
 
 // Resolves where a newly-added step lands in lane.steps (DESIGN §15 "reorder,

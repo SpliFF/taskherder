@@ -60,7 +60,21 @@ Start with `tasks_status` to see the lane tree as it is now.
   → a strong model, `inplace` if it needs the live checkout; scoped mechanical
   work → a cheaper model, `worktree`; a different account → that `profile`; a
   remote/container build → that `runner`. Omit anything the lane/project
-  default already gets right.
+  default already gets right. **Allocating for a sub-task? Call `tasks_options`
+  first** (DESIGN §26): the static schema can't know what *this box* offers, but
+  the catalog reports the real runners, resolved defaults, and which risky
+  values are operator-gated here — allocate from those, not guesses.
+- **Container lanes** (DESIGN §26): a lane that must run its steps *inside a
+  container that can do git* uses **`isolation: clone` + a docker image runner**
+  (a plain `worktree` cannot do git in a container — its `.git` is a host path).
+  `lifecycle` defaults to **`ephemeral`** (a fresh `docker run --rm` per fire —
+  the safe default); **prefer `persistent`** for a stable, single-account,
+  install-heavy lane once it ships (it keeps `node_modules`/caches warm between
+  fires) — but it is **operator-gated and lands in M11b**, so `tasks_options`
+  will show whether it's permitted here, and selecting it before then parks the
+  lane. `mcpTransport: mount` (default) is what lets an in-container agent
+  finalize through `tasks_*`; it needs node in the image (else it degrades to a
+  loud stand-in). Land/diff work exactly as for a worktree lane.
 - **Keep the plan and the lane tree consistent.** The lane tree is the
   *executable projection* of the plan's "Next up / Open threads": a thread you
   gated should be marked as gated in the plan file, and vice versa — never

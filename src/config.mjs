@@ -6,6 +6,8 @@ import { userConfigFile, projectConfigFile } from './paths.mjs';
 const INHERITED_KEYS = [
   'provider', 'profile', 'runner', 'isolation', 'land', 'base',
   'model', 'budget', 'timeout', 'maxTurns', 'bootstrap',
+  // Container-lane attributes (DESIGN §26) — scalars, normal merge.
+  'lifecycle', 'mcpTransport',
 ];
 
 // Object keys where a more specific level REPLACES the whole block instead of

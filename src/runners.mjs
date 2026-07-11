@@ -130,18 +130,29 @@ function renderTemplate(str, vars) {
 // `portBase` (§25 rule 2) is the lane's deterministic TASKHERD_PORT_BASE — it
 // crosses EVERY runner kind (unlike taskherdEnv's host paths, a port number is
 // meaningful anywhere): local/docker via env, ssh inlined on the remote command.
+// `tasksMount`/`pkgMount` (DESIGN §26 two-mount seam): extra bind mounts for a
+// container lane whose in-container taskherd-mcp reaches the herd over a mounted
+// `.tasks/`. Each is `{ hostPath, containerPath }`; pkgMount is read-only (this
+// package's own dir, so the image only needs node). `containerEnvInline` is a
+// map of `-e KEY=VALUE` entries whose VALUES are in-CONTAINER paths / config
+// (TASKHERD_REPO=/taskherd, git safe.directory) — never secrets, which still
+// cross by name only. `mcpMounts` true silences the §11/§26 ai-in-runner
+// stand-in (the tasks_* tools ARE reachable via the mount).
 export function wrapForRunner(runner, {
   file, args, extraEnv = {}, cwd, worktree, repo, laneName, isAi = false, taskherdEnv = {}, tty = true,
-  portBase = null,
+  portBase = null, tasksMount = null, pkgMount = null, containerEnvInline = {}, mcpMounts = false,
 } = {}) {
   const warnings = [];
   const extraKeys = Object.keys(extraEnv);
   const portEnv = portBase != null ? { TASKHERD_PORT_BASE: String(portBase) } : {};
+  const inlineKeys = Object.keys(containerEnvInline);
 
   // The §11 mcp-in-runner gap: a scheduled ai step under a non-local runner can't
   // reach the host-registered taskherd-mcp (host node + bin/mcp.mjs aren't in the
-  // container/remote), so its tasks_* finalization tools (§16/§17) are absent.
-  if (isAi && runner.kind !== 'local') {
+  // container/remote), so its tasks_* finalization tools (§16/§17) are absent —
+  // UNLESS the §26 mount seam is in force (mcpMounts), which bind-mounts .tasks/
+  // and an in-container taskherd-mcp, closing exactly this gap.
+  if (isAi && runner.kind !== 'local' && !mcpMounts) {
     warnings.push(
       `FIDELITY-STANDIN: ai step on runner '${runner.name || runner.kind}' cannot reach taskherd-mcp `
       + '(host node/bin/mcp.mjs absent in the runner env) — the tasks_* finalization tools are '
@@ -185,8 +196,15 @@ export function wrapForRunner(runner, {
         ? runner.mounts
         : (worktree ? [`{worktree}:${runner.workdir || '/work'}`] : []);
       for (const m of mounts) dargs.push('-v', renderTemplate(m, { worktree, repo, lane: laneName }));
+      // §26 two-mount seam: the herd's .tasks/ (rw) + this package (ro) so an
+      // in-container taskherd-mcp writes coordination state back to the host.
+      if (tasksMount) dargs.push('-v', `${tasksMount.hostPath}:${tasksMount.containerPath}`);
+      if (pkgMount) dargs.push('-v', `${pkgMount.hostPath}:${pkgMount.containerPath}:ro`);
       if (runner.workdir) dargs.push('-w', runner.workdir);
       for (const k of envNames) dargs.push('-e', k);
+      // In-container paths/config by VALUE (not secrets): TASKHERD_REPO=/taskherd,
+      // git safe.directory for the mounted clone, etc.
+      for (const k of inlineKeys) dargs.push('-e', `${k}=${containerEnvInline[k]}`);
       if (runner.dockerArgs) dargs.push(...runner.dockerArgs);
       dargs.push(runner.image);
     } else {

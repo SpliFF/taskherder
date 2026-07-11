@@ -132,8 +132,19 @@ test('taskherd-mcp: §16 tool surface round-trip (no tasks_run)', async (t) => {
 
   const { tools } = await client.listTools();
   const names = tools.map((tool) => tool.name).sort();
-  assert.deepEqual(names, ['tasks_ack', 'tasks_add', 'tasks_block', 'tasks_fork', 'tasks_init', 'tasks_note', 'tasks_status']);
+  assert.deepEqual(names, ['tasks_ack', 'tasks_add', 'tasks_block', 'tasks_fork', 'tasks_init', 'tasks_note', 'tasks_options', 'tasks_status']);
   assert.ok(!names.includes('tasks_run'), 'deliberately no tasks_run — an agent must not spawn itself');
+
+  // tasks_options (§26): the environment-specific allocation catalog.
+  const opts = await client.callTool({ name: 'tasks_options', arguments: {} });
+  const cat = JSON.parse(opts.content[0].text);
+  assert.deepEqual(cat.isolation.values, ['worktree', 'inplace', 'none', 'clone']);
+  assert.equal(cat.lifecycle.default, 'ephemeral');
+  assert.equal(cat.mcpTransport.default, 'mount');
+  assert.equal(cat.lifecycle.gated.persistent.allowed, false, 'persistent is gated by default');
+  assert.ok('http' in cat.mcpTransport.gated && 'socket' in cat.mcpTransport.gated, 'network transports reported as gated/deferred');
+  assert.equal(cat.parallel.max, 1);
+  assert.deepEqual(cat.runner.configured, [], 'no runners.json on this box → empty configured list');
 
   // add: creates the lane + a recurring default.
   const add = await client.callTool({

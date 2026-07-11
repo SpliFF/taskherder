@@ -23,7 +23,9 @@ import { renderStatus, readHistory } from '../src/history.mjs';
 import { loadProviders } from '../src/providers.mjs';
 import { loadRunners, graphicalEndpoint } from '../src/runners.mjs';
 import { listProfiles, loadProfile, isolationWarnings } from '../src/profiles.mjs';
-import { isGitRepo, gcWorktrees, laneDiff } from '../src/git.mjs';
+import {
+  isGitRepo, gcWorktrees, laneDiff, syncCloneBranch,
+} from '../src/git.mjs';
 import { loadProjectConfig, loadUserConfig, resolveConfig } from '../src/config.mjs';
 import { parseBootstrap } from '../src/bootstrap.mjs';
 import { registerProject } from '../src/registry.mjs';
@@ -82,7 +84,7 @@ const COMMAND_HELP = {
   init: { summary: 'Initialize .tasks/ in a repo (register it, scaffold config)', usage: 'taskherd init [-C repo | <repo>] [--no-global-gitignore]' },
   run: { summary: 'Fire the scheduler once — run ONE step (--lane targets one lane)', usage: 'taskherd run [-C repo | <repo>] [--lane <name>] [--force]' },
   status: { summary: 'Show lanes, last result, open gates, and cost', usage: 'taskherd status [-C repo | <repo>]' },
-  add: { summary: 'Queue a step onto a lane (command | ai | manual)', usage: 'taskherd add [-C repo] <lane> [--type command|ai|manual] [--at next|end|<index>] [--id <label>] [--waits-for <lane:id>]... [--after HH:MM] [--before HH:MM] [--days Mon-Fri] [--from YYYY-MM-DD] [--until YYYY-MM-DD] [--tz local|utc] [--when \'<json rule>\'] [--isolation worktree|inplace|none] [--land manual-gate|pr|leave] [--base <branch>] [--no-parallel] [--mutex <tag>]... [opts] "<task>"' },
+  add: { summary: 'Queue a step onto a lane (command | ai | manual)', usage: 'taskherd add [-C repo] <lane> [--type command|ai|manual] [--at next|end|<index>] [--id <label>] [--waits-for <lane:id>]... [--after HH:MM] [--before HH:MM] [--days Mon-Fri] [--from YYYY-MM-DD] [--until YYYY-MM-DD] [--tz local|utc] [--when \'<json rule>\'] [--isolation worktree|inplace|none|clone] [--land manual-gate|pr|leave] [--base <branch>] [--no-parallel] [--mutex <tag>]... [--lifecycle ephemeral] [--mcp-transport mount|none] [opts] "<task>"' },
   block: { summary: 'Add a manual gate that blocks a lane until acked', usage: 'taskherd block [-C repo] <lane> --message "<text>" [--at next|end|<index>] [--file <path>]' },
   fork: { summary: 'Split a new sibling lane off an existing one', usage: 'taskherd fork [-C repo] <new-lane> --from <parent> [add opts] ["<task>"]' },
   ack: { summary: 'Answer a gate / clear a parked failure / land a branch', usage: 'taskherd ack [-C repo] <lane>' },
@@ -231,6 +233,9 @@ function laneOptsFromFlags(values) {
     // serial slot; --mutex declares shared-resource tags (repeat or comma-sep).
     parallel: values['no-parallel'] ? false : undefined,
     mutex: values.mutex && values.mutex.length ? values.mutex : undefined,
+    // §26 container-lane attributes.
+    lifecycle: values.lifecycle,
+    mcpTransport: values['mcp-transport'],
   };
 }
 
@@ -265,6 +270,8 @@ const ADD_OPTIONS = {
   at: { type: 'string' },
   'no-parallel': { type: 'boolean', default: false },
   mutex: { type: 'string', multiple: true },
+  lifecycle: { type: 'string' },
+  'mcp-transport': { type: 'string' },
 };
 
 async function cmdAdd(argv) {
@@ -368,6 +375,9 @@ async function cmdDiff(argv) {
     console.log('taskherd: not a git repository — no lane branches to diff');
     return;
   }
+  // A clone lane's commits live in its own object store — pull the branch into
+  // the main repo before diffing (tolerant no-op for worktree/inplace lanes).
+  await syncCloneBranch(repo, laneName);
   const d = await laneDiff(repo, laneName, { base: values.base || null });
   if (!d.exists) {
     console.log(`taskherd: lane '${laneName}' has no branch ${d.branch} yet (never ran under git isolation)`);

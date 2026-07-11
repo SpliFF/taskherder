@@ -12,6 +12,8 @@ import { fileURLToPath } from 'node:url';
 import { createServer } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { createRequire } from 'node:module';
+import { execFile } from 'node:child_process';
+import { promisify } from 'node:util';
 import path from 'node:path';
 import pty from 'node-pty';
 import {
@@ -22,9 +24,35 @@ import { resolveProvider, renderInvocation, parseCost } from './providers.mjs';
 import { resolveRunner, wrapForRunner } from './runners.mjs';
 import { loadProfile, profileEnv, isolationWarnings } from './profiles.mjs';
 import {
-  isGitRepo, ensureWorktree, ensureInplaceBranch, defaultBase, headCommit,
+  isGitRepo, ensureWorktree, ensureClone, ensureInplaceBranch, defaultBase, headCommit,
 } from './git.mjs';
+import {
+  resolveContainerPlan, IN_CONTAINER_REPO, IN_CONTAINER_TASKS, IN_CONTAINER_PKG,
+} from './containers.mjs';
 import { distillStreamJson } from './render.mjs';
+
+const execFileP = promisify(execFile);
+
+// Whether the image carries a runnable `node` (DESIGN §26). The in-container
+// taskherd-mcp is `node <mounted-pkg>/bin/mcp.mjs`, so node must exist; absent ⇒
+// the mount transport degrades to a loud stand-in, never a silent gap. Probes
+// with a throwaway container; a probe failure (image gone, daemon down) is
+// treated as "no node" and degrades loudly rather than parking the whole lane.
+async function imageHasNode(image) {
+  try {
+    await execFileP('docker', ['run', '--rm', '--entrypoint', 'node', image, '--version'], { timeout: 30_000 });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// This package's own root (the parent of src/), bind-mounted read-only into a
+// container so the in-container mcp runs `node <mount>/bin/mcp.mjs` and the
+// image only needs node (§26 work-order refinement). mcp.mjs imports only
+// pure-JS modules (no node-pty native binding), so the host's node_modules mount
+// works across a darwin→linux boundary.
+const PACKAGE_ROOT = fileURLToPath(new URL('../', import.meta.url));
 
 // Cap on how much trailing output we keep to scan for a provider's cost JSON.
 // The result object is small and printed last, so the tail is enough.
@@ -208,11 +236,16 @@ async function resolveWorkdir(repo, lane, resolvedConfig) {
     // failed `generate` parks the lane as a setup error.
     return { isolation, workdir: await ensureWorktree(repo, lane.name, base, { bootstrap: resolvedConfig.bootstrap }) };
   }
+  if (isolation === 'clone') {
+    // A self-contained clone (§26): real `.git` dir → bind-mounts into a
+    // container cleanly. Seeded by the same §24 manifest as a worktree.
+    return { isolation, workdir: await ensureClone(repo, lane.name, base, { bootstrap: resolvedConfig.bootstrap }) };
+  }
   if (isolation === 'inplace') {
     await ensureInplaceBranch(repo, lane.name, base);
     return { isolation, workdir: repo };
   }
-  throw new Error(`taskherd: unknown isolation ${JSON.stringify(isolation)} (worktree | inplace | none)`);
+  throw new Error(`taskherd: unknown isolation ${JSON.stringify(isolation)} (worktree | inplace | none | clone)`);
 }
 
 // A scheduled ai run must see the taskherd-mcp tasks_* tools (DESIGN §16, §17
@@ -225,17 +258,27 @@ async function resolveWorkdir(repo, lane, resolvedConfig) {
 // though the agent's cwd is a worktree (which never contains .tasks/ — it's
 // gitignored). A tree .mcp.json that defines its own `taskherd` server wins
 // (deliberate pin), loudly.
-export async function writeMcpConfig(repo, lane, workdir) {
+export async function writeMcpConfig(repo, lane, workdir, { container = null } = {}) {
+  // For a container lane (§26) the merged config FILE is written to the host
+  // .tasks/run/ (which IS inside the mounted .tasks/), but every path INSIDE it —
+  // the server command and TASKHERD_REPO — must be IN-CONTAINER paths, and the
+  // `--mcp-config` value handed to the provider is the in-container file path.
   const mcpBin = fileURLToPath(new URL('../bin/mcp.mjs', import.meta.url));
-  const taskherd = {
-    command: process.execPath,
-    args: [mcpBin],
-    env: {
-      TASKHERD_REPO: path.resolve(repo),
-      TASKHERD_LANE: lane.name,
-      ...(process.env.TASKHERD_HOME ? { TASKHERD_HOME: process.env.TASKHERD_HOME } : {}),
-    },
-  };
+  const taskherd = container
+    ? {
+      command: 'node',
+      args: [`${IN_CONTAINER_PKG}/bin/mcp.mjs`],
+      env: { TASKHERD_REPO: IN_CONTAINER_REPO, TASKHERD_LANE: lane.name },
+    }
+    : {
+      command: process.execPath,
+      args: [mcpBin],
+      env: {
+        TASKHERD_REPO: path.resolve(repo),
+        TASKHERD_LANE: lane.name,
+        ...(process.env.TASKHERD_HOME ? { TASKHERD_HOME: process.env.TASKHERD_HOME } : {}),
+      },
+    };
   let treeServers = {};
   const treeCfg = path.join(workdir, '.mcp.json');
   if (existsSync(treeCfg)) {
@@ -254,7 +297,9 @@ export async function writeMcpConfig(repo, lane, workdir) {
   await mkdir(runDir(repo), { recursive: true });
   const file = path.join(runDir(repo), `${lane.name}.mcp.json`);
   await writeFile(file, `${JSON.stringify(merged, null, 2)}\n`);
-  return file;
+  // The provider reads the config at its in-container path (the same file, seen
+  // through the mounted .tasks/); the host writes it at `file`.
+  return container ? `${IN_CONTAINER_TASKS}/run/${lane.name}.mcp.json` : file;
 }
 
 // Builds the INNER invocation for a step (what runs, before the runner axis wraps
@@ -268,7 +313,7 @@ export async function writeMcpConfig(repo, lane, workdir) {
 // exists inside a worktree (it's gitignored). `mcpEnabled` is false under a
 // non-local runner — the host taskherd-mcp can't run there (§11), so we don't
 // hand the provider a --mcp-config at a host path that won't exist in the runner.
-async function buildInvocation(repo, lane, step, resolvedConfig = {}, workdir = repo, { mcpEnabled = true, runnerKind = 'local' } = {}) {
+async function buildInvocation(repo, lane, step, resolvedConfig = {}, workdir = repo, { mcpMode = 'host', runnerKind = 'local' } = {}) {
   if (step.type !== 'ai') {
     const { file, args } = shellArgv(step, runnerKind);
     return {
@@ -286,9 +331,16 @@ async function buildInvocation(repo, lane, step, resolvedConfig = {}, workdir = 
   const permissionMode = step.args?.permissionMode ?? null;
   const session = resolveSession(step, lane);
 
-  const mcpConfig = mcpEnabled ? await writeMcpConfig(repo, lane, workdir) : null;
+  // mcpMode (§26): 'host' = host taskherd-mcp (today's local path); 'container-
+  // mount' = an in-container taskherd-mcp over the mounted .tasks/ (paths inside
+  // the config rewritten to the container's view); 'none' = no tools (a loud
+  // stand-in was already logged for the non-local ai case).
+  let mcpConfig = null;
+  const mcp = mcpMode === 'host' || mcpMode === 'container-mount';
+  if (mcpMode === 'host') mcpConfig = await writeMcpConfig(repo, lane, workdir);
+  else if (mcpMode === 'container-mount') mcpConfig = await writeMcpConfig(repo, lane, workdir, { container: true });
   const inv = renderInvocation(provider, {
-    task, model: resolvedConfig.model, permissionMode, maxTurns, session, repo: workdir, mcpConfig, mcp: mcpEnabled,
+    task, model: resolvedConfig.model, permissionMode, maxTurns, session, repo: workdir, mcpConfig, mcp,
   });
 
   let extraEnv = {};
@@ -337,8 +389,34 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   // suppresses the (host-only) taskherd-mcp wiring on the ai invocation (§11).
   const { isolation, workdir } = await resolveWorkdir(repo, lane, resolvedConfig || {});
   const runner = await resolveRunner(resolvedConfig?.runner);
+
+  // §26 validation matrix + attribute resolution — needs BOTH isolation and the
+  // resolved runner, so it runs after both. Throws a setup error on an
+  // incoherent/operator-gated combination (worktree+image, persistent, volume,
+  // socket/http), which parks the lane (M2 path) rather than running it wrong.
+  const plan = resolveContainerPlan({
+    isolation,
+    runner,
+    lifecycle: resolvedConfig?.lifecycle,
+    mcpTransport: resolvedConfig?.mcpTransport,
+    isAi: step.type === 'ai',
+  });
+  for (const w of plan.warnings) console.error(w);
+
+  // Confirm the image actually carries node before trusting container-mount; an
+  // absent node degrades to the loud stand-in (§26 — never a silent gap).
+  let mcpMode = plan.mcpMode;
+  if (mcpMode === 'container-mount' && !(await imageHasNode(runner.image))) {
+    console.error(
+      `FIDELITY-STANDIN: image ${runner.image} has no runnable node — the in-container taskherd-mcp `
+      + `cannot run, so the tasks_* finalization tools are unavailable for lane ${lane.name}; the agent `
+      + 'runs but cannot enqueue its own next step (DESIGN §26).',
+    );
+    mcpMode = 'none';
+  }
+
   const invocation = await buildInvocation(repo, lane, step, resolvedConfig || {}, workdir, {
-    mcpEnabled: runner.kind === 'local',
+    mcpMode,
     runnerKind: runner.kind,
   });
 
@@ -357,6 +435,26 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   // through the same pty seam. Auth env crosses secret-safely (docker `-e KEY`
   // by name; ssh not at all — the remote authenticates as itself). Warnings
   // (mcp-in-runner, unsynced ssh cwd) are loud, per DESIGN §1/§11.
+  // §26 two-mount seam: for a container-mount ai lane, add the host .tasks/ (rw)
+  // + this package (ro) mounts and forward the IN-CONTAINER TASKHERD_REPO/LANE by
+  // value (paths, not secrets). Any docker-image clone lane also gets git
+  // safe.directory=* so in-container git trusts the mounted clone (whose .git is
+  // owned by the host uid, not the container's root).
+  let tasksMount = null;
+  let pkgMount = null;
+  const containerEnvInline = {};
+  if (mcpMode === 'container-mount') {
+    tasksMount = { hostPath: repoTasksDir(repo), containerPath: IN_CONTAINER_TASKS };
+    pkgMount = { hostPath: PACKAGE_ROOT, containerPath: IN_CONTAINER_PKG };
+    containerEnvInline.TASKHERD_REPO = IN_CONTAINER_REPO;
+    containerEnvInline.TASKHERD_LANE = lane.name;
+  }
+  if (isolation === 'clone' && plan.dockerImage) {
+    containerEnvInline.GIT_CONFIG_COUNT = '1';
+    containerEnvInline.GIT_CONFIG_KEY_0 = 'safe.directory';
+    containerEnvInline.GIT_CONFIG_VALUE_0 = '*';
+  }
+
   const { file: innerFile } = invocation; // the provider/shell command, for the cost message
   const spawnSpec = wrapForRunner(runner, {
     file: invocation.file,
@@ -373,6 +471,11 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     // §25 rule 2: every step env gets the lane's deterministic port block so
     // parallel lanes' test servers can pick disjoint ports by convention.
     portBase: lanePortBase(lane.name),
+    // §26 container mounts (image runners only; ignored otherwise).
+    tasksMount,
+    pkgMount,
+    containerEnvInline,
+    mcpMounts: mcpMode === 'container-mount',
   });
   for (const w of spawnSpec.warnings) console.error(w);
   const { file, args } = spawnSpec;

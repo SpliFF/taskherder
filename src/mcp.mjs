@@ -15,6 +15,12 @@ import {
   initTasksDir, addStep, forkLane, ackLane, noteLane,
 } from './tasks.mjs';
 import { renderStatus } from './history.mjs';
+import { loadProjectConfig, loadUserConfig, resolveConfig } from './config.mjs';
+import { loadRunners } from './runners.mjs';
+import { isGitRepo } from './git.mjs';
+import {
+  LIFECYCLES, MCP_TRANSPORTS, DEFAULT_LIFECYCLE, DEFAULT_MCP_TRANSPORT, persistentAllowed,
+} from './containers.mjs';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json');
@@ -97,13 +103,15 @@ const STEP_PROPS = {
 };
 
 const LANE_PROPS = {
-  isolation: { type: 'string', enum: ['worktree', 'inplace', 'none'], description: 'Git isolation for the lane.' },
+  isolation: { type: 'string', enum: ['worktree', 'inplace', 'none', 'clone'], description: 'Git isolation for the lane. `clone` (DESIGN §26) is a self-contained checkout that bind-mounts cleanly into a container — use it for a CONTAINER code lane (isolation:clone + runner:docker:<image>), where a plain worktree cannot do git. Call tasks_options for what this box permits.' },
   land: { type: 'string', enum: ['manual-gate', 'pr', 'leave'], description: 'Land policy when the lane completes.' },
   base: { type: 'string', description: 'Base branch the lane branch forks from / lands into.' },
   onEmpty: { type: 'string', enum: ['default', 'idle'], description: 'What an empty lane does each fire.' },
   asDefault: { type: 'boolean', description: 'Set the step as the lane\'s recurring default (runs every fire once the queue is empty) instead of appending it.' },
   parallel: { type: 'boolean', description: 'Parallel lanes (DESIGN §25): false pins this lane to the SERIAL slot — it only runs when nothing else is running and blocks admission while it runs. Only meaningful when the repo config sets parallel.max > 1.' },
   mutex: { type: 'array', items: { type: 'string' }, description: 'Shared-resource tags (DESIGN §25): two lanes sharing a tag never run concurrently (e.g. ["live-server", "db"]). Declare a tag for every resource isolation cannot prove disjoint — a port, one external DB, a rate-limited account. Only enforced when parallel.max > 1.' },
+  lifecycle: { type: 'string', enum: LIFECYCLES, description: 'Container lifetime (DESIGN §26), meaningful only with a docker image runner. `ephemeral` (DEFAULT, safe) = a fresh `docker run --rm` per fire. `persistent` (a taskherd-managed per-lane container — faster steady state for install-heavy lanes) is OPERATOR-GATED and lands in M11b; selecting it now parks the lane loudly. `volume` is deferred. Prefer `persistent` where it is safe once available; call tasks_options for what this repo permits.' },
+  mcpTransport: { type: 'string', enum: MCP_TRANSPORTS, description: 'How an in-container agent\'s tasks_* tools reach the herd (DESIGN §26), meaningful only for an ai step under a non-local runner. `mount` (DEFAULT, local docker only) = the herd\'s .tasks/ is bind-mounted and an in-container taskherd-mcp writes it. `none` = no tools (node-less image). `socket`/`http` are deferred network bridges. RISKY values may be operator-gated here — call tasks_options.' },
 };
 
 // Insert position (DESIGN §15). `next` interposes the step ahead of one already
@@ -129,6 +137,11 @@ const TOOLS = [
   {
     name: 'tasks_status',
     description: 'Show all lanes: cursor, state, open gates, last result, cost totals. Read this before mutating the lane tree.',
+    inputSchema: { type: 'object', properties: {} },
+  },
+  {
+    name: 'tasks_options',
+    description: 'The environment-specific ALLOCATION CATALOG for this repo (DESIGN §26): the runner definitions this box has, the resolved axis defaults, parallel.max, and which risky values (persistent lifecycle, network mcpTransport) are operator-gated HERE. Call this BEFORE tasks_fork/tasks_add when you must choose isolation/runner/lifecycle for a sub-task — the static tool schema cannot know what this machine offers, so allocate from the real permitted knobs, not guesses. For a container CODE lane, use isolation:clone + one of the configured docker image runners.',
     inputSchema: { type: 'object', properties: {} },
   },
   {
@@ -161,7 +174,7 @@ const TOOLS = [
   },
   {
     name: 'tasks_fork',
-    description: 'Fork a sibling lane off a parent: a NEW independent lane (own branch/worktree) for an independent workstream discovered mid-task. Give it an initial step (task/type/...) or a recurring default (asDefault). `from` defaults to the current lane (TASKHERD_LANE). Fork-time contract when the repo runs parallel lanes (DESIGN §25): fork only INDEPENDENT, DISJOINT file scopes into isolated lanes; declare any shared resource (a port, one DB, a rate-limited account) as a `mutex` tag on both lanes; work whose file scope OVERLAPS the parent stays in the parent lane — serial by construction, no analysis needed.',
+    description: 'Fork a sibling lane off a parent: a NEW independent lane (own branch/worktree) for an independent workstream discovered mid-task. Give it an initial step (task/type/...) or a recurring default (asDefault). `from` defaults to the current lane (TASKHERD_LANE). Fork-time contract when the repo runs parallel lanes (DESIGN §25): fork only INDEPENDENT, DISJOINT file scopes into isolated lanes; declare any shared resource (a port, one DB, a rate-limited account) as a `mutex` tag on both lanes; work whose file scope OVERLAPS the parent stays in the parent lane — serial by construction, no analysis needed. To ALLOCATE isolation/runner/lifecycle for the sub-task, call tasks_options first (DESIGN §26): it reports this box\'s real runners + which risky values are gated. A container code lane = isolation:clone + a docker image runner (a plain worktree cannot do git in a container).',
     inputSchema: {
       type: 'object',
       properties: {
@@ -200,11 +213,12 @@ const TOOLS = [
 
 function splitArgs(args = {}) {
   const {
-    lane, name, from, isolation, land, base, onEmpty, asDefault, at, parallel, mutex, ...stepOpts
+    lane, name, from, isolation, land, base, onEmpty, asDefault, at, parallel, mutex,
+    lifecycle, mcpTransport, ...stepOpts
   } = args;
   return {
     lane, name, from, laneOpts: {
-      isolation, land, base, onEmpty, asDefault, at, parallel, mutex,
+      isolation, land, base, onEmpty, asDefault, at, parallel, mutex, lifecycle, mcpTransport,
     },
     stepOpts,
   };
@@ -216,6 +230,54 @@ function hasStepPayload(stepOpts) {
 
 function text(s) {
   return { content: [{ type: 'text', text: s }] };
+}
+
+// The §26 allocation catalog: environment-specific knobs the /task skill needs
+// to allocate a sub-task's isolation/runner/lifecycle. Dynamic on purpose — the
+// static schema can't know THIS box's runners or which risky values the operator
+// gated here.
+async function optionsCatalog(repo) {
+  const [projectConfig, userConfig, runnersDef, gitRepo] = await Promise.all([
+    loadProjectConfig(repo), loadUserConfig(), loadRunners(), isGitRepo(repo),
+  ]);
+  const cfg = resolveConfig(null, null, projectConfig, userConfig);
+  const allowPersistent = persistentAllowed(projectConfig, userConfig);
+  const runners = Object.entries(runnersDef).map(([name, def]) => ({
+    name, kind: def.kind, ...(def.image ? { image: def.image } : {}), ...(def.container ? { container: def.container } : {}), ...(def.host ? { host: def.host } : {}),
+  }));
+  return {
+    repo,
+    isolation: {
+      default: cfg.isolation ?? (gitRepo ? 'worktree' : 'none'),
+      values: ['worktree', 'inplace', 'none', 'clone'],
+      note: 'clone = a self-contained checkout for a CONTAINER code lane (isolation:clone + a docker image runner); a plain worktree cannot do git inside a container.',
+    },
+    runner: {
+      default: cfg.runner ?? 'local',
+      configured: runners,
+      inline: ['local', 'docker:<image-or-container>', 'ssh:<host>'],
+      note: runners.length ? undefined : 'no ~/.taskherd/runners.json — use an inline docker:<image> / ssh:<host> form.',
+    },
+    lifecycle: {
+      default: DEFAULT_LIFECYCLE,
+      values: LIFECYCLES,
+      gated: {
+        persistent: { allowed: allowPersistent, note: 'operator-gated (config containers.allowPersistent) AND not yet implemented — lands in M11b; selecting it now parks the lane.' },
+        volume: { allowed: false, note: 'deferred value (DESIGN §26).' },
+      },
+      note: 'Prefer persistent where safe (stable, single-account, install-heavy lane) once M11b ships; ephemeral is the safe default until then.',
+    },
+    mcpTransport: {
+      default: DEFAULT_MCP_TRANSPORT,
+      values: MCP_TRANSPORTS,
+      gated: {
+        socket: { allowed: false, note: 'deferred network bridge.' },
+        http: { allowed: false, note: 'deferred network bridge.' },
+      },
+      note: 'mount is local-docker only (needs node in the image); it degrades to none + a loud stand-in on a node-less image or a remote runner.',
+    },
+    parallel: { max: Number(projectConfig?.parallel?.max ?? userConfig?.parallel?.max ?? 1) || 1 },
+  };
 }
 
 export function createTaskherdServer({ cwd = process.cwd(), env = process.env } = {}) {
@@ -243,6 +305,10 @@ export function createTaskherdServer({ cwd = process.cwd(), env = process.env } 
     async tasks_status() {
       const repo = await requireRepo();
       return text(await renderStatus(repo));
+    },
+    async tasks_options() {
+      const repo = await requireRepo();
+      return text(JSON.stringify(await optionsCatalog(repo), null, 2));
     },
     async tasks_add(args) {
       const repo = await requireRepo();

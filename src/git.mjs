@@ -3,10 +3,12 @@
 // worktree pool + gc. All plain `git` subprocesses — no dependency.
 import { execFile } from 'node:child_process';
 import { promisify } from 'node:util';
-import { mkdir, readdir } from 'node:fs/promises';
+import { mkdir, readdir, rm } from 'node:fs/promises';
 import { existsSync } from 'node:fs';
 import path from 'node:path';
-import { worktreeDir, wtRepoDir, laneFile } from './paths.mjs';
+import {
+  worktreeDir, wtRepoDir, laneFile, clonePath, cloneRepoDir,
+} from './paths.mjs';
 import {
   parseBootstrap, seedWorktree, ignoredAdvisory, markSeeding, clearSeeding, isSeedingPending,
 } from './bootstrap.mjs';
@@ -162,6 +164,78 @@ export async function ensureWorktree(repo, laneName, base, { bootstrap = null } 
   return dir;
 }
 
+// Clone isolation (DESIGN §26): ~/.taskherd/clone/<repo-id>/<lane>, a
+// self-contained `git clone --local` (objects hardlinked, so nearly as cheap as
+// a worktree) on taskherd/<lane>. Unlike a worktree, its `.git` is a real
+// DIRECTORY, so it bind-mounts into a container cleanly. The lane branch is
+// created in the MAIN repo first (exactly like the worktree path — so
+// branchBase, land, and diff all resolve against the main repo's config), then
+// checked out in the clone from the main repo's copy (which the clone sees as
+// origin/taskherd/<lane>). The clone becomes the sole writer of that branch; its
+// commits return to the main repo via syncCloneBranch. Pooled + re-seeded on a
+// half-seeded hit exactly like ensureWorktree.
+export async function ensureClone(repo, laneName, base, { bootstrap = null } = {}) {
+  const manifest = parseBootstrap(bootstrap); // fail-closed BEFORE any git op
+  const branch = laneBranch(laneName);
+  const dir = clonePath(repo, laneName);
+  if (existsSync(path.join(dir, '.git'))) {
+    if (manifest && (await isSeedingPending(dir))) {
+      await seedWorktree(repo, dir, manifest);
+      await clearSeeding(dir);
+      await ignoredAdvisory(repo, dir);
+    }
+    return dir;
+  }
+  if (existsSync(dir)) {
+    throw new Error(`taskherd: ${dir} exists but is not a git clone — remove it and re-run`);
+  }
+  // Create the branch in the MAIN repo (records branch.<b>.taskherdbase there —
+  // land/diff read the base from the main repo, never from the clone).
+  await ensureBranch(repo, branch, base);
+  await mkdir(path.dirname(dir), { recursive: true });
+  // --local hardlinks objects from the local source (§26: "objects hardlinked,
+  // nearly as cheap as a worktree") — and is self-contained, unlike --shared,
+  // whose alternates would re-introduce the host-absolute path trap. Hardlinked
+  // loose objects are immutable/content-addressed, so an in-container commit
+  // only ADDS new objects; it never mutates the main repo's shared inodes.
+  await git(path.dirname(dir), 'clone', '--local', '--quiet', path.resolve(repo), dir);
+  // The main repo's taskherd/<lane> came across as origin/taskherd/<lane>; make
+  // it the clone's checked-out local branch so in-container commits land on it.
+  await git(dir, 'checkout', '-B', branch, `refs/remotes/origin/${branch}`);
+  if (manifest) {
+    await markSeeding(dir);
+    await seedWorktree(repo, dir, manifest);
+    await clearSeeding(dir);
+  }
+  await ignoredAdvisory(repo, dir);
+  return dir;
+}
+
+// Fetch a clone lane's branch back into the MAIN repo (DESIGN §26): a clone has
+// its own object store, so commits made inside it are invisible to the main repo
+// until fetched. Called before land/diff/gc for a clone lane. Tolerant: a
+// non-clone lane (no clone dir) or a clone without the branch yet is a quiet
+// no-op, so callers can invoke it unconditionally. A non-fast-forward is a LOUD
+// error — the clone is the sole writer, so a divergence means main's copy was
+// tampered with, never silently clobbered.
+export async function syncCloneBranch(repo, laneName) {
+  const clone = clonePath(repo, laneName);
+  if (!existsSync(path.join(clone, '.git'))) return { synced: false, reason: 'no-clone' };
+  const branch = laneBranch(laneName);
+  if (!(await branchExists(clone, branch))) return { synced: false, reason: 'no-branch' };
+  try {
+    // src:dst with no leading '+' → git refuses a non-ff update (loud). The
+    // branch is never checked out in the main repo, so updating its ref is safe.
+    await git(repo, 'fetch', '--end-of-options', clone, `${branch}:${branch}`);
+  } catch (err) {
+    throw new Error(
+      `taskherd: syncCloneBranch ${laneName}: ${err.message} — the clone's ${branch} does not `
+      + 'fast-forward the main repo\'s copy (diverged history); resolve manually (DESIGN §26).',
+    );
+  }
+  return { synced: true, branch };
+}
+
 // Inplace isolation (§7): the main checkout, switched to taskherd/<lane>. A
 // checkout that would clobber uncommitted changes fails, which throws here and
 // parks the lane — the user's dirty tree is never overwritten silently.
@@ -273,6 +347,43 @@ export async function gcWorktrees(repo, configBase = null) {
     }
   }
   await git(repo, 'worktree', 'prune').catch(() => {});
+
+  // Clone pool (§26): same clean-AND-(merged-or-lane-gone) gate, but the tree is
+  // removed with `rm -rf` (a clone is a standalone checkout, not a registered
+  // worktree). syncCloneBranch first so the merged check sees the clone's latest.
+  let cloneNames = [];
+  try {
+    cloneNames = await readdir(cloneRepoDir(repo));
+  } catch {
+    // no clone pool for this repo yet
+  }
+  for (const name of cloneNames) {
+    const dir = clonePath(repo, name);
+    const branch = laneBranch(name);
+    if (!existsSync(path.join(dir, '.git'))) {
+      report.push({ lane: name, action: 'kept', reason: `${dir} is not a git clone — remove it manually` });
+      continue;
+    }
+    if (!(await isClean(dir).catch(() => false))) {
+      report.push({ lane: name, action: 'kept', reason: 'uncommitted changes (clone)' });
+      continue;
+    }
+    await syncCloneBranch(repo, name).catch(() => {}); // advisory before the merged check
+    const base = configBase || (await branchBase(repo, branch)) || (await defaultBase(repo));
+    const merged = await mergedIntoBase(repo, branch, base);
+    const laneStillExists = existsSync(laneFile(repo, name));
+    if (!merged && laneStillExists) {
+      report.push({ lane: name, action: 'kept', reason: `unmerged work on ${branch} (clone)` });
+      continue;
+    }
+    await rm(dir, { recursive: true, force: true });
+    if (merged && (await branchExists(repo, branch))) {
+      await git(repo, 'branch', '-d', branch);
+      report.push({ lane: name, action: 'removed', reason: `merged into ${base}; clone + branch deleted` });
+    } else {
+      report.push({ lane: name, action: 'removed', reason: `lane gone; clone deleted, unmerged branch ${branch} kept` });
+    }
+  }
   return report;
 }
 
@@ -319,10 +430,15 @@ export async function laneDiff(repo, laneName, { base = null, maxBytes = 400_000
   const patch = truncated ? full.slice(0, maxBytes) : full;
   const ahead = await aheadCount(repo, branch, resolvedBase);
 
+  // Uncommitted work left in the lane's tree — a worktree pool dir or, for a
+  // clone lane (§26), the clone dir (whichever exists).
   let dirty = false;
   const wt = worktreeDir(repo, laneName);
-  if (existsSync(path.join(wt, '.git'))) {
-    dirty = !(await isClean(wt).catch(() => true));
+  const clone = clonePath(repo, laneName);
+  const tree = existsSync(path.join(clone, '.git')) ? clone
+    : (existsSync(path.join(wt, '.git')) ? wt : null);
+  if (tree) {
+    dirty = !(await isClean(tree).catch(() => true));
   }
   return {
     exists: true, branch, base: resolvedBase, ahead, files, patch, truncated, bytes, dirty,

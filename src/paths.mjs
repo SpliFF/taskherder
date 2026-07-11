@@ -126,6 +126,23 @@ export function worktreeDir(repo, laneName) {
   return path.join(wtRepoDir(repo), laneName);
 }
 
+// Clone pool (DESIGN §26): `isolation: clone` makes a self-contained `git clone
+// --local` per lane, so its `.git` is a real directory that bind-mounts cleanly
+// into a container (a linked worktree's `.git` is a host-absolute pointer file
+// that doesn't survive the mount). Mirrors the worktree pool layout under a
+// sibling `clone/` root so the two never collide.
+export function cloneBaseDir() {
+  return path.join(taskherdHome(), 'clone');
+}
+
+export function cloneRepoDir(repo) {
+  return path.join(cloneBaseDir(), repoId(repo));
+}
+
+export function clonePath(repo, laneName) {
+  return path.join(cloneRepoDir(repo), laneName);
+}
+
 // Deterministic per-lane port block (DESIGN §25 rule 2): parallel lanes can't
 // share the dev server's hardcoded port, so every step env exports
 // TASKHERD_PORT_BASE and well-behaved test servers pick ports by convention:
