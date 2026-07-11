@@ -28,3 +28,21 @@ test('resolveConfig: omits keys nobody set', () => {
   const resolved = resolveConfig({}, {}, {}, {});
   assert.deepEqual(resolved, {});
 });
+
+test('resolveConfig: provider falls back to the `default` step template (lane → project → user) when the chain sets none', () => {
+  const project = { default: { type: 'ai', provider: 'claude', task: '/work' } };
+  assert.equal(resolveConfig({}, {}, project, {}).provider, 'claude', 'the §5 example config shape resolves');
+  const lane = { default: { type: 'ai', provider: 'codex', task: '/work' } };
+  assert.equal(resolveConfig({}, lane, project, {}).provider, 'codex', 'lane template beats project template');
+  const user = { default: { type: 'ai', provider: 'copilot', task: '/work' } };
+  assert.equal(resolveConfig({}, {}, {}, user).provider, 'copilot', 'user template is the last resort');
+});
+
+test('resolveConfig: an explicit provider anywhere in the chain beats every default template, and other template fields never leak', () => {
+  const lane = { default: { type: 'ai', provider: 'codex', task: '/work' } };
+  assert.equal(resolveConfig({}, lane, {}, { provider: 'claude' }).provider, 'claude', 'top-level chain wins over templates');
+  assert.equal(resolveConfig({ provider: 'copilot' }, lane, {}, {}).provider, 'copilot', 'step wins outright');
+  const project = { default: { type: 'ai', provider: 'claude', model: 'sonnet', task: '/work' } };
+  const r = resolveConfig({}, {}, project, {});
+  assert.equal(r.model, undefined, "a template's model/task are its own — only provider backfills");
+});

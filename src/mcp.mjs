@@ -90,7 +90,7 @@ const STEP_PROPS = {
   id: { type: 'string', description: 'Stable label for this step so OTHER steps can wait on it (a waitsFor target), e.g. "U2". Letters/digits/._- only.' },
   waitsFor: { type: 'array', items: { type: 'string' }, description: 'Cross-lane dependencies (DESIGN §22): this step will not run until every reference is satisfied, and the wait AUTO-CLEARS (no ack). Forms: "lane:id" (a specific step in another lane — the common case), ":id" (a step in THIS lane), or "lane" (that lane\'s whole queue drained). A ref is satisfied when its target step is `done`. Use this for a real prerequisite instead of hand-holding a manual gate.' },
   when: { type: 'object', description: 'A precondition RULE TREE (DESIGN §23): the step only runs on a fire where the rule holds — otherwise it soft-skips and re-checks next fire (AUTO-CLEARS, no ack), exactly like waitsFor. A rule is one object with exactly one key. Leaves: {"window":{...}} a time/date predicate — any of after/before ("HH:MM", local time; overnight wraps), days ("Mon-Fri" or ["Sat","Sun"]), from/until ("YYYY-MM-DD" absolute bounds), tz ("local"|"utc"); {"dep":"lane:id"} identical to a waitsFor ref. Combinators: {"all":[...]} (AND), {"any":[...]} (OR), {"not":<rule>}. Example — business hours only: {"all":[{"window":{"after":"09:00","before":"17:00","days":"Mon-Fri"}}]}; {"exit":{"run":"./scripts/ready.sh"}} runs a PROBE command each fire the step is otherwise runnable and lets it start once the exit code matches ("equals" int, default 0 | "in":[codes] | "not":code; "argv" array instead of "run" to skip the shell; "timeout" default 30s, "cache" TTL reuses the last result across fires, "runner", "env"). A probe is code the SCHEDULER executes speculatively and repeatedly — keep it cheap, idempotent, read-only; error/timeout ⇒ unsatisfied (fail-closed). ONLY window/dep/exit/all/any/not are implemented; file/http/env are refused with a loud error. A malformed rule fails loudly at add time — never a silent skip.' },
-  provider: { type: 'string', description: 'AI provider (e.g. claude).' },
+  provider: { type: 'string', description: 'AI provider (e.g. claude). Optional when a default is inherited (lane → project → user config, or a `default` step template); an ai step that resolves NO provider is rejected at add time (it would only park at fire time). Call tasks_options to see the resolved default.' },
   model: { type: 'string', description: 'Model override (e.g. sonnet, opus).' },
   profile: { type: 'string', description: 'Auth profile name (per-account isolation).' },
   runner: { type: 'string', description: 'Runner (local | docker:<ctr> | ssh:<host>).' },
@@ -247,6 +247,12 @@ async function optionsCatalog(repo) {
   }));
   return {
     repo,
+    provider: {
+      default: cfg.provider ?? null,
+      note: cfg.provider
+        ? undefined
+        : 'NO provider default anywhere — every ai step must set provider explicitly (tasks_add rejects one that resolves nothing), or set a project/user default in .tasks/config.json / ~/.taskherd/config.json.',
+    },
     isolation: {
       default: cfg.isolation ?? (gitRepo ? 'worktree' : 'none'),
       values: ['worktree', 'inplace', 'none', 'clone'],

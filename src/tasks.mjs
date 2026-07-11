@@ -1042,6 +1042,25 @@ function resolveInsertIndex(repo, lane, at) {
   return idx;
 }
 
+// Add-time provider check (DESIGN §1/§12): an ai step whose provider resolves
+// to NOTHING through the whole chain — step → lane → project → user config,
+// then the `default` step templates (resolveConfig) — is guaranteed to park at
+// its fire and block the lane. Reject it NOW, while the client (a human at the
+// CLI, or the agent behind tasks_add/tasks_fork) is still there to fix it,
+// instead of failing silently hours later. Provider stays late-bound: this
+// never writes the resolved value into the step, it only proves one exists.
+async function assertProviderResolvable(repo, lane, step) {
+  if (step.type !== 'ai') return;
+  const [projectConfig, userConfig] = await Promise.all([loadProjectConfig(repo), loadUserConfig()]);
+  if (!resolveConfig(step, lane, projectConfig, userConfig).provider) {
+    throw new LaneValidationError(
+      `taskherd: ai step has no provider and none is inherited — it would park at fire time. `
+      + `Set \`provider\` on the step (e.g. "claude"), or a default it can inherit: lane, `
+      + `${path.relative(repo, projectConfigFile(repo))}, or ~/.taskherd/config.json (DESIGN §5, §8)`,
+    );
+  }
+}
+
 // Appends a step to a lane (creating the lane on first use), or — with
 // `asDefault` — sets the lane's recurring default (DESIGN §6). `laneOpts.at`
 // ('next' | 'end' | index) chooses where a queued step lands so a client can
@@ -1052,6 +1071,7 @@ export async function addStep(repo, laneName, stepOpts, laneOpts = {}) {
   const lane = (await laneExists(repo, laneName)) ? await loadLane(repo, laneName) : newLane(laneName);
   const step = buildStep(stepOpts);
   applyLaneOpts(lane, laneOpts);
+  await assertProviderResolvable(repo, lane, step);
   if (laneOpts.asDefault) {
     const { status: _transient, ...defaultStep } = step;
     lane.default = defaultStep;
@@ -1162,6 +1182,7 @@ export async function forkLane(repo, name, from, { stepOpts = null, laneOpts = {
   applyLaneOpts(lane, laneOpts);
   if (stepOpts) {
     const step = buildStep(stepOpts);
+    await assertProviderResolvable(repo, lane, step);
     if (laneOpts.asDefault) {
       const { status: _transient, ...defaultStep } = step;
       lane.default = defaultStep;
@@ -1212,6 +1233,11 @@ export async function initTasksDir(repo, { globalGitignore = true } = {}) {
   if (!existsSync(cfgFile)) {
     const defaultConfig = {
       default: null,
+      // Project-wide AI provider for ai steps that don't set their own (§5
+      // inheritance; a `default` step template's provider also counts). Left
+      // null so the choice is explicit — an ai step that resolves NO provider
+      // is rejected at add time rather than parking at fire time.
+      provider: null,
       profile: null,
       runner: 'local',
       // Safety-first (DESIGN §7, §12): a git repo gets worktree isolation by

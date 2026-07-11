@@ -270,7 +270,9 @@ test('budgets still gate per lane under parallel mode', async (t) => {
   const { repo, cleanup } = await makeRepo();
   t.after(cleanup);
   await setParallel(repo, 2);
-  await addStep(repo, 'ai-lane', { type: 'ai', task: 'do things', budgetUsd: 0.05 });
+  await addStep(repo, 'ai-lane', {
+    type: 'ai', provider: 'claude', task: 'do things', budgetUsd: 0.05,
+  });
   await appendHistory(repo, { lane: 'ai-lane', step: 0, result: 'done', cost: 0.06 });
   const r = await tick(repo);
   assert.equal(r.outcome, 'idle'); // the only lane got budget-blocked before admission

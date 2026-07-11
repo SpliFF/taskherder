@@ -52,5 +52,16 @@ export function resolveConfig(step, lane, projectConfig, userConfig) {
       resolved[key] = found;
     }
   }
+  // `provider` gets one extra fallback layer: the `default` STEP template
+  // (lane → project → user). The §5 example project config carries provider
+  // only inside `default` — a herd whose recurring default runs claude clearly
+  // means claude for its ad-hoc ai steps too, and without this an added step
+  // with no explicit provider is guaranteed to park at fire time. Template
+  // fields other than provider never leak (a default's task/model are its own).
+  if (resolved.provider == null) {
+    const templated = [lane?.default?.provider, projectConfig?.default?.provider, userConfig?.default?.provider]
+      .find((v) => v !== undefined && v !== null);
+    if (templated !== undefined) resolved.provider = templated;
+  }
   return resolved;
 }

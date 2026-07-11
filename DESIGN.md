@@ -178,7 +178,11 @@ lanes by adding `!.tasks/` to its own `.gitignore`.
 
 Common fields resolved by inheritance **step → lane → project `config.json` →
 `~/.taskherd/config.json`**: `provider`, `profile`, `runner`, `isolation`,
-`land`, `model`, `budget`, `timeout`. `status`: `pending → running → done |
+`land`, `model`, `budget`, `timeout`. `provider` alone gets one extra fallback:
+the `default` step template's provider (lane → project → user) — so the example
+config above covers ad-hoc ai steps too — and an ai step that resolves **no**
+provider anywhere is rejected loudly at add time rather than parking the lane
+at fire time (§1/§12). `status`: `pending → running → done |
 failed | blocked`.
 
 ### Project defaults — `<repo>/.tasks/config.json`

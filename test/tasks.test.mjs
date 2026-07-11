@@ -6,7 +6,7 @@ import {
   loadAllLanesResilient, buildStep, ackLane, removeStep, forkLane, addStep,
   parseWaitRef, evaluateWaits, computeWaiting, detectWaitCycles,
 } from '../src/tasks.mjs';
-import { laneFile } from '../src/paths.mjs';
+import { laneFile, projectConfigFile } from '../src/paths.mjs';
 import { makeRepo } from './helpers.mjs';
 
 test('lane save/load round-trip preserves steps', async (t) => {
@@ -218,6 +218,41 @@ test('loadAllLanesResilient separates healthy lanes from unloadable ones (bug #5
   assert.equal(unloadable.length, 1);
   assert.equal(unloadable[0].name, 'bad');
   assert.match(unloadable[0].error, /malformed lane JSON/);
+});
+
+test('addStep rejects an ai step that resolves NO provider — loud at add time, not a parked lane at fire time (§1/§12)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await assert.rejects(
+    addStep(repo, 'ai', { type: 'ai', task: '/work' }),
+    (err) => err instanceof LaneValidationError && /provider/.test(err.message) && /park/.test(err.message),
+  );
+  // provider is an ai-only axis — command/manual steps are unaffected.
+  await addStep(repo, 'ai', { type: 'command', task: 'echo ok' });
+  await addStep(repo, 'ai', { type: 'manual', message: 'gate' });
+});
+
+test('addStep accepts a provider-less ai step when a default is inheritable — incl. the §5 example shape (provider only inside the `default` template)', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await writeFile(
+    projectConfigFile(repo),
+    `${JSON.stringify({ default: { type: 'ai', provider: 'claude', task: '/work' } })}\n`,
+  );
+  const { step } = await addStep(repo, 'ai', { type: 'ai', task: '/review' });
+  assert.equal(step.provider, undefined, 'provider stays late-bound — never materialized into the step');
+});
+
+test('forkLane runs the same add-time provider check on its initial step', async (t) => {
+  const { repo, cleanup } = await makeRepo();
+  t.after(cleanup);
+  await addStep(repo, 'main', { type: 'command', task: 'echo seed' });
+  await assert.rejects(
+    forkLane(repo, 'kid', 'main', { stepOpts: { type: 'ai', task: '/work' } }),
+    LaneValidationError,
+  );
+  const lane = await forkLane(repo, 'kid', 'main', { stepOpts: { type: 'ai', provider: 'claude', task: '/work' } });
+  assert.equal(lane.steps[0].provider, 'claude');
 });
 
 test('saveLane writes atomically and leaves no temp file behind (bug #2)', async (t) => {
