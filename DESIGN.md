@@ -775,3 +775,134 @@ isolation value (a linked worktree's `.git` is a *file* holding a
 host-absolute `gitdir:` path, so worktrees do not survive bind-mounting into
 containers; the per-lane clone is the primitive that fixes it) — and the
 **mcp-in-runner shim** (§16 tools inside a container) container lanes require.
+*(Container lanes, `clone` isolation, and the mcp-in-runner shim are now
+designed in **§26**; the remaining deferrals stay open.)*
+
+---
+
+## 26. Container lanes — `clone` isolation, lifecycle, and the mount seam
+
+Lifts the **container-lanes** item off §25's deferred list. A container lane
+runs an isolated lane's steps *inside* a Docker container that can actually do
+git — the missing primitive §25 named. The decisions are **task attributes**
+(not global modes): they ride §5 inheritance (step → lane → project → user)
+exactly like the five axes, because how much isolation a task needs is knowable
+only by the task's author. Off by default; a repo with no container lanes
+behaves exactly as §7/§11/§25 describe today.
+
+**The latent break this fixes.** A `worktree`-isolation lane under a
+`docker:image` runner already bind-mounts the worktree into the container
+(§11). A linked worktree's `.git` is a *file* holding a **host-absolute**
+`gitdir:` path, absent inside the container — so every in-container git
+operation fails silently-ish. `clone` isolation is the fix and the reason this
+is one capability.
+
+### The attributes
+
+```jsonc
+// step / lane / project config.json — each overrides the broader scope (§5)
+"isolation":    "clone",        // §7 axis + NEW value (below)
+"runner":       "docker:build", // §11 axis, unchanged
+"lifecycle":    "ephemeral",    // NEW — container lifetime (docker `image` runner only)
+"mcpTransport": "mount"         // NEW — how in-container tasks_* reach the herd (ai + non-local)
+```
+
+- **`isolation: clone`** — a self-contained checkout made with `git clone
+  --local` into the pool at `~/.taskherd/clone/<repo-id>/<lane>` (objects
+  **hardlinked**, so it is nearly as cheap as a worktree). Its `.git` is a real
+  **directory**, so it bind-mounts into a container cleanly. Because a clone has
+  its **own** object store, the lane branch's commits are invisible to the main
+  repo until fetched: land and diff (§7) run **`syncCloneBranch`** first —
+  `git fetch <clone> taskherd/<lane>` into the main repo — then proceed exactly
+  as the worktree path does. `gc` reaps the clone dir + the fetched branch under
+  the §7 discipline. `clone` is a candidate for §25 admission (isolated). It is
+  valid under a `local` runner (a pristine host checkout) — allowed, not
+  optimized for.
+
+- **`lifecycle`** — the container's lifetime; meaningful **only** with a docker
+  `image` runner. `ephemeral` (**default**) = `docker run --rm` per fire — a
+  fresh, stateless container each time, the §12-safe floor (nothing lingers);
+  the §24 seed manifest's `generate` re-runs each fire (the cost of safety).
+  `persistent` = a taskherd-managed, long-lived container **per lane** (created
+  on first fire, `docker exec` on subsequent fires, stopped+removed on `gc`), so
+  `node_modules`/caches/`generate` output survive between fires — fast steady
+  state, at the cost of taskherd owning the container's lifecycle (health,
+  restart, orphan reaping) and that container being part of the lane's §25
+  running footprint. `persistent` is **operator-gated** (below). `volume` (an
+  ephemeral container plus a persistent per-lane named volume) is a **deferred**
+  value.
+
+- **`mcpTransport`** — how an in-container `/task` agent's `tasks_*` tools reach
+  the herd; meaningful **only** for an `ai` step under a non-local runner.
+  `mount` (**default**) = the herd's `.tasks/` is bind-mounted into the
+  container and an in-container `taskherd-mcp` writes it directly (below).
+  `none` = no tools; the existing loud FIDELITY-STANDIN (§11) — the honest state
+  for a node-less image. `socket`/`http` network bridges are **deferred** values
+  (unnecessary once node-in-container is normal). **`mount` is local-docker
+  only** — a remote runner (`ssh:`, off-host docker) cannot mount the host's
+  `.tasks/`, so remote-container finalization degrades to `none` + the
+  stand-in; the remote lane's **git** results still return via the executor's
+  `git fetch` over ssh, but the remote agent cannot self-finalize (a deferred
+  refinement, matching §11's "full remote-git is later").
+
+### The execution & communication seam
+
+The orchestrator (scheduler + executor) stays **outside** the container — §13's
+local pty runs `docker exec`/`docker run` and streams the container process's
+stdout back. Results return through **bind mounts**, never a new network
+protocol. A container code lane has exactly **two mounts**, one per result kind:
+
+1. **the clone** at the runner's workdir (e.g. `/work`) — the code the agent
+   edits and commits; git results surface via `syncCloneBranch` after the run.
+2. **the main repo's `.tasks/`** at a known path, with `TASKHERD_REPO` pointed
+   there — coordination state; results surface as the in-container MCP's live,
+   atomic file writes (the §M1.1 tmp+rename `saveLane` discipline makes
+   host+container concurrent writes safe). Only `.tasks/` is mounted, never the
+   whole main checkout.
+
+Any *service* the task stands up is reached by the "docker ports" path already
+in place: the executor publishes ports and hands each lane a disjoint
+`TASKHERD_PORT_BASE` (§25 rule 2); the console `/gfx` reverse-proxy (§15)
+already reaches in-container servers.
+
+### Baking allocation into the MCP (§16/§17)
+
+A forking `/task` agent must choose isolation/runner/lifecycle for a sub-task,
+but the static tool schema cannot know what *this box* offers. A new read tool
+**`tasks_options`** returns the **environment-specific** catalog: the runners
+configured in `runners.json`, the repo's resolved axis defaults + `parallel.max`,
+and **which risky values are operator-gated here**. `tasks_add`/`tasks_fork`
+gain the new attributes in their schemas (with the loud "risky values may be
+operator-gated" note, mirroring the §23 refusal of agent-authored
+`exit`/`file`/`http` rules). This upgrades the §25 rule-6 fork contract from
+"declare `mutex` tags" to "here are the real permitted knobs + their blast
+radius — allocate accordingly." The **skill actively encourages `persistent`
+where it is safe** (a stable, single-account, install-heavy lane) while the
+**default stays `ephemeral`** — exposure plus guidance, never a silent fast-path.
+
+### Rules
+
+1. **Safe by default (§12).** Defaults are the safe combination: `ephemeral`
+   lifecycle (nothing lingers), `mount` transport degrading to a loud stand-in.
+   `persistent` lifecycle and any network `mcpTransport` are **operator-gated** —
+   a repo-config allow-flag must opt in before *any* author, human **or an AI
+   via MCP**, can select them (the §15 `serve --allow-shell` posture).
+2. **Fail loud on incoherent combinations (§1) — the validation matrix.**
+   `worktree` isolation + a docker `image` runner ⇒ **reject** at resolve time,
+   steering to `clone` (this converts today's silent break into an actionable
+   park — worth adding first). `lifecycle: persistent` without a docker `image`
+   runner ⇒ warn, inert. `mcpTransport: mount` + a remote runner ⇒ warn +
+   stand-in. Never a silent incoherent run.
+3. **Caps stay config, not a task attribute.** A per-profile / per-host
+   concurrency cap is a shared-resource limit, not a task property — repo
+   `parallel.max` (§25), a per-profile entry, and a box-wide `~/.taskherd/`
+   host ledger, evaluated **min-of** in admission. Deferred with the rest of
+   §25's admission refinements; listed here only to fix its home.
+
+**Prerequisite:** §24 (a container tree must be seedable) and §25 (container
+lanes are admission candidates).
+
+**Deferred (loudly rejected until designed):** the `volume` lifecycle; the
+`socket`/`http` `mcpTransport` bridges; **remote-container finalization** (the
+`tasks_*` tools inside an off-host runner); and the per-profile/per-host caps
+of rule 3.
