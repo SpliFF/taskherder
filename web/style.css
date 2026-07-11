@@ -239,9 +239,12 @@ main {
 
 .steps { list-style: none; margin: 0; padding: 0; border-top: 1px dashed var(--line); }
 
+/* A step is idx + glyph in a fixed gutter, then a column: the text line on
+   top, a wrapping chips/buttons meta row below. The text is never squeezed by
+   fixed-width neighbours — long blockers and the tool cluster wrap under it. */
 .step {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 8px;
   padding: 5px 0;
   border-bottom: 1px dashed var(--line);
@@ -250,26 +253,30 @@ main {
 
 .step-idx { color: var(--faint); width: 2ch; text-align: right; flex: none; }
 .step-glyph { flex: none; width: 2ch; text-align: center; }
+.step-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px; }
+.step-line { display: flex; align-items: baseline; gap: 8px; }
+.step-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 3px 6px; }
 .step.done .step-glyph { color: var(--run); }
 .step.failed .step-glyph, .step.failed .step-text { color: var(--fail); }
 .step.blocked .step-glyph { color: var(--gate); }
 .step.pending .step-glyph { color: var(--faint); }
 .step.done .step-text { color: var(--faint); text-decoration: line-through; text-decoration-color: #ffffff30; }
 .step.waiting-here .step-glyph { color: var(--wait); }
-.step-text { flex: 1; overflow-wrap: anywhere; }
+.step-text { flex: 1; min-width: 0; overflow-wrap: anywhere; }
 .step-type { color: var(--faint); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; flex: none; }
-.step-tools { display: flex; gap: 2px; flex: none; }
+.step-tools { display: flex; gap: 2px; flex: none; margin-left: auto; }
 
-/* Dependency chips on a step: `#id` (a waitsFor target), `⧗ refs` (what this
-   step waits on) and `⏰ when` (a §23 time/date/rule schedule gate). Small,
-   monospace, non-shrinking so they read as metadata. */
+/* Dependency chips on a step: `#id` (a waitsFor target), `⧗ ref` (one chip per
+   ref this step waits on) and `⏰ when` (a §23 time/date/rule schedule gate).
+   They sit on the wrapping meta row under the text; a lone chip wider than the
+   lane breaks internally rather than overflowing. */
 .step-id, .step-waits, .step-when {
-  font-size: 10px; flex: none; border-radius: 3px; padding: 0 4px;
-  border: 1px solid var(--line-strong);
+  font-size: 10px; max-width: 100%; border-radius: 3px; padding: 0 4px;
+  border: 1px solid var(--line-strong); overflow-wrap: anywhere;
 }
 .step-id { color: var(--dim); letter-spacing: 0.04em; }
-.step-waits { color: var(--wait); border-color: #2b5560; overflow-wrap: anywhere; }
-.step-when { color: var(--wait); border-color: #2b5560; overflow-wrap: anywhere; }
+.step-waits { color: var(--wait); border-color: #2b5560; }
+.step-when { color: var(--wait); border-color: #2b5560; }
 
 .lane-default { color: var(--dim); font-size: 11px; padding: 4px 0; }
 .lane-default::before { content: "↻ "; color: var(--faint); }

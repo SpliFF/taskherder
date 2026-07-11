@@ -168,11 +168,12 @@ function laneHtml(p, lane) {
     // point at it with the ⧗ glyph so it's clear WHICH step is blocked on a dep.
     const waitingHere = i === lane.cursor && waiting;
     const glyph = active ? GLYPH.running : (waitingHere ? GLYPH.waiting : (GLYPH[s.status] || '·'));
-    // Dependency chips: `#id` marks a step other lanes can wait on; `⧗ refs`
-    // marks a step that itself waits on those refs.
+    // Dependency chips: `#id` marks a step other lanes can wait on; `⧗ ref`
+    // marks a step that itself waits on that ref — one chip PER ref, so a step
+    // with several blockers wraps chip-by-chip instead of one unbreakable run.
     const idChip = s.id ? `<span class="step-id" title="step label — other lanes can wait on this (waitsFor target)">#${esc(s.id)}</span>` : '';
-    const waitsChip = s.waitsFor?.length
-      ? `<span class="step-waits" title="won't run until these land: ${esc(s.waitsFor.join(', '))}">⧗ ${esc(s.waitsFor.join(', '))}</span>` : '';
+    const waitsChips = s.waitsFor?.length
+      ? s.waitsFor.map((r) => `<span class="step-waits" title="won't run until this lands: ${esc(r)}">⧗ ${esc(r)}</span>`).join('') : '';
     // A `when` schedule chip (DESIGN §23): advertises a time/date-window or rule
     // gate on a queued step even before its lane is actively waiting on it.
     const whenChip = s.whenLabel
@@ -184,12 +185,22 @@ function laneHtml(p, lane) {
         <button class="btn ghost" title="Edit this step's prompt/command" data-action="step-edit" data-lane="${esc(lane.name)}" data-idx="${i}" data-type="${esc(s.type)}">✎</button>
         <button class="btn ghost" title="Remove this step from the queue" data-action="step-del" data-lane="${esc(lane.name)}" data-idx="${i}">✕</button>
       </span>` : '';
+    // Two-line step layout: the text line owns the full width (only the tiny
+    // type tag shares it), chips + tool buttons live on a wrapping meta row
+    // BELOW — so neither long blockers nor the button cluster can ever squeeze
+    // the task text into a one-character-wide column.
+    const chips = `${idChip}${waitsChips}${whenChip}`;
+    const meta = (chips || tools) ? `<div class="step-meta">${chips}${tools}</div>` : '';
     return `<li class="step ${esc(s.status)}${waitingHere ? ' waiting-here' : ''}">
       <span class="step-idx">${i}</span>
       <span class="step-glyph">${glyph}</span>
-      <span class="step-text">${esc(s.summary)}</span>
-      ${idChip}${waitsChip}${whenChip}
-      <span class="step-type">${esc(s.type)}</span>${tools}
+      <div class="step-main">
+        <div class="step-line">
+          <span class="step-text">${esc(s.summary)}</span>
+          <span class="step-type">${esc(s.type)}</span>
+        </div>
+        ${meta}
+      </div>
     </li>`;
   }).join('');
 
