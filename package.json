@@ -1,6 +1,6 @@
 {
   "name": "taskherder",
-  "version": "0.1.5",
+  "version": "0.1.6",
   "description": "Herd scheduled task lanes across projects, containers, and hosts — run OS commands and AI agents (Claude/Codex/Copilot) on a schedule, with manual gates, git-branch isolation, per-account auth, and an optional web console.",
   "type": "module",
   "bin": {
