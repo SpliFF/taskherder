@@ -110,6 +110,23 @@ function renderTemplate(str, vars) {
   return String(str).replace(/\{(\w+)\}/g, (m, k) => (vars[k] != null ? String(vars[k]) : m));
 }
 
+// The resolved `-v` mount VALUE strings for a docker IMAGE runner (host:ctr[:ro]).
+// Shared by wrapForRunner's ephemeral `run --rm` branch and the executor's M11b
+// persistent-container create + signature, so an ephemeral and a persistent lane
+// mount an identical set (and the signature that guards drift matches reality).
+export function dockerImageMounts(runner, {
+  worktree, repo, laneName, tasksMount = null, pkgMount = null,
+} = {}) {
+  const specs = runner.mounts && runner.mounts.length
+    ? runner.mounts
+    : (worktree ? [`{worktree}:${runner.workdir || '/work'}`] : []);
+  const out = specs.map((m) => renderTemplate(m, { worktree, repo, lane: laneName }));
+  // §26 two-mount seam: the herd's .tasks/ (rw) + this package (ro).
+  if (tasksMount) out.push(`${tasksMount.hostPath}:${tasksMount.containerPath}`);
+  if (pkgMount) out.push(`${pkgMount.hostPath}:${pkgMount.containerPath}:ro`);
+  return out;
+}
+
 // Wraps the inner invocation for the resolved runner. Returns the concrete spawn
 // spec the executor hands to node-pty:
 //   { file, args, env, cwd, warnings }
@@ -138,9 +155,17 @@ function renderTemplate(str, vars) {
 // (TASKHERD_REPO=/taskherd, git safe.directory) — never secrets, which still
 // cross by name only. `mcpMounts` true silences the §11/§26 ai-in-runner
 // stand-in (the tasks_* tools ARE reachable via the mount).
+// `execContainer` (DESIGN §26 M11b): the name of a taskherd-managed PERSISTENT
+// per-lane container to `docker exec` this step into (created earlier this fire
+// by the executor). Its mounts are create-time only, so exec adds none — all env
+// crosses per-exec. `execWorkdir` is the in-container cwd (the mount point the
+// clone lives at). `ephemeralName`/`ephemeralLabels` name + label an EPHEMERAL
+// `run --rm` container so a timed-out fire can `docker kill` it (killing the local
+// client alone orphans it — DESIGN §12) and gc can sweep a crash-leftover.
 export function wrapForRunner(runner, {
   file, args, extraEnv = {}, cwd, worktree, repo, laneName, isAi = false, taskherdEnv = {}, tty = true,
   portBase = null, tasksMount = null, pkgMount = null, containerEnvInline = {}, mcpMounts = false,
+  execContainer = null, execWorkdir = null, ephemeralName = null, ephemeralLabels = {},
 } = {}) {
   const warnings = [];
   const extraKeys = Object.keys(extraEnv);
@@ -178,7 +203,18 @@ export function wrapForRunner(runner, {
     // the profile env (the value never lands on the recorded argv).
     const ttyEnv = { ...process.env, ...extraEnv, ...portEnv };
     const envNames = [...extraKeys, ...Object.keys(portEnv)];
-    if (runner.container) {
+    if (execContainer) {
+      // §26 M11b: exec the step into the taskherd-managed PERSISTENT per-lane
+      // container. Mounts were set at create time, so exec carries none; ALL env
+      // crosses per-exec — `-e NAME` for secrets (value from the client env) and
+      // `-e KEY=VALUE` for in-container paths/config (TASKHERD_REPO, git safe.dir).
+      dargs.push('exec', '-i');
+      if (tty) dargs.push('-t');
+      if (execWorkdir) dargs.push('-w', execWorkdir);
+      for (const k of envNames) dargs.push('-e', k);
+      for (const k of inlineKeys) dargs.push('-e', `${k}=${containerEnvInline[k]}`);
+      dargs.push(execContainer);
+    } else if (runner.container) {
       // Exec into a running, user-managed container. The worktree mapping is the
       // user's responsibility; use runner.workdir if given, else the container's.
       dargs.push('exec', '-i');
@@ -189,17 +225,16 @@ export function wrapForRunner(runner, {
     } else if (runner.image) {
       // Ephemeral container with the worktree bind-mounted in. --rm so it doesn't
       // pile up; each fire is a fresh, isolated home/keychain (§11's strongest
-      // multi-account isolation).
+      // multi-account isolation). A --name + repo/lane labels (§26 M11b) let a
+      // timed-out fire `docker kill` it and gc sweep any crash-leftover.
       dargs.push('run', '--rm', '-i');
       if (tty) dargs.push('-t');
-      const mounts = runner.mounts && runner.mounts.length
-        ? runner.mounts
-        : (worktree ? [`{worktree}:${runner.workdir || '/work'}`] : []);
-      for (const m of mounts) dargs.push('-v', renderTemplate(m, { worktree, repo, lane: laneName }));
-      // §26 two-mount seam: the herd's .tasks/ (rw) + this package (ro) so an
-      // in-container taskherd-mcp writes coordination state back to the host.
-      if (tasksMount) dargs.push('-v', `${tasksMount.hostPath}:${tasksMount.containerPath}`);
-      if (pkgMount) dargs.push('-v', `${pkgMount.hostPath}:${pkgMount.containerPath}:ro`);
+      if (ephemeralName) dargs.push('--name', ephemeralName);
+      for (const [k, v] of Object.entries(ephemeralLabels)) dargs.push('--label', `${k}=${v}`);
+      const mounts = dockerImageMounts(runner, {
+        worktree, repo, laneName, tasksMount, pkgMount,
+      });
+      for (const m of mounts) dargs.push('-v', m);
       if (runner.workdir) dargs.push('-w', runner.workdir);
       for (const k of envNames) dargs.push('-e', k);
       // In-container paths/config by VALUE (not secrets): TASKHERD_REPO=/taskherd,

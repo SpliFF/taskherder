@@ -17,18 +17,22 @@ import { promisify } from 'node:util';
 import path from 'node:path';
 import pty from 'node-pty';
 import {
-  logsDir, runtimeDir, runSocketPath, runSocketLink, repoTasksDir, runDir, lanePortBase,
+  logsDir, runtimeDir, runSocketPath, runSocketLink, repoTasksDir, runDir, lanePortBase, repoId,
 } from './paths.mjs';
 import { appendEvent } from './events.mjs';
 import { resolveProvider, renderInvocation, parseCost } from './providers.mjs';
-import { resolveRunner, wrapForRunner } from './runners.mjs';
+import { resolveRunner, wrapForRunner, dockerImageMounts } from './runners.mjs';
 import { loadProfile, profileEnv, isolationWarnings } from './profiles.mjs';
+import { loadProjectConfig, loadUserConfig } from './config.mjs';
 import {
   isGitRepo, ensureWorktree, ensureClone, ensureInplaceBranch, defaultBase, headCommit,
 } from './git.mjs';
 import {
   resolveContainerPlan, IN_CONTAINER_REPO, IN_CONTAINER_TASKS, IN_CONTAINER_PKG,
+  persistentAllowed, containerName, ephemeralContainerName, containerSignature,
+  REPO_LABEL, LANE_LABEL,
 } from './containers.mjs';
+import { ensurePersistentContainer, restartContainer, killContainer } from './containers-docker.mjs';
 import { distillStreamJson } from './render.mjs';
 
 const execFileP = promisify(execFile);
@@ -390,16 +394,27 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   const { isolation, workdir } = await resolveWorkdir(repo, lane, resolvedConfig || {});
   const runner = await resolveRunner(resolvedConfig?.runner);
 
+  // The `persistent` lifecycle (§26 rule 1) is operator-gated on
+  // `containers.allowPersistent`. Only load the config to check the flag when a
+  // step actually asks for persistent — non-container fires pay nothing.
+  let allowPersistent = false;
+  if (resolvedConfig?.lifecycle === 'persistent') {
+    const [projectConfig, userConfig] = await Promise.all([loadProjectConfig(repo), loadUserConfig()]);
+    allowPersistent = persistentAllowed(projectConfig, userConfig);
+  }
+
   // §26 validation matrix + attribute resolution — needs BOTH isolation and the
   // resolved runner, so it runs after both. Throws a setup error on an
-  // incoherent/operator-gated combination (worktree+image, persistent, volume,
-  // socket/http), which parks the lane (M2 path) rather than running it wrong.
+  // incoherent/operator-gated combination (worktree+image, gated-off persistent,
+  // volume, socket/http), which parks the lane (M2 path) rather than running it
+  // wrong. `plan.persistent` is true for a gate-approved persistent lane.
   const plan = resolveContainerPlan({
     isolation,
     runner,
     lifecycle: resolvedConfig?.lifecycle,
     mcpTransport: resolvedConfig?.mcpTransport,
     isAi: step.type === 'ai',
+    allowPersistent,
   });
   for (const w of plan.warnings) console.error(w);
 
@@ -455,6 +470,54 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     containerEnvInline.GIT_CONFIG_VALUE_0 = '*';
   }
 
+  // §26 M11b: a docker-image lane's timed-out step must be killed INSIDE the
+  // container — killing the local `docker run`/`docker exec` client leaves the
+  // in-container process orphaned (verified live, §12). `containerKill` names the
+  // docker-level escalation the timeout handler runs after the client SIGKILL:
+  //   persistent → `docker restart -t 0 <name>` (nukes the runaway; the container
+  //                + its persistent state survive → next fire execs in as normal)
+  //   ephemeral  → `docker kill <name>` (--rm then auto-removes it)
+  let execContainer = null;
+  let execWorkdir = null;
+  let ephemeralName = null;
+  let ephemeralLabels = {};
+  let containerKill = null;
+  if (plan.dockerImage) {
+    const rid = repoId(repo);
+    const cWorkdir = runner.workdir || '/work';
+    if (plan.persistent) {
+      // taskherd owns ONE long-lived container per lane. It always mounts the FULL
+      // §26 seam (clone + .tasks/ rw + package ro) regardless of this step's type,
+      // so a lane mixing command + ai steps keeps ONE stable-signature container
+      // instead of thrashing it (the mounts are create-time only). The in-container
+      // TASKHERD_* paths ride per-exec so an ai step finalizes even after a command.
+      const persistTasksMount = { hostPath: repoTasksDir(repo), containerPath: IN_CONTAINER_TASKS };
+      const persistPkgMount = { hostPath: PACKAGE_ROOT, containerPath: IN_CONTAINER_PKG };
+      const mounts = dockerImageMounts(runner, {
+        worktree: workdir, repo: path.resolve(repo), laneName: lane.name,
+        tasksMount: persistTasksMount, pkgMount: persistPkgMount,
+      });
+      const signature = containerSignature({ image: runner.image, mounts, workdir: cWorkdir });
+      const name = containerName(rid, lane.name);
+      const ensured = await ensurePersistentContainer({
+        name, image: runner.image, mounts, workdir: cWorkdir,
+        dockerArgs: runner.dockerArgs || [], signature, repoIdStr: rid, lane: lane.name,
+      });
+      console.error(`taskherd: lane ${lane.name} persistent container ${name} — ${ensured.action} (${ensured.reason})`);
+      execContainer = name;
+      execWorkdir = cWorkdir;
+      containerKill = { mode: 'restart', name };
+      containerEnvInline.TASKHERD_REPO = IN_CONTAINER_REPO;
+      containerEnvInline.TASKHERD_LANE = lane.name;
+    } else {
+      // Ephemeral image lane: name + label the `run --rm` so a timed-out fire can
+      // `docker kill` it and gc can sweep a crash-leftover by its repo/lane labels.
+      ephemeralName = ephemeralContainerName(rid, lane.name, id.slice(0, 8));
+      ephemeralLabels = { [REPO_LABEL]: rid, [LANE_LABEL]: lane.name };
+      containerKill = { mode: 'kill', name: ephemeralName };
+    }
+  }
+
   const { file: innerFile } = invocation; // the provider/shell command, for the cost message
   const spawnSpec = wrapForRunner(runner, {
     file: invocation.file,
@@ -476,6 +539,12 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
     pkgMount,
     containerEnvInline,
     mcpMounts: mcpMode === 'container-mount',
+    // §26 M11b: exec into the persistent per-lane container, or name/label the
+    // ephemeral one (both no-ops for local/ssh/user-container runners).
+    execContainer,
+    execWorkdir,
+    ephemeralName,
+    ephemeralLabels,
   });
   for (const w of spawnSpec.warnings) console.error(w);
   const { file, args } = spawnSpec;
@@ -589,6 +658,21 @@ export async function runStep(repo, lane, step, index, resolvedConfig) {
   });
   clearTimeout(timer);
   if (killTimer) clearTimeout(killTimer);
+
+  // §12-CRITICAL (verified live): killing the local docker client — whether it
+  // exits on our SIGTERM or the follow-up SIGKILL — does NOT kill the process
+  // running INSIDE the container. So a timed-out container step must ALWAYS be
+  // escalated at the docker level (not conditionally in the kill timer, which the
+  // promptly-exiting client would clear before it fires): `docker restart -t 0`
+  // for a persistent lane (nukes the runaway; the container + its state survive)
+  // or `docker kill` for an ephemeral one (--rm then reaps). Awaited before we
+  // return so a one-shot `taskherd run` can't exit before the orphan is cleared.
+  if (timedOut && containerKill) {
+    const run = containerKill.mode === 'restart' ? restartContainer : killContainer;
+    await run(containerKill.name).catch((err) => {
+      console.error(`taskherd: in-container ${containerKill.mode} of ${containerKill.name} failed after timeout: ${err.message} — a process may still be running inside (DESIGN §12)`);
+    });
+  }
   const durationMs = Date.now() - startedAt;
 
   logStream.end();

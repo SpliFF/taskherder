@@ -69,12 +69,16 @@ Start with `tasks_status` to see the lane tree as it is now.
   (a plain `worktree` cannot do git in a container — its `.git` is a host path).
   `lifecycle` defaults to **`ephemeral`** (a fresh `docker run --rm` per fire —
   the safe default); **prefer `persistent`** for a stable, single-account,
-  install-heavy lane once it ships (it keeps `node_modules`/caches warm between
-  fires) — but it is **operator-gated and lands in M11b**, so `tasks_options`
-  will show whether it's permitted here, and selecting it before then parks the
-  lane. `mcpTransport: mount` (default) is what lets an in-container agent
-  finalize through `tasks_*`; it needs node in the image (else it degrades to a
-  loud stand-in). Land/diff work exactly as for a worktree lane.
+  install-heavy lane (a `bootstrap.generate`/`npm ci` cost is the tell) — it is
+  ONE taskherd-managed container per lane, so `node_modules`/caches/`generate`
+  output stay **warm between fires** instead of rebuilding each time. It is
+  **operator-gated** (`containers.allowPersistent`): call `tasks_options` to see
+  whether it's permitted here — selecting it where it isn't parks the lane.
+  Caveat: persistent state is **shared across fires**, so a poisoned cache or a
+  half-written dep persists too — `taskherd gc` (which reaps the container with
+  the clone) is the reset. `mcpTransport: mount` (default) is what lets an
+  in-container agent finalize through `tasks_*`; it needs node in the image (else
+  it degrades to a loud stand-in). Land/diff work exactly as for a worktree lane.
 - **Keep the plan and the lane tree consistent.** The lane tree is the
   *executable projection* of the plan's "Next up / Open threads": a thread you
   gated should be marked as gated in the plan file, and vice versa — never

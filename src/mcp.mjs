@@ -110,7 +110,7 @@ const LANE_PROPS = {
   asDefault: { type: 'boolean', description: 'Set the step as the lane\'s recurring default (runs every fire once the queue is empty) instead of appending it.' },
   parallel: { type: 'boolean', description: 'Parallel lanes (DESIGN §25): false pins this lane to the SERIAL slot — it only runs when nothing else is running and blocks admission while it runs. Only meaningful when the repo config sets parallel.max > 1.' },
   mutex: { type: 'array', items: { type: 'string' }, description: 'Shared-resource tags (DESIGN §25): two lanes sharing a tag never run concurrently (e.g. ["live-server", "db"]). Declare a tag for every resource isolation cannot prove disjoint — a port, one external DB, a rate-limited account. Only enforced when parallel.max > 1.' },
-  lifecycle: { type: 'string', enum: LIFECYCLES, description: 'Container lifetime (DESIGN §26), meaningful only with a docker image runner. `ephemeral` (DEFAULT, safe) = a fresh `docker run --rm` per fire. `persistent` (a taskherd-managed per-lane container — faster steady state for install-heavy lanes) is OPERATOR-GATED and lands in M11b; selecting it now parks the lane loudly. `volume` is deferred. Prefer `persistent` where it is safe once available; call tasks_options for what this repo permits.' },
+  lifecycle: { type: 'string', enum: LIFECYCLES, description: 'Container lifetime (DESIGN §26), meaningful only with a docker image runner. `ephemeral` (DEFAULT, safe) = a fresh `docker run --rm` per fire. `persistent` (a taskherd-managed per-lane container — keeps node_modules/caches/generate output warm between fires, faster steady state for install-heavy lanes) is OPERATOR-GATED on `containers.allowPersistent`; where permitted, prefer it for a stable, single-account, install-heavy lane (persistent state is shared across fires — gc resets it). `volume` is deferred. Selecting a gated-off value parks the lane loudly; call tasks_options for what this repo permits.' },
   mcpTransport: { type: 'string', enum: MCP_TRANSPORTS, description: 'How an in-container agent\'s tasks_* tools reach the herd (DESIGN §26), meaningful only for an ai step under a non-local runner. `mount` (DEFAULT, local docker only) = the herd\'s .tasks/ is bind-mounted and an in-container taskherd-mcp writes it. `none` = no tools (node-less image). `socket`/`http` are deferred network bridges. RISKY values may be operator-gated here — call tasks_options.' },
 };
 
@@ -268,10 +268,10 @@ async function optionsCatalog(repo) {
       default: DEFAULT_LIFECYCLE,
       values: LIFECYCLES,
       gated: {
-        persistent: { allowed: allowPersistent, note: 'operator-gated (config containers.allowPersistent) AND not yet implemented — lands in M11b; selecting it now parks the lane.' },
+        persistent: { allowed: allowPersistent, note: 'a taskherd-managed per-lane container (node_modules/caches/generate output survive between fires). Operator-gated on config containers.allowPersistent — permitted here only if allowed:true; selecting it where gated off parks the lane.' },
         volume: { allowed: false, note: 'deferred value (DESIGN §26).' },
       },
-      note: 'Prefer persistent where safe (stable, single-account, install-heavy lane) once M11b ships; ephemeral is the safe default until then.',
+      note: 'Prefer persistent where it is permitted (allowed:true) and safe — a stable, single-account, install-heavy lane; ephemeral (the safe default) rebuilds each fire. Persistent state is shared across fires (gc reaps the container with the clone to reset).',
     },
     mcpTransport: {
       default: DEFAULT_MCP_TRANSPORT,

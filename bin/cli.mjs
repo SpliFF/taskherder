@@ -13,8 +13,11 @@ import { parseArgs } from 'node:util';
 import { spawnSync } from 'node:child_process';
 
 import {
-  repoTasksDir, pausedFile, runSocketPath, profileDir, profileFile,
+  repoTasksDir, pausedFile, runSocketPath, profileDir, profileFile, laneFile, clonePath,
 } from '../src/paths.mjs';
+import { readRunningSet } from '../src/admission.mjs';
+import { containerGcPlan } from '../src/containers.mjs';
+import { listRepoContainers, removeContainer } from '../src/containers-docker.mjs';
 import {
   initTasksDir, ackLane, addStep, forkLane, loadAllLanesResilient,
 } from '../src/tasks.mjs';
@@ -352,12 +355,34 @@ async function cmdGc(argv) {
   }
   const projectConfig = await loadProjectConfig(repo);
   const report = await gcWorktrees(repo, projectConfig.base || null);
-  if (report.length === 0) {
-    console.log('taskherd: no worktrees');
-    return;
-  }
   for (const r of report) {
     console.log(`  ${r.action === 'removed' ? '✓' : '·'} ${r.lane}: ${r.action} — ${r.reason}`);
+  }
+
+  // §26 M11b: reap taskherd-managed containers alongside their clones (the same
+  // clean-AND-merged-or-deleted gate gcWorktrees applied) + a label-based orphan
+  // sweep, but NEVER a container whose lane has a live §25 run manifest.
+  const containers = await listRepoContainers(repo);
+  if (containers.length) {
+    const running = await readRunningSet(repo, { reap: false });
+    const runningLanes = new Set(running.running.map((m) => m.lane));
+    const laneFiles = new Set(containers.map((c) => c.lane).filter((lane) => lane && existsSync(laneFile(repo, lane))));
+    const clones = new Set(containers.map((c) => c.lane).filter((lane) => lane && existsSync(path.join(clonePath(repo, lane), '.git'))));
+    const plan = containerGcPlan({
+      containers, laneFiles, clones, runningLanes,
+    });
+    for (const p of plan) {
+      if (p.action === 'reap') {
+        await removeContainer(p.name);
+        console.log(`  ✓ ${p.lane || p.name}: container removed — ${p.reason}`);
+      } else {
+        console.log(`  · ${p.lane || p.name}: container kept — ${p.reason}`);
+      }
+    }
+  }
+
+  if (report.length === 0 && containers.length === 0) {
+    console.log('taskherd: no worktrees');
   }
 }
 
@@ -958,6 +983,18 @@ async function cmdDoctor(argv = []) {
       } catch (err) {
         problems += 1;
         console.log(`  ✗ bootstrap manifest (${scope}): ${err.message}`);
+      }
+    }
+
+    // §26 M11b: taskherd-managed per-lane containers (persistent lifecycle) and
+    // any ephemeral leftovers. Empty when docker is absent (no lines). An
+    // orphan (lane gone) or a stopped container is a `·` advisory, not a problem.
+    for (const c of await listRepoContainers(repo)) {
+      const laneGone = !c.lane || !existsSync(laneFile(repo, c.lane));
+      if (laneGone) {
+        console.log(`  · orphaned container ${c.name} (${c.status}) — lane gone; \`taskherd gc\` reaps it`);
+      } else {
+        console.log(`  ✓ container ${c.name} (${c.status}) for lane '${c.lane}'`);
       }
     }
   }

@@ -1,9 +1,13 @@
 // Container lanes (DESIGN §26): the `lifecycle` and `mcpTransport` task
-// attributes, the validation matrix (§26 rule 2), and the fixed in-container
-// mount points. Pure/synchronous and dependency-light on purpose — the executor
-// does the async parts (the node-in-image probe, writing the merged mcp config),
-// and tasks.mjs/mcp.mjs consume the enums. No import from tasks/git/executor,
-// so this can be imported anywhere without a cycle.
+// attributes, the validation matrix (§26 rule 2), the fixed in-container mount
+// points, and the M11b `persistent` lifecycle state machine + container
+// identity/signature. Pure/synchronous and dependency-light on purpose — the
+// executor does the async parts (the node-in-image probe, writing the merged
+// mcp config), and the actual `docker` subprocesses live in containers-docker.mjs;
+// tasks.mjs/mcp.mjs consume the enums. Only imports node:crypto (for the
+// signature hash) — no import from tasks/git/executor, so this can be imported
+// anywhere without a cycle.
+import { createHash } from 'node:crypto';
 
 export const LIFECYCLES = ['ephemeral', 'persistent', 'volume'];
 export const MCP_TRANSPORTS = ['mount', 'none', 'socket', 'http'];
@@ -67,7 +71,7 @@ export function isDockerImageRunner(runner) {
 //   'none'            — no in-runner tools (loud FIDELITY-STANDIN already logged
 //                       for the ai case)
 export function resolveContainerPlan({
-  isolation, runner, lifecycle, mcpTransport, isAi = false,
+  isolation, runner, lifecycle, mcpTransport, isAi = false, allowPersistent = false,
 } = {}) {
   const warnings = [];
   const lc = parseLifecycle(lifecycle);
@@ -77,6 +81,7 @@ export function resolveContainerPlan({
   const runnerKind = runner?.kind || 'local';
   const dockerImage = isDockerImageRunner(runner);
   const anyDocker = runnerKind === 'docker';
+  let persistent = false;
 
   // Rule 2 — the reject that converts today's silent break into an actionable
   // park: a linked worktree's `.git` is a host-absolute pointer, so it cannot do
@@ -91,18 +96,25 @@ export function resolveContainerPlan({
   }
 
   // Rule 1 — lifecycle gating. `persistent`/`volume` only DO anything with a
-  // docker image runner; without one they are inert (warn, don't park). With
-  // one, they are refused in M11a: `persistent` is operator-gated + unimplemented
-  // (lands in M11b); `volume` is a deferred value.
+  // docker image runner; without one they are inert (warn, don't park). With a
+  // docker image runner, `persistent` (M11b: a taskherd-managed per-lane
+  // container) is OPERATOR-GATED: it proceeds only when the repo/user config
+  // opted in via `containers.allowPersistent` — otherwise the lane parks loudly
+  // (the §15 `serve --allow-shell` posture). `volume` is a deferred value.
   if (effLifecycle === 'persistent') {
     if (dockerImage) {
-      throw new Error(
-        'taskherd: lifecycle \'persistent\' is operator-gated and not yet implemented — it lands '
-        + 'in M11b (a taskherd-managed per-lane container). Use \'ephemeral\' (the safe default) '
-        + '(DESIGN §26 rule 1).',
-      );
+      if (!allowPersistent) {
+        throw new Error(
+          'taskherd: lifecycle \'persistent\' is operator-gated — set "containers": '
+          + '{ "allowPersistent": true } in .tasks/config.json (or ~/.taskherd/config.json) to '
+          + 'enable a taskherd-managed per-lane container. Until then use \'ephemeral\' (the safe '
+          + 'default) (DESIGN §26 rule 1).',
+        );
+      }
+      persistent = true;
+    } else {
+      warnings.push(`taskherd: lifecycle 'persistent' has no effect without a docker image runner — ignored (DESIGN §26 rule 2).`);
     }
-    warnings.push(`taskherd: lifecycle 'persistent' has no effect without a docker image runner — ignored (DESIGN §26 rule 2).`);
   }
   if (effLifecycle === 'volume') {
     if (dockerImage) {
@@ -144,6 +156,108 @@ export function resolveContainerPlan({
   }
 
   return {
-    lifecycle: effLifecycle, mcpTransport: effTransport, mcpMode, dockerImage, warnings,
+    lifecycle: effLifecycle, mcpTransport: effTransport, mcpMode, dockerImage, persistent, warnings,
   };
+}
+
+// ── M11b: the `persistent` lifecycle (DESIGN §26) ───────────────────────────
+// taskherd owns ONE long-lived container per lane: created on the first fire,
+// `docker exec`'d on subsequent fires, `docker start`ed if it was stopped, and
+// loudly RECREATED when its signature drifts (image/mounts/workdir changed) so a
+// stale container is never silently reused. The docker calls live in
+// containers-docker.mjs; the DECISION is this pure function (peer of
+// admission.mjs's `admissible`), unit-testable without a docker daemon.
+
+// The keep-alive PID 1 for a per-lane container: it must stay up between fires
+// (with nothing to do) so `docker exec` has something to exec into.
+export const KEEP_ALIVE = ['tail', '-f', '/dev/null'];
+
+// Decide what to do with a per-lane container given its observed state and the
+// wanted signature. Returns { action: create|start|exec|recreate, reason }.
+//   missing                 → create   (docker run -d + keep-alive)
+//   signature drift          → recreate (rm -f + create; loud)
+//   stopped (sig matches)    → start    (docker start, then exec)
+//   running (sig matches)    → exec     (reuse — the fast steady state)
+export function nextContainerAction({
+  exists, running, currentSignature, wantedSignature,
+} = {}) {
+  if (!exists) return { action: 'create', reason: 'no per-lane container yet' };
+  if (currentSignature !== wantedSignature) {
+    return {
+      action: 'recreate',
+      reason: `container signature drift (image/mounts/workdir changed: ${currentSignature || '∅'} → ${wantedSignature}) — recreating`,
+    };
+  }
+  if (running) return { action: 'exec', reason: 'reusing the running per-lane container' };
+  return { action: 'start', reason: 'per-lane container was stopped — starting it' };
+}
+
+// Deterministic per-lane container name: `taskherd-<repoId>-<lane>`, sanitized
+// to docker's name charset ([a-zA-Z0-9][a-zA-Z0-9_.-]*). The `taskherd-` prefix
+// guarantees a valid leading char even if repoId/lane sanitize to empty.
+export function containerName(repoIdStr, laneName) {
+  const raw = `taskherd-${repoIdStr}-${laneName}`;
+  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-');
+}
+
+// A unique name for an EPHEMERAL (`docker run --rm`) container so a timed-out
+// fire can `docker kill` it (killing the local client alone orphans it — verified
+// live, DESIGN §12). The run token keeps parallel/successive fires disjoint.
+export function ephemeralContainerName(repoIdStr, laneName, token) {
+  const raw = `taskherd-eph-${repoIdStr}-${laneName}-${token}`;
+  return raw.replace(/[^a-zA-Z0-9_.-]/g, '-').slice(0, 120);
+}
+
+// The signature label = a hash of everything that, if changed, means the running
+// container is stale (its mounts are create-time only, so a changed mount set
+// can't be applied to a live container — it must be recreated). Sorted mounts so
+// ordering never causes a spurious drift.
+export function containerSignature({ image, mounts = [], workdir = '' } = {}) {
+  const canon = JSON.stringify({ image, mounts: [...mounts].sort(), workdir });
+  return createHash('sha256').update(canon).digest('hex').slice(0, 16);
+}
+
+// Docker labels for a taskherd-managed container: repo + lane make orphan
+// discovery (`docker ps --filter label=`) possible; signature drives recreate.
+export const REPO_LABEL = 'taskherd.repo';
+export const LANE_LABEL = 'taskherd.lane';
+export const SIGNATURE_LABEL = 'taskherd.signature';
+export const EPHEMERAL_PREFIX = 'taskherd-eph-';
+export function containerLabels(repoIdStr, laneName, signature) {
+  return {
+    [REPO_LABEL]: repoIdStr,
+    [LANE_LABEL]: laneName,
+    [SIGNATURE_LABEL]: signature,
+  };
+}
+
+// The gc decision for taskherd-labeled containers, pure + unit-testable (the CLI
+// gathers the docker/fs facts and applies the actions). Rules (DESIGN §26 M11b):
+//   1. NEVER touch a container whose lane has a live §25 run manifest — a fire is
+//      using it (the running-footprint interlock).
+//   2. An EPHEMERAL leftover (name `taskherd-eph-…`) should not exist (`--rm`
+//      reaps on exit); a survivor is a crash artifact → reap.
+//   3. A PERSISTENT container follows the clone: reap when its lane is gone OR its
+//      clone was reaped (merged/absent) — the same clean-AND-merged-or-deleted
+//      gate gcWorktrees applies to the clone; keep it while the lane is active.
+export function containerGcPlan({
+  containers = [], laneFiles = new Set(), clones = new Set(), runningLanes = new Set(),
+} = {}) {
+  return containers.map((c) => {
+    const { name } = c;
+    const lane = c.lane || '';
+    if (runningLanes.has(lane)) {
+      return { name, lane, action: 'keep', reason: 'live run manifest (§25 footprint interlock)' };
+    }
+    if (name.startsWith(EPHEMERAL_PREFIX)) {
+      return { name, lane, action: 'reap', reason: 'ephemeral container leftover (crash artifact)' };
+    }
+    if (!laneFiles.has(lane)) {
+      return { name, lane, action: 'reap', reason: 'lane gone (orphan)' };
+    }
+    if (!clones.has(lane)) {
+      return { name, lane, action: 'reap', reason: 'clone reaped/absent' };
+    }
+    return { name, lane, action: 'keep', reason: 'active lane, clone present' };
+  });
 }

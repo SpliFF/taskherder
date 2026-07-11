@@ -24,6 +24,8 @@ import { wrapForRunner } from '../src/runners.mjs';
 import {
   resolveContainerPlan, parseLifecycle, parseMcpTransport,
   IN_CONTAINER_TASKS, IN_CONTAINER_REPO, IN_CONTAINER_PKG,
+  nextContainerAction, containerName, ephemeralContainerName, containerSignature,
+  containerGcPlan, EPHEMERAL_PREFIX,
 } from '../src/containers.mjs';
 
 const commandStep = (run) => ({ type: 'command', run, status: 'pending' });
@@ -71,19 +73,39 @@ test('§26 matrix: local runner → host mcp; clone+local is allowed (pristine h
   assert.equal(p.warnings.length, 0);
 });
 
-test('§26 matrix: persistent lifecycle is operator-gated (parks) on a docker image runner', () => {
+test('§26 M11b: persistent lifecycle is operator-gated — parks OFF, proceeds ON', () => {
+  // gate OFF (default): a loud park naming the allow-flag (a test locks the
+  // wording so the gate can't silently open).
   assert.throws(
     () => resolveContainerPlan({ isolation: 'clone', runner: IMAGE, lifecycle: 'persistent' }),
-    /lifecycle 'persistent' is operator-gated.*M11b/s,
+    /lifecycle 'persistent' is operator-gated.*containers.*allowPersistent/s,
   );
-  // volume is a deferred value
+  assert.throws(
+    () => resolveContainerPlan({
+      isolation: 'clone', runner: IMAGE, lifecycle: 'persistent', allowPersistent: false,
+    }),
+    /operator-gated/,
+  );
+  // gate ON: proceeds, plan.persistent === true
+  const on = resolveContainerPlan({
+    isolation: 'clone', runner: IMAGE, lifecycle: 'persistent', allowPersistent: true, isAi: true,
+  });
+  assert.equal(on.persistent, true);
+  assert.equal(on.lifecycle, 'persistent');
+  assert.equal(on.mcpMode, 'container-mount');
+  // the default/ephemeral path is never "persistent"
+  assert.equal(resolveContainerPlan({ isolation: 'clone', runner: IMAGE, isAi: true }).persistent, false);
+  // volume is still a deferred value
   assert.throws(
     () => resolveContainerPlan({ isolation: 'clone', runner: IMAGE, lifecycle: 'volume' }),
     /lifecycle 'volume' is a deferred value/,
   );
-  // …but inert (warn, not park) without a docker image runner
-  const p = resolveContainerPlan({ isolation: 'clone', runner: LOCAL, lifecycle: 'persistent' });
-  assert.match(p.warnings.join('\n'), /no effect without a docker image runner/);
+  // persistent is inert (warn, not park) without a docker image runner — even ON
+  const inert = resolveContainerPlan({
+    isolation: 'clone', runner: LOCAL, lifecycle: 'persistent', allowPersistent: true,
+  });
+  assert.equal(inert.persistent, false);
+  assert.match(inert.warnings.join('\n'), /no effect without a docker image runner/);
 });
 
 test('§26 matrix: socket/http transports are deferred (park)', () => {
@@ -292,4 +314,114 @@ test('§26: ensureClone records the base in the MAIN repo so land/diff resolve i
   const recorded = await gitIn(repo, 'config', 'branch.taskherd/cl.taskherdbase');
   assert.equal(recorded, 'main');
   assert.ok(existsSync(laneFile(repo, 'cl')) === false, 'ensureClone does not create a lane file');
+});
+
+// ── M11b: the persistent lifecycle state machine (pure) ─────────────────────
+test('§26 M11b: nextContainerAction — missing→create, drift→recreate, stopped→start, running→exec', () => {
+  assert.deepEqual(
+    nextContainerAction({ exists: false, wantedSignature: 'a' }).action, 'create',
+  );
+  assert.equal(
+    nextContainerAction({
+      exists: true, running: true, currentSignature: 'old', wantedSignature: 'new',
+    }).action, 'recreate',
+  );
+  assert.equal(
+    nextContainerAction({
+      exists: true, running: false, currentSignature: 'a', wantedSignature: 'a',
+    }).action, 'start',
+  );
+  assert.equal(
+    nextContainerAction({
+      exists: true, running: true, currentSignature: 'a', wantedSignature: 'a',
+    }).action, 'exec',
+  );
+  // drift wins over running (a stale image/mount must never silently be reused)
+  assert.equal(
+    nextContainerAction({
+      exists: true, running: true, currentSignature: null, wantedSignature: 'a',
+    }).action, 'recreate',
+  );
+});
+
+// ── M11b: container identity + drift signature ──────────────────────────────
+test('§26 M11b: containerName / ephemeralContainerName sanitize to docker charset', () => {
+  assert.equal(containerName('repo-abcd1234', 'ci'), 'taskherd-repo-abcd1234-ci');
+  // odd repoId/lane chars collapse to '-'; the taskherd- prefix keeps a valid lead
+  assert.match(containerName('re po/x', 'a b'), /^taskherd-re-po-x-a-b$/);
+  assert.match(containerName('r', 'l'), /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/);
+  const eph = ephemeralContainerName('r', 'ci', 'deadbeef');
+  assert.ok(eph.startsWith(EPHEMERAL_PREFIX));
+  assert.match(eph, /^[a-zA-Z0-9][a-zA-Z0-9_.-]*$/);
+});
+
+test('§26 M11b: containerSignature is deterministic, mount-order-insensitive, drifts on change', () => {
+  const base = { image: 'node:20-alpine', mounts: ['/a:/x', '/b:/y'], workdir: '/work' };
+  const sig = containerSignature(base);
+  assert.equal(sig, containerSignature({ ...base, mounts: ['/b:/y', '/a:/x'] }), 'mount order does not matter');
+  assert.notEqual(sig, containerSignature({ ...base, image: 'node:22-alpine' }), 'image change drifts');
+  assert.notEqual(sig, containerSignature({ ...base, mounts: ['/a:/x'] }), 'mount set change drifts');
+  assert.notEqual(sig, containerSignature({ ...base, workdir: '/srv' }), 'workdir change drifts');
+});
+
+// ── M11b: gc plan — the clone gate + orphan sweep + the §25 interlock ────────
+test('§26 M11b: containerGcPlan honors the run-manifest interlock, reaps orphans/leftovers, keeps active', () => {
+  const containers = [
+    { name: 'taskherd-r-live', lane: 'live' }, // has a live manifest → keep
+    { name: 'taskherd-r-gone', lane: 'gone' }, // lane file gone → reap
+    { name: 'taskherd-r-noclone', lane: 'noclone' }, // clone reaped → reap
+    { name: 'taskherd-r-active', lane: 'active' }, // lane + clone present → keep
+    { name: 'taskherd-eph-r-active-abcd', lane: 'active' }, // ephemeral leftover → reap
+    { name: 'taskherd-eph-r-live-ef01', lane: 'live' }, // ephemeral but live manifest → keep
+  ];
+  const plan = containerGcPlan({
+    containers,
+    laneFiles: new Set(['noclone', 'active', 'live']),
+    clones: new Set(['active', 'live']),
+    runningLanes: new Set(['live']),
+  });
+  const by = Object.fromEntries(plan.map((p) => [p.name, p]));
+  assert.equal(by['taskherd-r-live'].action, 'keep');
+  assert.match(by['taskherd-r-live'].reason, /interlock/);
+  assert.equal(by['taskherd-r-gone'].action, 'reap');
+  assert.match(by['taskherd-r-gone'].reason, /lane gone/);
+  assert.equal(by['taskherd-r-noclone'].action, 'reap');
+  assert.match(by['taskherd-r-noclone'].reason, /clone reaped/);
+  assert.equal(by['taskherd-r-active'].action, 'keep');
+  assert.equal(by['taskherd-eph-r-active-abcd'].action, 'reap');
+  assert.match(by['taskherd-eph-r-active-abcd'].reason, /ephemeral/);
+  assert.equal(by['taskherd-eph-r-live-ef01'].action, 'keep', 'never reap a live lane container, even ephemeral');
+});
+
+// ── M11b: wrapForRunner exec-into-persistent + ephemeral naming ─────────────
+test('§26 M11b: wrapForRunner execs into a persistent container (no run/--rm/mounts/image)', () => {
+  const spec = wrapForRunner(IMAGE, {
+    file: 'sh', args: ['-c', 'echo hi'], laneName: 'ci',
+    execContainer: 'taskherd-r-ci', execWorkdir: '/work',
+    extraEnv: { ANTHROPIC_API_KEY: 'sek' },
+    containerEnvInline: { TASKHERD_REPO: IN_CONTAINER_REPO, GIT_CONFIG_COUNT: '1' },
+  });
+  assert.equal(spec.file, 'docker');
+  const argv = spec.args.join(' ');
+  assert.match(argv, /^exec -i -t -w \/work/);
+  assert.doesNotMatch(argv, /run|--rm|-v /); // exec adds no mounts, no --rm
+  assert.match(argv, /-e ANTHROPIC_API_KEY(?!=)/); // secret by NAME only (value off-argv)
+  assert.match(argv, new RegExp(`-e TASKHERD_REPO=${IN_CONTAINER_REPO}`)); // inline by value
+  assert.match(argv, /-e GIT_CONFIG_COUNT=1/);
+  assert.match(argv, /taskherd-r-ci sh -c echo hi/); // the named container, then the command
+  // secret value never lands on the recorded argv
+  assert.ok(!argv.includes('sek'));
+});
+
+test('§26 M11b: wrapForRunner names + labels an ephemeral run --rm (so timeout-kill/gc can find it)', () => {
+  const spec = wrapForRunner(IMAGE, {
+    file: 'sh', args: ['-c', 'true'], worktree: '/clone', repo: '/repo', laneName: 'ci',
+    ephemeralName: 'taskherd-eph-r-ci-abcd', ephemeralLabels: { 'taskherd.repo': 'r', 'taskherd.lane': 'ci' },
+  });
+  const argv = spec.args.join(' ');
+  assert.match(argv, /run --rm -i/);
+  assert.match(argv, /--name taskherd-eph-r-ci-abcd/);
+  assert.match(argv, /--label taskherd\.repo=r/);
+  assert.match(argv, /--label taskherd\.lane=ci/);
+  assert.match(argv, /-v \/clone:\/work/); // still bind-mounts the tree
 });
