@@ -5,7 +5,70 @@ based on [Keep a Changelog](https://keepachangelog.com/); versioning is
 [SemVer](https://semver.org/). Pre-1.0: minor versions may include breaking
 changes.
 
-## Unreleased
+## 0.1.7 — 2026-07-16
+
+> First release published to npm since 0.1.5 — the 0.1.6 version bump below
+> was committed but never published, so this release carries both sections.
+
+### Changed
+- **`/task` subsumes `/work` — the milestone loop merged into the bundled
+  skill.** Fired agents given bare-prose prompts behaved like plain sessions
+  and exited with **uncommitted work**, dirtying the tree for the next fire.
+  `/task` §1 now carries the full milestone discipline (verify claimed state
+  against reality before building — suites + `git status`, a dirty tree on
+  arrival is a previous fire's leak; topmost unblocked milestone only;
+  blocked-on-a-design-question = plan write-up + gate = a successful fire;
+  never force-add gitignored plan files; hard stop after one milestone) and
+  **both** paths end commit-before-exit. §2 adds the enqueue convention:
+  an ai step's prompt starts with `/task ` so the next fire re-enters the
+  loop (claude expands skills in `-p` mode; codex/copilot prompts must spell
+  the contract out). DESIGN §17 and the §5–§7 examples now point lane
+  defaults at `/task`; `/work` is retired.
+
+## 0.1.6 — 2026-07-12 *(version bumped, never published — ships in 0.1.7)*
+
+### Added
+- **Container lanes (DESIGN §26) — `isolation: clone` + the default path.**
+  A lane that must run its steps inside a container that can do git uses a
+  `git clone --local` pool at `~/.taskherd/clone/<repo-id>/<lane>` (a real
+  `.git` dir, bind-mounts cleanly); the lane branch is created in the main
+  repo so land/diff/base resolve there, and `syncCloneBranch` fetches the
+  clone's commits back before land/diff/gc (loud on non-fast-forward
+  divergence). The executor mounts the clone at `/work` + the herd's
+  `.tasks/` at a fixed in-container path, and an in-container `taskherd-mcp`
+  (node + this package mounted read-only) lets a container `/task` agent
+  finalize through `tasks_*`. A §26 validation matrix rejects
+  worktree+docker-image at resolve time (steering to clone) and fails loud
+  on unknown `lifecycle`/`mcpTransport` values. `gc` reaps merged clone
+  dirs + branches.
+- **Container lanes (DESIGN §26) — operator-gated `persistent` lifecycle.**
+  Behind `containers.allowPersistent`: one taskherd-managed container per
+  lane — created on first fire, `docker exec` after, `docker start` if
+  stopped, loud recreate on signature drift — so `node_modules`/caches stay
+  warm between fires. §12: a container timeout now escalates *inside* the
+  container (`docker restart -t 0` persistent / `docker kill` ephemeral)
+  since killing the local client orphans the process; also fixes the M6
+  ephemeral `run --rm` orphan. `gc` reaps the container with its clone
+  (label-based orphan sweep, honoring the §25 run-manifest interlock);
+  `doctor` shows a per-lane container line.
+- **`tasks_options` MCP tool — the environment-specific allocation catalog.**
+  Reports the real runners, resolved defaults, and which risky values are
+  operator-gated on *this* box, so an enqueuing agent allocates from facts
+  instead of guesses; `tasks_add`/`tasks_fork` schemas enriched to match.
+
+### Fixed
+- **Provider defaults: template fallback + loud add-time check.** An ai step
+  added without a provider was accepted silently and parked at fire time,
+  blocking the lane. `resolveConfig` now falls back to the `default` step
+  template's provider (lane → project → user; other template fields never
+  leak; an explicit provider anywhere still wins), and `addStep`/`forkLane`
+  reject an ai step that resolves *no* provider at add time — surfaced
+  through the MCP error channel to the enqueuing agent instead of parking
+  hours later.
+- **Console: two-line step layout.** A step with long `waitsFor` refs crushed
+  the task text to a one-character column. Steps now render as a text line
+  over a wrapping meta row (one chip per `waitsFor` ref, so multiple
+  blockers wrap individually).
 
 ### Added
 - **Parallel lanes — admission control (DESIGN §25).** Off by default; a repo
