@@ -1,6 +1,6 @@
 ---
 name: task
-description: Execute one unit of scheduled lane work, then provision the next fire — enqueue a follow-up step, gate on a human, or fork an independent workstream via the taskherd tasks_* tools. Use when fired as a scheduled taskherd step, or to finish any work session in a taskherd-managed repo.
+description: Execute one unit of work (one milestone if the project keeps a plan), then provision the next fire — enqueue a follow-up step, gate on a human, or fork an independent workstream via the taskherd tasks_* tools. Use when fired as a scheduled taskherd step, when the user says "work" / "work on the plan", or to finish any work session in a taskherd-managed repo. Subsumes the old /work skill.
 ---
 
 # /task — the taskherder finalization loop
@@ -17,11 +17,36 @@ taskherd's job, gated by a human).
 
 ## 1. Work
 
-Do one bounded unit of work:
+Do one bounded unit of work, then stop — the next fire continues the loop.
 
-- If the project has its own work loop (a `/work` skill, a PLAN.md "Work
-  pattern"), follow it: one milestone, verify, commit per project policy, stop.
-- Otherwise: execute the lane's task as given, verify it actually works, commit.
+**If the project keeps a milestone plan** (a PLAN.md with a "Work pattern" /
+milestone queue), the unit is ONE milestone:
+
+- Read PLAN.md first — its "Work pattern" and "Code-session contract" sections
+  are binding for this fire. Find the active plan file's "Next milestones"
+  queue.
+- Verify claimed state against reality before building on it: run the test
+  suites; check `git status` in every repo the plan mentions (some projects
+  nest repos). A tree already dirty when you arrive is a previous fire's leak —
+  commit it separately or record it (`tasks_note` + the handoff); never
+  silently absorb it into your own diff.
+- Execute the **topmost unblocked milestone — one only**. If it is blocked on
+  an unanswered design question: write the question and its options into the
+  plan file and gate the lane on it (`tasks_block`, §2). That is a successful
+  fire.
+- Close the loop: suites green (or failures catalogued as the milestone's
+  output); commit per the project's git/publication policy (plan and spec
+  files are typically gitignored working memory — **never force-add**); update
+  the plan file (mark the milestone done, record field notes, re-point the
+  queue); address every verb of the milestone's text by name: done / blocked /
+  not-done. Do **not** begin the next milestone.
+
+**Otherwise:** execute the lane's task as given, verify it actually works,
+commit.
+
+Either way, **never exit leaving the tree dirty** — an uncommitted result is
+invisible to taskherd and becomes the next fire's mess (worst on `inplace`
+lanes, where it dirties the user's live checkout).
 
 ## 2. Finalize — provision the next fire
 
@@ -32,7 +57,12 @@ Start with `tasks_status` to see the lane tree as it is now.
 - **Next up → usually nothing.** A recurring lane re-runs its default prompt
   next fire with zero bookkeeping. Only `tasks_add` an explicit step when the
   next fire needs something *specific* — a particular prompt, model, provider,
-  or a one-off `command` step.
+  or a one-off `command` step. **Start an ai step's prompt with `/task `**
+  (e.g. `/task Fix the lobby join crash — repro in issue #12`) so the next
+  fire re-enters this loop; a bare prose prompt spawns a plain agent session
+  with no commit/finalize contract, and its work is left uncommitted. (Only
+  claude expands skills — for a codex/copilot step, spell the contract into
+  the prompt: verify, commit, never push.)
 - **An open thread needs a human** (a design question, missing credentials, a
   sign-off, an outward-facing action like publishing) → `tasks_block` with a
   message saying exactly what the human must decide or do (put long prose in a

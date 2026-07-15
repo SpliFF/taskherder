@@ -144,14 +144,14 @@ lanes by adding `!.tasks/` to its own `.gitignore`.
   "name": "bar-ui",
   "parent": "main",
   "onEmpty": "default",
-  "default": { "type": "ai", "provider": "claude", "task": "/work" },
+  "default": { "type": "ai", "provider": "claude", "task": "/task" },
   "isolation": "worktree",
   "land": "manual-gate",
   "profile": "personal",
   "cursor": 1,
   "lastRun": 126,
   "steps": [
-    { "type": "ai", "provider": "claude", "model": "sonnet", "task": "/work",
+    { "type": "ai", "provider": "claude", "model": "sonnet", "task": "/task",
       "status": "done" },
     { "type": "manual", "message": "Confirm the new BAR HUD layout",
       "file": "desc/bar-hud-signoff.md", "status": "blocked" }
@@ -167,7 +167,7 @@ lanes by adding `!.tasks/` to its own `.gitignore`.
 { "type": "command", "argv": ["make", "build"] }
 
 // ai: provider-driven; any provider CLI arg overridable, incl. the permission model
-{ "type": "ai", "provider": "claude", "task": "/work",   // or "file": "desc/x.md"
+{ "type": "ai", "provider": "claude", "task": "/task",   // or "file": "desc/x.md"
   "model": "opus", "session": { "mode": "fresh" },        // or {mode:"resume", id:"…"}
   "args": { "permissionMode": "acceptEdits", "maxTurns": 20 },
   "budget": { "usd": 2.0 } }
@@ -189,7 +189,7 @@ failed | blocked`.
 
 ```json
 {
-  "default": { "type": "ai", "provider": "claude", "task": "/work", "onEmpty": "default" },
+  "default": { "type": "ai", "provider": "claude", "task": "/task", "onEmpty": "default" },
   "profile": "personal",
   "runner": "local",
   "isolation": "worktree",
@@ -227,7 +227,7 @@ runs instead of skipping — §25; the one-step-per-fire grain is unchanged.)*
 **Fallback:** no `.tasks/` lanes → run the configured `default` once (a plain
 scheduled command). Keeps trivial use zero-config.
 
-`onEmpty:"default"` means an empty lane just runs `/work` (or any default) each
+`onEmpty:"default"` means an empty lane just runs `/task` (or any default) each
 fire — so the steady state needs **no** bookkeeping; finalization (§17) only
 writes the tree for *deviations* (specific steps, gates, forks).
 
@@ -244,7 +244,7 @@ Isolation is **per-lane** (default from `config.json`):
   gitignored state per the bootstrap manifest (§24).
 - **`inplace`** — runs in the main checkout on `taskherd/<lane>`. For lanes that
   need the **live/shared runtime** (a running server, a built binary, fixed ports,
-  a shared DB — e.g. springrts `/work`). Serialized by the mutex.
+  a shared DB — e.g. springrts `/task`). Serialized by the mutex.
 - **`none`** — no git management (read-only or non-repo `command` steps).
 
 **Branch:** `taskherd/<lane>`. **Base:** configurable; default default-branch tip.
@@ -457,12 +457,15 @@ MCP config; targets the repo at its launch cwd.
 
 ## 17. The `/task` skill — the finalization loop
 
-Extends the `work`-style milestone loop so each iteration **provisions the next
-fire** (conditional on a `.tasks/` store / the `tasks_*` tools being present —
+**Subsumes** the `work`-style milestone loop (merged into `/task` 2026-07-16 —
+`/work` is retired; `/task` does the milestone work AND provisions the next
+fire, conditional on a `.tasks/` store / the `tasks_*` tools being present —
 otherwise it just emits the handoff block and degrades gracefully):
 
-- **Next up** → usually nothing (the lane's `default` runs `/work` next). Enqueue
-  an explicit step only for a specific model/provider/prompt.
+- **Next up** → usually nothing (the lane's `default` runs `/task` next). Enqueue
+  an explicit step only for a specific model/provider/prompt — and write an ai
+  step's prompt starting with `/task ` so the fire re-enters this loop (a bare
+  prose prompt gets a plain session with no commit/finalize contract).
 - **Open threads needing a human** (a design question, missing creds, a sign-off,
   an external action) → `tasks_block` a **manual gate** → *this* lane pauses,
   siblings continue.
